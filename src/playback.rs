@@ -204,6 +204,10 @@ impl PlaybackEngine {
     }
 }
 
+pub fn spotify_volume_to_percent(volume: u16) -> i32 {
+    ((volume as u32 * 100 + u16::MAX as u32 / 2) / u16::MAX as u32) as i32
+}
+
 fn percent_to_spotify_volume(volume_percent: u16) -> u16 {
     let clamped = volume_percent.min(100);
     ((clamped as u32 * u16::MAX as u32) / 100) as u16
