@@ -140,6 +140,11 @@ struct AppState {
     previous_volume_percent: i32,
     muted: bool,
     last_volume_change: Option<Instant>,
+    /// This PC's own volume. Other devices keep theirs, so controlling one never changes it.
+    local_volume_percent: i32,
+    /// Whether this PC's player is playing right now, from its own events. Spotify's
+    /// report of the active device lags behind, and can still name the one before.
+    local_playing: bool,
     track_view_generation: u64,
 }
 
@@ -147,6 +152,12 @@ impl AppState {
     /// True when this PC's librespot player is the active Spotify device, so
     /// commands can go straight to it. librespot silently ignores commands
     /// while it is not active, so anything else must use the Web API.
+    /// True when the volume slider acts on this PC: it's playing here, or nothing is
+    /// playing anywhere, so the next play starts here.
+    fn local_volume_is_target(&self) -> bool {
+        self.local_playing || self.local_is_active() || self.active_device_id.is_none()
+    }
+
     fn local_is_active(&self) -> bool {
         self.local_device_id.is_some()
             && self.active_device_id == self.local_device_id
@@ -302,6 +313,7 @@ fn main() -> Result<()> {
         .iter()
         .map(|item| item.track_count)
         .collect::<Vec<_>>();
+    let local_volume_percent = if config.remember_volume { config.last_volume_percent.clamp(0, 100) } else { 100 };
     let cached_liked_uris = config
         .library_snapshot
         .liked_songs
@@ -369,6 +381,8 @@ fn main() -> Result<()> {
         previous_volume_percent: 100,
         muted: false,
         last_volume_change: None,
+        local_volume_percent,
+        local_playing: false,
         track_view_generation: 0,
     }));
 
@@ -677,7 +691,7 @@ fn main() -> Result<()> {
     {
         let (volume_tx, mut volume_rx) = mpsc::unbounded_channel::<i32>();
         let (seek_tx, mut seek_rx) = mpsc::unbounded_channel::<i32>();
-        bind_debounced_slider_callbacks(&ui, volume_tx, seek_tx);
+        bind_debounced_slider_callbacks(&ui, Arc::clone(&state), volume_tx, seek_tx);
 
         let ui_weak = ui.as_weak();
         let runtime = Arc::clone(&runtime);
@@ -697,9 +711,14 @@ fn main() -> Result<()> {
                     let mut guard = volume_state.lock().unwrap();
                     guard.last_volume_change = Some(Instant::now());
                     guard.muted = value == 0;
+                    let local = guard.local_volume_is_target();
+                    if local {
+                        guard.local_volume_percent = value;
+                    }
                     if value > 0 {
                         guard.previous_volume_percent = value;
-                        if guard.config.remember_volume {
+                        // Only this PC's volume is remembered for the next start.
+                        if local && guard.config.remember_volume {
                             guard.config.last_volume_percent = value;
                             Some(guard.config.clone())
                         } else {
@@ -952,12 +971,16 @@ fn retry_chrome_install(ui_weak: slint::Weak<AppWindow>, attempts_left: u32) {
 
 fn bind_debounced_slider_callbacks(
     ui: &AppWindow,
+    state: Arc<Mutex<AppState>>,
     volume_tx: mpsc::UnboundedSender<i32>,
     seek_tx: mpsc::UnboundedSender<i32>,
 ) {
     ui.on_set_volume(move |value| {
-        // Heard at once. Telling Spotify and saving it can wait for the drag to end.
-        playback::set_volume_now(value.clamp(0, 100) as u16);
+        // Heard at once when it's this PC's. Telling Spotify and saving it can wait for
+        // the drag to end. Another device's volume never touches this PC's.
+        if state.lock().unwrap().local_volume_is_target() {
+            playback::set_volume_now(value.clamp(0, 100) as u16);
+        }
         let _ = volume_tx.send(value);
     });
 
@@ -1765,10 +1788,10 @@ fn bind_callbacks(
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let target_volume = {
+            let (target_volume, use_local_volume) = {
                 let mut guard = state.lock().unwrap();
                 guard.last_volume_change = Some(Instant::now());
-                if ui.get_volume_percent() > 0 {
+                let target = if ui.get_volume_percent() > 0 {
                     guard.previous_volume_percent = ui.get_volume_percent().clamp(1, 100);
                     guard.muted = true;
                     0
@@ -1776,9 +1799,16 @@ fn bind_callbacks(
                     let restored = guard.previous_volume_percent.clamp(1, 100);
                     guard.muted = false;
                     restored
+                };
+                let local = guard.local_volume_is_target();
+                if local {
+                    guard.local_volume_percent = target;
                 }
+                (target, local)
             };
-            playback::set_volume_now(target_volume as u16);
+            if use_local_volume {
+                playback::set_volume_now(target_volume as u16);
+            }
             ui.set_volume_percent(target_volume);
             ui.set_muted(target_volume == 0);
             ui.set_previous_volume_percent({
@@ -1786,10 +1816,6 @@ fn bind_callbacks(
                 guard.previous_volume_percent
             });
 
-            let use_local_volume = {
-                let guard = state.lock().unwrap();
-                guard.local_is_active()
-            };
             if use_local_volume {
                 if let Err(error) = run_local_player_command(Arc::clone(&state), |engine| {
                     engine.set_volume(target_volume as u16)
@@ -6132,8 +6158,16 @@ async fn refresh_playback_only(
             .is_some_and(|at| at.elapsed() < Duration::from_secs(3));
         if recently_changed {
             None
+        } else if guard.local_volume_is_target() {
+            // This PC's volume is the one shown. Spotify's report can still be about the
+            // device played on before, like a speaker left at 20%.
+            Some(guard.local_volume_percent)
         } else {
-            playback.as_ref().and_then(|p| p.device.as_ref()).and_then(|d| d.volume_percent)
+            playback
+                .as_ref()
+                .and_then(|p| p.device.as_ref())
+                .filter(|d| d.is_active)
+                .and_then(|d| d.volume_percent)
         }
     };
     if let Some(volume) = remote_volume {
@@ -7110,7 +7144,7 @@ async fn apply_volume_change(
     let (use_local, target_device_id, has_token) = {
         let guard = state.lock().unwrap();
         (
-            guard.local_is_active(),
+            guard.local_volume_is_target(),
             guard.active_device_id.clone().or_else(|| guard.device_id.clone()),
             guard.token.is_some(),
         )
@@ -7118,8 +7152,8 @@ async fn apply_volume_change(
     if use_local {
         return run_local_player_command(state, |engine| engine.set_volume(volume_percent as u16));
     }
-    // Keep the idle local player in sync so it starts at the chosen volume.
-    let _ = run_local_player_command(Arc::clone(&state), |engine| engine.set_volume(volume_percent as u16));
+    // Another device is playing: only its volume changes. This PC keeps its own, so
+    // turning a speaker down never turns this PC down with it.
     match target_device_id {
         Some(device_id) if has_token => {
             let token = current_token(&state).await?;
@@ -7567,10 +7601,40 @@ async fn run_local_player_event_loop(
                 apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, false, engine_generation);
             }
             PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } | PlayerEvent::Unavailable { .. } => {
-                state.lock().unwrap().play_watch.stopped();
+                let mut guard = state.lock().unwrap();
+                guard.play_watch.stopped();
+                guard.local_playing = false;
+            }
+            PlayerEvent::VolumeChanged { volume } => {
+                // Set from a phone or another Spotify app, or our own change coming back.
+                state.lock().unwrap().local_volume_percent = playback::spotify_volume_to_percent(volume);
+                let ui_weak = ui_weak.clone();
+                let state = Arc::clone(&state);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        show_local_volume(&ui, &state);
+                    }
+                });
             }
             _ => {}
         }
+    }
+}
+
+/// Puts this PC's own volume on the slider while it's the one the slider controls,
+/// unless the user moved the slider a moment ago and the player hasn't caught up.
+fn show_local_volume(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
+    let volume = {
+        let guard = state.lock().unwrap();
+        let recently_changed = guard.last_volume_change.is_some_and(|at| at.elapsed() < Duration::from_secs(3));
+        if recently_changed || !guard.local_volume_is_target() {
+            return;
+        }
+        guard.local_volume_percent
+    };
+    if ui.get_volume_percent() != volume {
+        ui.set_volume_percent(volume);
+        ui.set_muted(volume == 0);
     }
 }
 
@@ -7606,6 +7670,7 @@ fn apply_local_player_position_event(
         if !matches_current {
             return;
         }
+        guard.local_playing = is_playing;
         if is_playing && guard.local_device_id.is_some() {
             guard.active_device_id = guard.local_device_id.clone();
             guard.device_id = guard.local_device_id.clone();
@@ -7621,6 +7686,10 @@ fn apply_local_player_position_event(
                 return;
             }
             ui.set_is_playing(is_playing);
+            if is_playing {
+                // Back from another device, the slider shows this PC's volume again.
+                show_local_volume(&ui, &state);
+            }
             show_progress(&ui, position_ms);
             ui.set_connection_status(if is_playing {
                 "Connected - Playing".into()
