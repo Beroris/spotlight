@@ -1,0 +1,10 @@
+target/
+bin/
+obj/
+.idea/
+.vscode/
+*.pdb
+*.ilk
+*.log
+*.tmp
+dist/

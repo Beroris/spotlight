@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs>
+<linearGradient id="tile" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10204f"/><stop offset=".55" stop-color="#2563eb"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+<radialGradient id="glow" cx=".5" cy=".46" r=".5"><stop offset="0" stop-color="#9ee8ff" stop-opacity=".55"/><stop offset="1" stop-color="#9ee8ff" stop-opacity="0"/></radialGradient>
+<linearGradient id="face" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#d3f1ff"/></linearGradient>
+</defs>
+<rect width="64" height="64" fill="url(#tile)"/>
+<circle cx="32" cy="30" r="30" fill="url(#glow)"/>
+<circle cx="32" cy="32" r="14" fill="url(#face)"/>
+<path d="M32 24.6V32l5.2 3.2" fill="none" stroke="#17408f" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

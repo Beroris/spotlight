@@ -1,0 +1,113 @@
+[package]
+name = "spotlight"
+version = "1.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/Beroris/spotlight"
+build = "build.rs"
+
+[[bin]]
+name = "Spotlight"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+base64 = "0.22"
+dirs = "5"
+global-hotkey = "0.6"
+mimalloc = { version = "0.1", default-features = false }
+librespot = "0.8"
+librespot-connect = "0.8"
+librespot-core = "0.8"
+librespot-oauth = "0.8"
+librespot-playback = { version = "0.8", default-features = true }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rubato = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+single-instance = "0.3"
+slint = { version = "1.7", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
+# The stage cover's tilt is drawn with OpenGL. The same version Slint's renderer already uses.
+glow = { version = "0.17", default-features = false }
+# Spotify serves some covers as WebP whatever their URL suggests.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+urlencoding = "2.1"
+uuid = { version = "1", features = ["v4"] }
+webbrowser = "1"
+# The same version librespot's audio libraries already build.
+windows = { version = "0.54", features = [
+    "Foundation",
+    "Media",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# Only the latency test uses this, to record what a device really outputs.
+rodio = { version = "0.21", default-features = false, features = ["playback"] }
+
+[build-dependencies]
+ico = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+slint-build = "1.7"
+winres = "0.1"
+
+# Real-time audio DSP must be fast even in debug builds, or playback can stutter.
+[profile.dev.package.rubato]
+opt-level = 3
+
+[patch.crates-io]
+# Adds a way to reorder the queue without touching the song. See its SPOTLIGHT-CHANGES.md.
+librespot-connect = { path = "vendor/librespot-connect" }
+# Adds crossfade, one song fading into the next. See its SPOTLIGHT-CHANGES.md.
+librespot-playback = { path = "vendor/librespot-playback" }
+# Stops a second, identical frame after every change, and frame requests while in the tray.
+# See its SPOTLIGHT-CHANGES.md.
+i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
+
+[workspace]
+members = ["vendor/librespot-connect"]
+# Kept out of the workspace so Cargo.lock lists only what Spotlight builds. A member's
+# optional backends (wgpu, Vulkan, other audio outputs) would all be locked, though never built.
+exclude = ["vendor/i-slint-backend-winit", "vendor/librespot-playback"]
+
+[profile.dev.package.realfft]
+opt-level = 3
+
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

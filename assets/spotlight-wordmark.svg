@@ -1,0 +1,10 @@
+<svg width="1500" height="430" viewBox="0 0 1500 430" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Spotlight triangle wordmark</title>
+  <desc id="desc">A simple Spotlight wordmark with a triangular Spotify-inspired spotlight mark.</desc>
+  <circle cx="215" cy="215" r="172" fill="#1ED760"/>
+  <path d="M192 158C207 153 224 153 238 158" stroke="#061009" stroke-width="25" stroke-linecap="round"/>
+  <path d="M168 209C198 197 232 197 262 209" stroke="#061009" stroke-width="25" stroke-linecap="round"/>
+  <path d="M142 262C189 242 242 242 288 262" stroke="#061009" stroke-width="25" stroke-linecap="round"/>
+  <text x="452" y="280" font-family="Inter, Manrope, Avenir Next, Segoe UI, Arial, sans-serif" font-size="180" font-weight="760" letter-spacing="-7" fill="#F6F8F4">Spot</text>
+  <text x="850" y="280" font-family="Inter, Manrope, Avenir Next, Segoe UI, Arial, sans-serif" font-size="180" font-weight="760" letter-spacing="-7" fill="#1ED760">light</text>
+</svg>

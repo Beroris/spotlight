@@ -1,0 +1,8 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Spotlight triangle stack icon</title>
+  <desc id="desc">A Spotify-inspired green circle mark where three curved lines step outward to suggest a triangular spotlight beam.</desc>
+  <circle cx="512" cy="512" r="420" fill="#1ED760"/>
+  <path d="M456 374C492 361 534 361 568 374" stroke="#061009" stroke-width="60" stroke-linecap="round"/>
+  <path d="M398 496C470 466 552 466 626 496" stroke="#061009" stroke-width="60" stroke-linecap="round"/>
+  <path d="M334 622C448 573 577 573 690 622" stroke="#061009" stroke-width="60" stroke-linecap="round"/>
+</svg>
