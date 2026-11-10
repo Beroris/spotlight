@@ -427,6 +427,7 @@ fn main() -> Result<()> {
         ui.set_next_icon(load_icon("next.svg"));
         ui.set_search_icon(load_icon("search.svg"));
         ui.set_refresh_icon(load_icon("refresh.svg"));
+        ui.set_spinner_icon(load_icon("spinner.svg"));
         ui.set_settings_icon(load_icon("settings.svg"));
         ui.set_playlist_icon(load_icon("playlist.svg"));
         ui.set_device_icon(load_icon("device.svg"));
@@ -570,6 +571,12 @@ fn main() -> Result<()> {
         let state = Arc::clone(&state);
         let spotify_api = spotify_api.clone();
         runtime.spawn(async move {
+            // Just after opening, music may be going on another device, and at sign-in the
+            // network can be late, so look often for the first minute.
+            const STARTUP_WATCH: Duration = Duration::from_secs(60);
+            const STARTUP_INTERVAL: Duration = Duration::from_secs(2);
+            let opened_at = Instant::now();
+            let mut last_poll = Instant::now();
             loop {
                 let (interval, playback_only) = {
                     let guard = state.lock().unwrap();
@@ -600,7 +607,19 @@ fn main() -> Result<()> {
                         (Duration::from_secs(if low_resource { 30 } else { 8 }), true)
                     }
                 };
-                tokio::time::sleep(interval).await;
+                let interval = if playback_only && opened_at.elapsed() < STARTUP_WATCH {
+                    interval.min(STARTUP_INTERVAL)
+                } else {
+                    interval
+                };
+                // The wait is worked out again every second, so bringing the window to the
+                // front catches up at once rather than sitting out a long background wait.
+                let remaining = interval.saturating_sub(last_poll.elapsed());
+                if !remaining.is_zero() {
+                    tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+                    continue;
+                }
+                last_poll = Instant::now();
                 if state.lock().unwrap().token.is_none() {
                     continue;
                 }
@@ -806,7 +825,10 @@ fn main() -> Result<()> {
                 true,
                 false,
             );
-            let (local_result, restore_result) = tokio::join!(local_start, session_restore);
+            // The full restore can page through the whole library before it asks what's playing,
+            // so ask straight away too: music already going on a phone shows up at once.
+            let playing_now = refresh_playback_only(ui_weak.clone(), Arc::clone(&state), spotify_api.clone());
+            let (local_result, restore_result, _) = tokio::join!(local_start, session_restore, playing_now);
 
             if let Err(error) = local_result {
                 let ui_weak_error = ui_weak.clone();
@@ -1673,12 +1695,12 @@ fn bind_callbacks(
             };
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_device_switching(true);
-                ui.set_device_status(format!("Connecting to {}…", device_name).into());
+                // The row turns a ring while this happens.
             }
             if token.is_none() || device_id.as_deref().is_none_or(str::is_empty) {
                 if let Some(ui) = ui_weak.upgrade() {
                     ui.set_device_switching(false);
-                    ui.set_device_status("Device unavailable — refresh and try again".into());
+                    show_toast(&ui, "Device unavailable — refresh and try again", true);
                 }
                 return;
             }
@@ -1722,11 +1744,9 @@ fn bind_callbacks(
                         ui.set_device_switching(false);
                         match result {
                             Ok(_) => {
-                                ui.set_device_status(format!("Playing on {}", device_name).into());
                                 append_log(&ui, &format!("Transferred playback to selected device {}.", device_name));
                             }
                             Err(error) => {
-                                ui.set_device_status("Device switch failed — previous device restored".into());
                                 append_log(&ui, &format!("Device switch failed: {error}"));
                             }
                         }
@@ -4591,6 +4611,7 @@ fn set_now_playing_from_track(
         // Authoritative updates come from the local librespot player.
         ui.set_playing_device_name("".into());
         ui.set_active_device_name(ui.get_local_device_name());
+        ui.set_device_icon(load_icon("computer.svg"));
     }
     ui.set_is_playing(true);
     ui.set_connection_status("Connected - Playing".into());
@@ -4787,8 +4808,9 @@ fn update_spotify_queue(
     let playback_uri = playback.and_then(|p| p.item.as_ref()).map(|track| track.uri.as_str());
     let queue_uri = queue.currently_playing.as_ref().map(|track| track.uri.as_str());
     let mut guard = state.lock().unwrap();
-    // Next up is where it was left, until something plays.
-    if guard.parked.is_some() {
+    // Next up is where it was left, until something plays. Music on another device takes
+    // over, queue and all, even if its queue arrives before its song has cleared the park.
+    if guard.parked.is_some() && playback_uri.is_none() {
         return;
     }
     // A queue for a session the local player isn't playing must not replace ours.
@@ -5825,6 +5847,7 @@ fn clear_now_playing(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
     ui.set_current_track_uri("".into());
     ui.set_playing_device_name("".into());
     ui.set_active_device_name("".into());
+    ui.set_device_icon(load_icon("device.svg"));
     ui.set_stream_quality("".into());
     ui.set_track_title("Nothing playing".into());
     show_track_artists(ui, &[]);
@@ -5937,7 +5960,15 @@ fn apply_playback_to_ui(
         // Something is playing, which takes over from where the music was left.
         let mut guard = state.lock().unwrap();
         guard.missing_playback_since = None;
-        guard.parked = None;
+        if guard.parked.take().is_some() {
+            // The saved Next up belonged to the parked song. What's playing now brings its own,
+            // so ask for that next time rather than waiting out the usual gap.
+            guard.queue_override_active = false;
+            guard.queue_override_tracks.clear();
+            if guard.spotify_queue_current_uri.as_deref() != Some(track.uri.as_str()) {
+                guard.last_spotify_queue_refresh = None;
+            }
+        }
     }
     if local_player_disagrees(state, &track.uri) {
         // Not transient, so don't start fast polling over it.
@@ -5992,6 +6023,9 @@ fn apply_playback_to_ui(
             // Another device's stream isn't ours to report on.
             ui.set_stream_quality("".into());
         }
+        // The icon by the device's name shows what kind it is: phone, speaker, TV or computer.
+        let kind = playback.device.as_ref().map(|device| device.device_type.as_str()).unwrap_or_default();
+        ui.set_device_icon(load_icon(if remote_name.is_empty() { "computer.svg" } else { device_type_icon(kind) }));
         ui.set_playing_device_name(remote_name.into());
         ui.set_active_device_name(active_name.into());
     }
@@ -6870,7 +6904,7 @@ macro_rules! embedded_icon {
 /// The installer ships only the exe, so assets live inside it and are unpacked
 /// to the app data folder for Slint to load by path.
 fn embedded_asset_path(name: &str) -> Option<PathBuf> {
-    let assets: [(&str, &[u8]); 27] = [
+    let assets: [(&str, &[u8]); 28] = [
         ("spotlight-mark.svg", include_bytes!("../assets/spotlight-mark.svg").as_slice()),
         embedded_icon!("computer.svg"),
         embedded_icon!("device.svg"),
@@ -6888,6 +6922,7 @@ fn embedded_asset_path(name: &str) -> Option<PathBuf> {
         embedded_icon!("settings.svg"),
         embedded_icon!("shuffle.svg"),
         embedded_icon!("speaker.svg"),
+        embedded_icon!("spinner.svg"),
         embedded_icon!("tv.svg"),
         embedded_icon!("volume.svg"),
         embedded_icon!("volume-low.svg"),
