@@ -1,7 +1,7 @@
 ; Spotlight's installer: a normal Windows setup wizard, for the current user, with no admin rights.
 ;
 ; Build it with scripts/package-windows.ps1, which passes the version and the built exe:
-;   ISCC.exe /DAppVersion=1.0.0 /DSourceExe=..\target\release\Spotlight.exe installer\spotlight.iss
+;   ISCC.exe /DAppVersion=1.1.0 /DSourceExe=..\target\release\Spotlight.exe installer\spotlight.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
