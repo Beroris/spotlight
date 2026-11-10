@@ -1980,13 +1980,16 @@ component DeviceRow inherits Rectangle {
     in property <string> subtitle;
     in property <image> icon;
     in property <bool> active;
+    // Connecting to this device: a ring turns at the end of the row.
+    in property <bool> busy;
+    in property <image> spinner;
     in property <bool> shown: true;
     in property <int> order: 0;
     callback clicked();
 
     height: 52px;
     border-radius: 8px;
-    GlassHover { lit: device-hover.has-hover; }
+    GlassHover { lit: device-hover.has-hover || root.busy; }
 
     property <float> fade: root.shown ? 1 : 0;
     animate fade {
@@ -2040,6 +2043,23 @@ component DeviceRow inherits Rectangle {
                 color: root.active ? AppTheme.accent : AppTheme.muted-text;
                 font-size: 12px;
                 overflow: elide;
+            }
+        }
+
+        Rectangle {
+            width: 16px;
+            property <float> show: root.busy ? 1 : 0;
+            animate show { duration: AppTheme.motion-slow; easing: ease-out; }
+            visible: self.show > 0.01;
+            opacity: self.show;
+            Image {
+                source: root.spinner;
+                colorize: AppTheme.accent;
+                width: 16px;
+                height: 16px;
+                image-fit: contain;
+                // Ticks only while connecting, so a still list costs nothing.
+                transform-rotation: root.busy && !AppTheme.reduce-motion ? animation-tick() / 800ms * 360deg : 0deg;
             }
         }
     }
@@ -2648,7 +2668,7 @@ export component AppWindow inherits Window {
     in-out property <[bool]> device_is_local;
     in-out property <int> selected_device_index: -1;
     in-out property <bool> device_switching: false;
-    in-out property <string> device_status: "";
+    in-out property <image> spinner_icon;
     in-out property <[image]> queue_images;
     in-out property <[string]> queue_titles;
     in-out property <[string]> queue_artists;
@@ -5014,16 +5034,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        if root.device_switching : HorizontalLayout {
-                            padding-left: 8px;
-                            Text {
-                                text: root.device_status;
-                                color: AppTheme.accent;
-                                font-size: 12px;
-                                overflow: elide;
-                                horizontal-alignment: left;
-                            }
-                        }
                         Rectangle { height: 4px; }
 
                         if root.device_titles.length == 0 : Text { height: 40px; text: "  Looking for devices…"; color: AppTheme.muted-text; font-size: 13px; vertical-alignment: center; }
@@ -5032,6 +5042,8 @@ export component AppWindow inherits Window {
                             subtitle: root.device_subtitles[index];
                             icon: root.device_images[index];
                             active: root.device_is_active[index];
+                            busy: root.device_switching && root.selected_device_index == index;
+                            spinner: root.spinner_icon;
                             shown: root.inspector-face == 2;
                             order: index;
                             clicked => {
