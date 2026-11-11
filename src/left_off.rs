@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -40,44 +40,55 @@ fn path() -> Result<PathBuf> {
     Ok(config::config_dir()?.join("left-off.json"))
 }
 
-/// What was written last, so an unchanged state isn't written again. Also keeps two writes
-/// from crossing.
+/// What was written last, so an unchanged state isn't written again.
 static WRITTEN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Writes one at a time and in order, so an older place never lands over a newer one.
+static WRITER: config::BackgroundWriter<LeftOff> = config::BackgroundWriter::new("spotlight-left-off-writer", write);
+
+fn written() -> MutexGuard<'static, Vec<u8>> {
+    WRITTEN.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub fn load() -> Option<LeftOff> {
     let bytes = fs::read(path().ok()?).ok()?;
     let left_off = serde_json::from_slice::<LeftOff>(&bytes).ok()?;
-    *WRITTEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = bytes;
+    *written() = bytes;
     Some(left_off).filter(|left_off| !left_off.track.uri.is_empty())
 }
 
 pub fn save(left_off: &LeftOff) -> Result<()> {
+    WRITER.save_now(left_off)
+}
+
+fn write(left_off: &LeftOff) -> Result<()> {
     let bytes = serde_json::to_vec(left_off)?;
-    let mut written = WRITTEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut written = written();
     if *written == bytes {
         return Ok(());
     }
     let path = path()?;
     let partial = path.with_extension("json.partial");
+    // No flush to the disk: this is saved every 15 s while music plays, and a file a power cut
+    // leaves empty only opens as nothing to carry on from.
     fs::write(&partial, &bytes)?;
     fs::rename(&partial, &path)?;
     *written = bytes;
     Ok(())
 }
 
-/// After signing out: the next account shouldn't open on this one's music.
+/// After signing out: the next account shouldn't open on this one's music. A save still
+/// waiting is dropped, so it can't bring the file back.
 pub fn forget() {
-    let mut written = WRITTEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Ok(path) = path() {
-        let _ = fs::remove_file(path);
-    }
-    written.clear();
+    WRITER.discard_then(|| {
+        if let Ok(path) = path() {
+            let _ = fs::remove_file(path);
+        }
+        written().clear();
+    });
 }
 
 pub fn save_in_background(left_off: LeftOff) {
-    std::thread::spawn(move || {
-        let _ = save(&left_off);
-    });
+    WRITER.save_soon(left_off);
 }
 
 /// The songs of the list after the ones Next up shows. In shuffle that's the list's other

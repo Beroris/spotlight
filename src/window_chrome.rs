@@ -43,6 +43,8 @@ pub fn in_mini() -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn quit_running() {}
 #[cfg(not(target_os = "windows"))]
+pub fn show_running() {}
+#[cfg(not(target_os = "windows"))]
 pub fn handle() -> isize { 0 }
 
 /// The mini player's size in logical px. `ui/app.slint` lays it out the same way.
@@ -294,6 +296,35 @@ mod imp {
         1
     }
 
+    /// What opening Spotlight again sends the copy that's already running, to bring it back.
+    static SHOW_MESSAGE: AtomicU32 = AtomicU32::new(0);
+
+    fn show_message() -> u32 {
+        let name: Vec<u16> = "SpotlightShow\0".encode_utf16().collect();
+        unsafe { RegisterWindowMessageW(name.as_ptr()) }
+    }
+
+    /// Brings the Spotlight that's already running to the front, from the tray too. For when
+    /// it's opened again, from the Start menu say, while it runs.
+    pub fn show_running() {
+        let message = show_message();
+        let mut windows: Vec<HWND> = Vec::new();
+        unsafe {
+            EnumWindows(Some(collect_spotlights), &mut windows as *mut Vec<HWND> as LPARAM);
+            let own = GetCurrentProcessId();
+            for hwnd in windows {
+                let mut process_id = 0;
+                GetWindowThreadProcessId(hwnd, &mut process_id);
+                if process_id == 0 || process_id == own {
+                    continue;
+                }
+                // Only the app just opened may bring a window to the front, so it lends that.
+                windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(process_id);
+                PostMessageW(hwnd, message, 0, 0);
+            }
+        }
+    }
+
     /// Asks every other running Spotlight to quit, as the installer does before it replaces or
     /// removes the app, and waits up to five seconds for them to go.
     pub fn quit_running() {
@@ -332,6 +363,7 @@ mod imp {
     pub fn install(ui: &AppWindow) -> bool {
         UI.with(|slot| *slot.borrow_mut() = Some(ui.as_weak()));
         QUIT_MESSAGE.store(quit_message(), Ordering::Relaxed);
+        SHOW_MESSAGE.store(show_message(), Ordering::Relaxed);
         unsafe {
             let mut hwnd: HWND = ptr::null_mut();
             let thread = windows_sys::Win32::System::Threading::GetCurrentThreadId();
@@ -798,6 +830,26 @@ mod imp {
         if quit != 0 && message == quit {
             crate::tray::remove_icon();
             crate::config::exit_after_saving();
+        }
+        let show = SHOW_MESSAGE.load(Ordering::Relaxed);
+        if show != 0 && message == show {
+            update_ui(|ui| {
+                let _ = ui.show();
+                ui.window().set_minimized(false);
+                // Closing to the tray hides the window behind Slint's back, so Slint may think
+                // it's still shown. Showing it here too, as the tray does, covers that.
+                let hwnd = window();
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW);
+                        if IsIconic(hwnd) != 0 {
+                            ShowWindow(hwnd, SW_RESTORE);
+                        }
+                        windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                    }
+                }
+            });
+            return 0;
         }
         if let Some(handled) = crate::taskbar::handle_message(message, wparam) {
             return handled;

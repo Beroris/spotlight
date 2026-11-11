@@ -72,6 +72,9 @@ pub struct AppConfig {
     pub close_to_tray: bool,
     #[serde(default)]
     pub start_minimized: bool,
+    /// Wait in the tray, rather than open, when Windows starts Spotlight at sign-in.
+    #[serde(default = "default_true")]
+    pub tray_at_sign_in: bool,
     #[serde(default = "default_true")]
     pub low_resource_mode: bool,
     #[serde(default)]
@@ -90,6 +93,10 @@ pub struct AppConfig {
     pub check_for_updates: bool,
     pub token: Option<TokenStore>,
     pub local_playback_token: Option<TokenStore>,
+    /// The Spotify account signed in, by its id, so what Spotlight keeps for each account
+    /// finds its own. Learned after signing in.
+    #[serde(default)]
+    pub account_id: Option<String>,
     #[serde(default)]
     pub library_snapshot: LibrarySnapshot,
     #[serde(default)]
@@ -163,6 +170,8 @@ pub struct TokenResponse {
 pub struct PlaylistPage {
     pub items: Vec<PlaylistItem>,
     pub next: Option<String>,
+    #[serde(default)]
+    pub total: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -173,6 +182,8 @@ pub struct PlaylistItem {
     pub images: Vec<AlbumImage>,
     #[serde(alias = "tracks", alias = "items")]
     pub tracks: PlaylistTracksRef,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -186,6 +197,8 @@ pub struct PlaylistTracksRef {
 pub struct PlaylistTracksPage {
     pub items: Vec<PlaylistTrackItem>,
     pub next: Option<String>,
+    #[serde(default)]
+    pub total: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -198,6 +211,8 @@ pub struct PlaylistTrackItem {
 pub struct SavedTracksPage {
     pub items: Vec<SavedTrackItem>,
     pub next: Option<String>,
+    #[serde(default)]
+    pub total: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -303,7 +318,17 @@ pub struct Device {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct LibrarySnapshot {
     pub playlists: Vec<CachedPlaylist>,
+    /// The first of Liked Songs, to show at once on opening. More, if asked for, aren't kept.
     pub liked_songs: Vec<CachedLikedSong>,
+    /// How many songs Liked Songs has, as Spotify last said. Zero if it hasn't.
+    #[serde(default)]
+    pub liked_songs_total: usize,
+    /// How many playlists the library has in all, as Spotify last said, and how many of them
+    /// were asked for. Zero for either is what Spotlight loads at first.
+    #[serde(default)]
+    pub playlists_total: usize,
+    #[serde(default)]
+    pub playlists_wanted: usize,
     #[serde(default)]
     pub fetched_at_epoch: u64,
     #[serde(default)]
@@ -318,6 +343,9 @@ pub struct CachedPlaylist {
     pub image_url: Option<String>,
     #[serde(default)]
     pub track_count: Option<u32>,
+    /// Spotify's version of the playlist, which changes with every edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -35,6 +35,10 @@ const CHUNK_FRAMES: usize = 1024;
 /// How often to look for a chosen device that wasn't there, such as a mixer
 /// that has been switched off.
 const MISSING_DEVICE_RECHECK: Duration = Duration::from_secs(5);
+/// How often to look whether Windows' default output has changed, while following it.
+const DEFAULT_DEVICE_RECHECK: Duration = Duration::from_secs(2);
+/// How long a Windows default that wouldn't open waits before it's tried again.
+const UNOPENABLE_DEFAULT_RETRY: Duration = Duration::from_secs(30);
 
 /// The device picked in Settings. Empty means the Windows default.
 static CHOSEN_DEVICE: Mutex<String> = Mutex::new(String::new());
@@ -179,6 +183,9 @@ fn clock_ms() -> u64 {
 /// Silences or resumes the output at once. Call this before telling the player.
 pub fn set_paused(paused: bool) {
     PAUSED.store(paused, Ordering::SeqCst);
+    if !paused {
+        wasapi::wake_streams();
+    }
 }
 
 /// Applies a volume the user just chose.
@@ -194,8 +201,10 @@ pub fn set_player_gain(gain: f32) {
     }
 }
 
+/// The count only changes under the queue's lock, so it always matches what the queue holds.
 fn clear_queue() {
-    QUEUE.lock().unwrap().clear();
+    let mut queue = QUEUE.lock().unwrap();
+    queue.clear();
     QUEUED_SAMPLES.store(0, Ordering::SeqCst);
 }
 
@@ -226,6 +235,8 @@ struct OutputFeed {
     holding: bool,
     seen_skip: u64,
     fading_out_old_audio: bool,
+    /// Counts chunks taken from the queue.
+    chunks_taken: u64,
 }
 
 impl OutputFeed {
@@ -239,6 +250,7 @@ impl OutputFeed {
             holding: false,
             seen_skip: SKIP_COUNT.load(Ordering::SeqCst),
             fading_out_old_audio: false,
+            chunks_taken: 0,
         }
     }
 
@@ -266,12 +278,15 @@ impl OutputFeed {
 
     fn next_queued_sample(&mut self) -> f32 {
         if self.position >= self.chunk.len() {
-            let Some(next) = QUEUE.lock().unwrap().pop_front() else {
+            let mut queue = QUEUE.lock().unwrap();
+            let Some(next) = queue.pop_front() else {
                 return 0.0;
             };
             QUEUED_SAMPLES.fetch_sub(next.len(), Ordering::SeqCst);
+            drop(queue);
             self.chunk = next;
             self.position = 0;
+            self.chunks_taken = self.chunks_taken.wrapping_add(1);
         }
         let sample = self.chunk.get(self.position).copied().unwrap_or(0.0);
         self.position += 1;
@@ -295,9 +310,28 @@ impl Iterator for OutputFeed {
     }
 }
 
+impl wasapi::Feed for OutputFeed {
+    fn fill(&mut self, buffer: &mut [f32]) -> bool {
+        let playing_before = !self.has_nothing_to_play();
+        let chunks_before = self.chunks_taken;
+        for sample in buffer {
+            *sample = self.next().unwrap_or(0.0);
+        }
+        // Music that came and was used up within this fill counts too.
+        playing_before || self.chunks_taken != chunks_before || !self.has_nothing_to_play()
+    }
+
+    fn has_nothing_to_play(&self) -> bool {
+        let paused_and_faded = PAUSED.load(Ordering::SeqCst) && self.gain == 0.0;
+        paused_and_faded || (self.position >= self.chunk.len() && QUEUED_SAMPLES.load(Ordering::SeqCst) == 0)
+    }
+}
+
 /// An open stream on one device.
 struct Output {
     stream: wasapi::Stream,
+    /// Windows' id for the device.
+    device_id: String,
     /// Playing somewhere other than the chosen device, because that wasn't there.
     on_fallback: bool,
 }
@@ -317,21 +351,8 @@ fn open_output(chosen: &str, may_fall_back: bool) -> Result<Output> {
 
     let mut first_error = None;
     for (index, id) in candidates.into_iter().enumerate() {
-        let opened = wasapi::Stream::open(id, |rate| {
-            let mut feed = OutputFeed::new(rate);
-            move |buffer: &mut [f32]| {
-                for sample in buffer {
-                    *sample = feed.next().unwrap_or(0.0);
-                }
-            }
-        });
-        match opened {
-            Ok(stream) => {
-                return Ok(Output {
-                    stream,
-                    on_fallback: !chosen.is_empty() && (wanted.is_none() || index > 0),
-                });
-            }
+        match open_on(id, !chosen.is_empty() && (wanted.is_none() || index > 0)) {
+            Ok(output) => return Ok(output),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -343,6 +364,11 @@ fn open_output(chosen: &str, may_fall_back: bool) -> Result<Output> {
     })
 }
 
+fn open_on(device_id: String, on_fallback: bool) -> Result<Output> {
+    let stream = wasapi::Stream::open(device_id.clone(), OutputFeed::new)?;
+    Ok(Output { stream, device_id, on_fallback })
+}
+
 pub struct HighQualitySink {
     /// Nothing is opened until there's something to play.
     output: Option<Output>,
@@ -351,6 +377,9 @@ pub struct HighQualitySink {
     seen_choice: u64,
     seen_skip: u64,
     last_missing_check: Instant,
+    last_default_check: Instant,
+    /// A Windows default that wouldn't open, and when, so it isn't tried every check.
+    unopenable_default: Option<(String, Instant)>,
 }
 
 pub fn new_sink() -> Box<dyn Sink> {
@@ -365,6 +394,8 @@ pub fn new_sink() -> Box<dyn Sink> {
         seen_choice: 0,
         seen_skip: SKIP_COUNT.load(Ordering::SeqCst),
         last_missing_check: Instant::now(),
+        last_default_check: Instant::now(),
+        unopenable_default: None,
     })
 }
 
@@ -418,6 +449,33 @@ impl HighQualitySink {
             let chosen = CHOSEN_DEVICE.lock().unwrap().clone();
             if let Ok(output) = open_output(&chosen, false) {
                 self.install(output).map_err(not_connected)?;
+            }
+        } else if self.last_default_check.elapsed() >= DEFAULT_DEVICE_RECHECK
+            && CHOSEN_DEVICE.lock().unwrap().is_empty()
+        {
+            // Set to the Windows default, so it follows when Windows changes it, such as to
+            // headphones that just connected.
+            self.last_default_check = Instant::now();
+            let playing_on = self.output.as_ref().map(|output| output.device_id.as_str());
+            let default = wasapi::default_device_id();
+            // Once Windows moves on from a default that failed, it gets a fresh try if it
+            // comes back.
+            if self.unopenable_default.as_ref().is_some_and(|(id, _)| default.as_ref() != Some(id)) {
+                self.unopenable_default = None;
+            }
+            let failed_lately = self
+                .unopenable_default
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < UNOPENABLE_DEFAULT_RETRY);
+            let Some(default) = default.filter(|id| Some(id.as_str()) != playing_on && !failed_lately) else {
+                return Ok(());
+            };
+            match open_on(default.clone(), false) {
+                Ok(output) => {
+                    self.unopenable_default = None;
+                    self.install(output).map_err(not_connected)?;
+                }
+                Err(_) => self.unopenable_default = Some((default, Instant::now())),
             }
         }
         Ok(())
@@ -513,6 +571,8 @@ impl Sink for HighQualitySink {
                 QUEUED_SAMPLES.fetch_add(resampled.len(), Ordering::SeqCst);
                 queue.push_back(resampled);
             }
+            drop(queue);
+            wasapi::wake_streams();
         }
         self.wait_for_room(rate as usize * CHANNELS * BUFFER_MS / 1000);
         Ok(())
@@ -698,12 +758,90 @@ mod tests {
             seen_choice: 0,
             seen_skip: 0,
             last_missing_check: Instant::now(),
+            last_default_check: Instant::now(),
+            unopenable_default: None,
         };
         queue_numbered_frames(1, 100);
         set_paused(true);
         // With no output this returns at once either way; the queue must survive.
         sink.stop().unwrap();
         assert_eq!(QUEUED_SAMPLES.load(Ordering::SeqCst), 200);
+    }
+
+    #[test]
+    fn the_feed_has_nothing_to_play_when_paused_or_out_of_audio() {
+        use wasapi::Feed;
+        let _controls = fresh_controls();
+        let mut feed = OutputFeed::new(48_000);
+        assert!(feed.has_nothing_to_play(), "nothing queued");
+        queue_numbered_frames(1, 1_000);
+        assert!(!feed.has_nothing_to_play());
+        pull_frames(&mut feed, 10);
+        assert!(!feed.has_nothing_to_play(), "part of a chunk is left");
+
+        set_paused(true);
+        assert!(!feed.has_nothing_to_play(), "still fading out");
+        pull_frames(&mut feed, FADE_FRAMES + 2);
+        assert!(feed.has_nothing_to_play(), "paused and silent");
+        set_paused(false);
+        assert!(!feed.has_nothing_to_play(), "unpaused with audio waiting");
+
+        set_user_gain(0.0);
+        pull_frames(&mut feed, FADE_FRAMES + 2);
+        assert!(!feed.has_nothing_to_play(), "muted music keeps moving");
+        set_user_gain(1.0);
+        pull_frames(&mut feed, 1_000);
+        assert!(feed.has_nothing_to_play(), "played it all");
+    }
+
+    /// Plays silence on the Windows default device, then checks that its stream stops once
+    /// paused and starts again at once. `cargo test stream_rests -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real audio device"]
+    fn a_stream_rests_while_paused_and_wakes_at_once() {
+        let _controls = fresh_controls();
+        choose_device("");
+        let mut sink = new_sink();
+        let mut converter = Converter::new(None);
+        let silence = || AudioPacket::Samples(vec![0.0; 4_096 * CHANNELS]);
+        sink.start().unwrap();
+        for _ in 0..10 {
+            sink.write(silence(), &mut converter).unwrap();
+        }
+        assert_eq!(wasapi::resting_streams(), 0, "rested while it had audio");
+
+        set_paused(true);
+        sink.stop().unwrap();
+        thread::sleep(Duration::from_millis(5_600));
+        assert_eq!(wasapi::resting_streams(), 1, "didn't rest while paused");
+        let held = QUEUED_SAMPLES.load(Ordering::SeqCst);
+        assert!(held > 0, "the paused audio should wait for the resume");
+
+        let resumed_at = Instant::now();
+        set_paused(false);
+        sink.start().unwrap();
+        while wasapi::resting_streams() > 0 {
+            assert!(resumed_at.elapsed() < Duration::from_millis(50), "didn't wake");
+            std::hint::spin_loop();
+        }
+        println!("woke within {:?}", resumed_at.elapsed());
+        // The rest of the chunk it was part way through comes first, then the queue moves.
+        while QUEUED_SAMPLES.load(Ordering::SeqCst) >= held {
+            assert!(resumed_at.elapsed() < Duration::from_millis(300), "woke but didn't play");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The end of the music: everything plays out, then it rests again.
+        sink.stop().unwrap();
+        thread::sleep(Duration::from_millis(5_600));
+        assert_eq!(wasapi::resting_streams(), 1, "didn't rest with nothing to play");
+        drop(sink);
+        // Dropping the player ends a resting stream too.
+        let dropped_at = Instant::now();
+        while wasapi::resting_streams() > 0 {
+            assert!(dropped_at.elapsed() < Duration::from_millis(200), "a resting stream outlived its player");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Opens every real output device in turn with silent audio. Run it with

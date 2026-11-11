@@ -1,7 +1,7 @@
 ; Spotlight's installer: a normal Windows setup wizard, for the current user, with no admin rights.
 ;
 ; Build it with scripts/package-windows.ps1, which passes the version and the built exe:
-;   ISCC.exe /DAppVersion=1.1.0 /DSourceExe=..\target\release\Spotlight.exe installer\spotlight.iss
+;   ISCC.exe /DAppVersion=1.2.0 /DSourceExe=..\target\release\Spotlight.exe installer\spotlight.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -72,7 +72,7 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Play Sp
 
 [Registry]
 ; The same entry Spotlight writes itself, which lists it under Startup apps in Task Manager.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --at-sign-in"; Flags: uninsdeletevalue
 ; Task Manager's switch for it is set in the code below, from the sign-in option.
 
 [Run]

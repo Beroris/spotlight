@@ -89,6 +89,9 @@ struct AppState {
     playlist_track_counts: Vec<Option<u32>>,
     track_uris: Vec<String>,
     playlist_track_cache: HashMap<String, Vec<FullTrack>>,
+    /// The version of each library playlist its cached songs came from, so a playlist
+    /// changed elsewhere is fetched again rather than shown as it was.
+    playlist_cache_versions: HashMap<String, String>,
     selected_playlist_uri: String,
     active_queue_playlist_uri: String,
     current_track_uri: Option<String>,
@@ -120,7 +123,19 @@ struct AppState {
     local_playback_start_lock: Arc<tokio::sync::Mutex<()>>,
     track_start_generation: u64,
     track_start_lock: Arc<tokio::sync::Mutex<()>>,
-    library_refresh_in_flight: bool,
+    /// The session whose library refresh is under way. One left over from an account that
+    /// signed out doesn't hold up the next.
+    library_refresh_in_flight: Option<u64>,
+    /// How much of each long list of songs is loaded, by the list's link. Liked Songs too.
+    loaded: HashMap<String, Loaded>,
+    /// Numbers each `loaded` entry, so a part fetched for an older copy of a list isn't added
+    /// to a newer one.
+    load_stamp: u64,
+    /// Goes up whenever the library's playlists change, so a refresh or a "Load more" that
+    /// began before another change doesn't undo it.
+    playlists_revision: u64,
+    /// When the signed-in account was last asked for, while it isn't known yet.
+    account_asked_at: Option<Instant>,
     next_allowed_library_refresh_at_epoch: u64,
     last_device_display: Vec<String>,
     last_queue_display: Vec<String>,
@@ -147,6 +162,50 @@ struct AppState {
     /// report of the active device lags behind, and can still name the one before.
     local_playing: bool,
     track_view_generation: u64,
+    /// Goes up at each sign-out, so what was asked for the account that left can tell when it
+    /// comes back.
+    session: u64,
+}
+
+/// How much of a long list of songs is loaded. Spotify sends a list a part at a time, and
+/// Spotlight loads the rest of a long one only when asked.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Loaded {
+    /// How long the whole list is, as Spotify counts it.
+    total: usize,
+    /// How far into Spotify's list was asked for.
+    wanted: usize,
+    /// Where the next part starts in Spotify's list, while there's more.
+    more_from: Option<usize>,
+    /// Which loading this was, so two copies of a list that look alike can be told apart.
+    stamp: u64,
+}
+
+/// Notes how much of a list is now loaded, numbered afresh.
+fn mark_loaded(guard: &mut AppState, list_uri: &str, mut loaded: Loaded) {
+    guard.load_stamp = guard.load_stamp.wrapping_add(1);
+    loaded.stamp = guard.load_stamp;
+    guard.loaded.insert(list_uri.to_string(), loaded);
+}
+
+/// How far into a list of songs to load: as far as was asked for, and at least the first part.
+fn songs_wanted(guard: &AppState, list_uri: &str) -> usize {
+    guard.loaded.get(list_uri).map_or(0, |loaded| loaded.wanted).max(spotify::SONGS_PER_PART)
+}
+
+/// How many songs Liked Songs has, though only the first are kept between runs.
+fn liked_count(snapshot: &models::LibrarySnapshot) -> usize {
+    snapshot.liked_songs_total.max(snapshot.liked_songs.len())
+}
+
+fn cached_playlist(item: &models::PlaylistItem) -> CachedPlaylist {
+    CachedPlaylist {
+        name: item.name.clone(),
+        uri: item.uri.clone(),
+        image_url: item.images.first().map(|image| image.url.clone()),
+        track_count: item.tracks.total,
+        snapshot_id: item.snapshot_id.clone(),
+    }
 }
 
 impl AppState {
@@ -305,9 +364,14 @@ fn main() -> Result<()> {
     if !config::is_portable() {
         startup_entry::register();
     }
+    let at_sign_in = std::env::args().skip(1).any(|arg| arg == startup_entry::AT_SIGN_IN_ARG);
     let instance = SingleInstance::new("SpotlightDesktopSingleton").context("single-instance init failed")?;
     if !instance.is_single() {
-        eprintln!("Spotlight is already running. Close the existing instance before starting another.");
+        // Opening it again brings back the copy that's running, even from the tray. Windows
+        // starting it at sign-in hasn't been asked to show anything.
+        if !at_sign_in {
+            window_chrome::show_running();
+        }
         return Ok(());
     }
     memory_trim::start();
@@ -322,6 +386,8 @@ fn main() -> Result<()> {
         .iter()
         .map(|item| item.uri.clone())
         .collect::<Vec<_>>();
+    // Not saved between runs. Blank until the library is fetched, as the list's own link works too.
+    let cached_playlist_track_hrefs = vec![String::new(); cached_playlist_uris.len()];
     let cached_playlist_track_counts = config
         .library_snapshot
         .playlists
@@ -336,6 +402,16 @@ fn main() -> Result<()> {
         .map(|item| item.uri.clone())
         .collect::<Vec<_>>();
     let cached_liked_tracks = liked_tracks_from_snapshot(&config);
+    // Only the first of Liked Songs is kept between runs, and the rest loads when asked for.
+    let loaded_liked = {
+        let snapshot = &config.library_snapshot;
+        (snapshot.liked_songs_total > snapshot.liked_songs.len()).then_some(Loaded {
+            total: snapshot.liked_songs_total,
+            wanted: spotify::SONGS_PER_PART,
+            more_from: Some(snapshot.liked_songs.len()),
+            stamp: 0,
+        })
+    };
     let state = Arc::new(Mutex::new(AppState {
         token: config.token.clone(),
         local_playback_token: config.local_playback_token.clone(),
@@ -347,10 +423,11 @@ fn main() -> Result<()> {
         available_device_ids: Vec::new(),
         available_device_names: Vec::new(),
         playlist_uris: cached_playlist_uris,
-        playlist_track_hrefs: Vec::new(),
+        playlist_track_hrefs: cached_playlist_track_hrefs,
         playlist_track_counts: cached_playlist_track_counts,
         track_uris: cached_liked_uris.clone(),
         playlist_track_cache: HashMap::from([(LIKED_SONGS_PLAYLIST_URI.to_string(), cached_liked_tracks)]),
+        playlist_cache_versions: HashMap::new(),
         selected_playlist_uri: LIKED_SONGS_PLAYLIST_URI.to_string(),
         active_queue_playlist_uri: LIKED_SONGS_PLAYLIST_URI.to_string(),
         current_track_uri: None,
@@ -376,7 +453,7 @@ fn main() -> Result<()> {
         local_playback_start_lock: Arc::new(tokio::sync::Mutex::new(())),
         track_start_generation: 0,
         track_start_lock: Arc::new(tokio::sync::Mutex::new(())),
-        library_refresh_in_flight: false,
+        library_refresh_in_flight: None,
         next_allowed_library_refresh_at_epoch,
         last_device_display: Vec::new(),
         last_queue_display: Vec::new(),
@@ -399,6 +476,11 @@ fn main() -> Result<()> {
         local_volume_percent,
         local_playing: false,
         track_view_generation: 0,
+        session: 0,
+        loaded: loaded_liked.into_iter().map(|loaded| (LIKED_SONGS_PLAYLIST_URI.to_string(), loaded)).collect(),
+        load_stamp: 0,
+        playlists_revision: 0,
+        account_asked_at: None,
     }));
 
     let ui = AppWindow::new()?;
@@ -440,6 +522,7 @@ fn main() -> Result<()> {
         ui.set_minimize_to_tray(guard.config.minimize_to_tray);
         ui.set_close_to_tray(guard.config.close_to_tray);
         ui.set_start_minimized(guard.config.start_minimized);
+        ui.set_tray_at_sign_in(guard.config.tray_at_sign_in);
         ui.set_low_resource_mode(guard.config.low_resource_mode);
         ui.set_reduce_animations(guard.config.reduce_animations);
         ui.set_disable_background_effects(guard.config.disable_background_effects);
@@ -498,8 +581,9 @@ fn main() -> Result<()> {
     let hotkeys = {
         let guard = state.lock().unwrap();
         let bindings = hotkey_bindings(&guard.config);
-        if guard.config.media_keys_enabled || guard.config.global_hotkeys {
-            match MediaKeyGuard::install(media_tx.clone(), guard.config.media_keys_enabled, guard.config.global_hotkeys, &bindings) {
+        media_controls::set_enabled(guard.config.media_keys_enabled);
+        if guard.config.global_hotkeys {
+            match MediaKeyGuard::install(media_tx.clone(), &bindings) {
                 Ok(installed) => {
                     ui.set_hotkey_warning(installed.warnings.join("\n").into());
                     Some(installed)
@@ -606,6 +690,9 @@ fn main() -> Result<()> {
             const STARTUP_INTERVAL: Duration = Duration::from_secs(2);
             let opened_at = Instant::now();
             let mut last_poll = Instant::now();
+            // Checks that failed in a row, and what the title bar says about it.
+            let mut misses = 0u32;
+            let mut trouble_shown = "";
             loop {
                 let (interval, playback_only) = {
                     let guard = state.lock().unwrap();
@@ -618,6 +705,18 @@ fn main() -> Result<()> {
                         .is_some_and(|until| Instant::now() < until)
                     {
                         (Duration::from_millis(if foreground { 500 } else if low_resource { 1_000 } else { 750 }), true)
+                    } else if guard.playback_clock.is_playing && guard.local_playing && guard.local_is_active() {
+                        // This PC is the one playing. Its player's own events keep the bar
+                        // right, the next song included, and it hears at once when another
+                        // device takes over. Spotify is asked now and then for the rest, such as
+                        // songs queued from a phone.
+                        let secs = match (foreground, low_resource) {
+                            (true, false) => 5,
+                            (true, true) => 8,
+                            (false, false) => 15,
+                            (false, true) => 30,
+                        };
+                        (Duration::from_secs(secs), true)
                     } else if guard.playback_clock.is_playing {
                         let remaining_ms = guard
                             .playback_clock
@@ -648,14 +747,32 @@ fn main() -> Result<()> {
                     tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
                     continue;
                 }
-                last_poll = Instant::now();
-                if state.lock().unwrap().token.is_none() {
+                let signed_in = state.lock().unwrap().token.is_some();
+                // Asking again before Spotify said to, for this or any other request, only
+                // makes it wait longer.
+                if let Some(wait) = spotify::rate_limit_wait() {
+                    if signed_in {
+                        show_sync_trouble(&ui_weak, &mut trouble_shown, RATE_LIMITED);
+                    }
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
-                if playback_only {
-                    let _ = refresh_playback_only(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await;
+                last_poll = Instant::now();
+                if !signed_in {
+                    misses = 0;
+                    show_sync_trouble(&ui_weak, &mut trouble_shown, "");
+                    continue;
+                }
+                let result = if playback_only {
+                    refresh_playback_only(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await
                 } else {
-                    let _ = refresh_everything(ui_weak.clone(), Arc::clone(&state), spotify_api.clone(), false, false, false).await;
+                    refresh_everything(ui_weak.clone(), Arc::clone(&state), spotify_api.clone(), false, false, false)
+                        .await
+                        .map(|_| ())
+                };
+                // Signed out while it was out: what it found is about the account that left.
+                if state.lock().unwrap().token.is_some() {
+                    show_sync_trouble(&ui_weak, &mut trouble_shown, sync_trouble(&result, &mut misses));
                 }
             }
         });
@@ -674,18 +791,21 @@ fn main() -> Result<()> {
                 } else {
                     Duration::from_secs(1)
                 }).await;
-                let (progress_ms, duration_ms, is_playing) = {
+                let (progress_ms, duration_ms, is_playing, playing_here) = {
                     let guard = state.lock().unwrap();
                     (
                         guard.playback_clock.displayed_progress_ms(),
                         guard.playback_clock.duration_ms,
                         guard.playback_clock.is_playing,
+                        guard.local_playing && guard.local_is_active(),
                     )
                 };
                 if !is_playing || (duration_ms <= 0 && progress_ms <= 0) || (low_resource && !foreground) {
                     continue;
                 }
-                let should_refresh_transition = is_playing && duration_ms > 0 && duration_ms.saturating_sub(progress_ms) <= 250;
+                // This PC's player says itself when the next song starts, so Spotify isn't asked.
+                let should_refresh_transition =
+                    !playing_here && is_playing && duration_ms > 0 && duration_ms.saturating_sub(progress_ms) <= 250;
                 let _ = slint::invoke_from_event_loop({
                     let ui_weak = ui_weak.clone();
                     let state = Arc::clone(&state);
@@ -722,7 +842,7 @@ fn main() -> Result<()> {
                     value = next;
                 }
                 let value = value.clamp(0, 100);
-                let config_to_save = {
+                {
                     let mut guard = volume_state.lock().unwrap();
                     guard.last_volume_change = Some(Instant::now());
                     guard.muted = value == 0;
@@ -735,17 +855,10 @@ fn main() -> Result<()> {
                         // Only this PC's volume is remembered for the next start.
                         if local && guard.config.remember_volume {
                             guard.config.last_volume_percent = value;
-                            Some(guard.config.clone())
-                        } else {
-                            None
+                            config::save_config_background(&guard.config);
                         }
-                    } else {
-                        None
                     }
                 };
-                if let Some(config) = config_to_save {
-                    config::save_config_background(config);
-                }
                 let result = apply_volume_change(Arc::clone(&volume_state), volume_api.clone(), value).await;
                 let _ = slint::invoke_from_event_loop({
                     let ui_weak = ui_weak.clone();
@@ -908,17 +1021,23 @@ fn main() -> Result<()> {
         });
     }
 
-    // A restart after a crash comes back the way the window was. Otherwise the setting says.
+    // A restart after a crash comes back the way the window was. Otherwise the settings say:
+    // started by Windows at sign-in, or set to start minimized with the tray in use, it waits
+    // in the tray.
     let (to_tray, minimized) = match after_crash {
         Some(left) => (left.was_in_tray, left.was_minimized),
         None => {
             let guard = state.lock().unwrap();
             let tray_in_use = guard.config.close_to_tray || guard.config.minimize_to_tray;
-            (guard.config.start_minimized && tray_in_use, guard.config.start_minimized && !tray_in_use)
+            let start_minimized = guard.config.start_minimized;
+            ((at_sign_in && guard.config.tray_at_sign_in) || (start_minimized && tray_in_use), start_minimized && !tray_in_use)
         }
     };
     if to_tray {
+        // The window is made but not shown: the tray brings it out. Hiding it once the event
+        // loop has shown it would flash it on the screen first.
         tray::ensure_started();
+        i_slint_backend_winit::keep_first_window_hidden();
     }
 
     {
@@ -949,8 +1068,9 @@ fn main() -> Result<()> {
 
         // Slint creates the native window some time after the event loop
         // starts, so keep trying briefly until it exists. `ui.run()` shows the window, so going
-        // to the tray or the taskbar waits for it too. The window stays made while it's in the
-        // tray, so the media keys and Windows' media controls still reach it.
+        // to the taskbar waits for it too. Going to the tray kept it hidden already, and hiding
+        // it again changes nothing. The window stays made while it's in the tray, so the media
+        // keys and Windows' media controls still reach it.
         let ui_weak = ui.as_weak();
         retry_chrome_install(ui_weak, 500, move |ui| {
             if to_tray {
@@ -1158,7 +1278,7 @@ fn bind_callbacks(
                         && (guard.config.audio_quality != ui.get_audio_quality().as_str()
                             || guard.config.normalize_volume != ui.get_normalize_volume())
                 };
-                let (config_to_save, playlists, liked_count, artwork_enabled, selected_playlist_uri) = {
+                let (playlists, liked_count, artwork_enabled, selected_playlist_uri) = {
                     let mut guard = state.lock().unwrap();
                     guard.config.client_id = ui.get_client_id().to_string();
                     guard.config.redirect_uri = ui.get_redirect_uri().to_string();
@@ -1189,6 +1309,7 @@ fn bind_callbacks(
                     guard.config.minimize_to_tray = ui.get_minimize_to_tray();
                     guard.config.close_to_tray = ui.get_close_to_tray();
                     guard.config.start_minimized = ui.get_start_minimized();
+                    guard.config.tray_at_sign_in = ui.get_tray_at_sign_in();
                     guard.config.low_resource_mode = ui.get_low_resource_mode();
                     guard.config.reduce_animations = ui.get_reduce_animations();
                     guard.config.disable_background_effects = ui.get_disable_background_effects();
@@ -1197,15 +1318,14 @@ fn bind_callbacks(
                     guard.config.developer_mode = ui.get_developer_mode();
                     guard.config.check_for_updates = ui.get_check_for_updates();
                     UPDATE_AUTO_CHECK.store(guard.config.check_for_updates, Ordering::Relaxed);
+                    config::save_config_background(&guard.config);
                     (
-                        guard.config.clone(),
                         guard.config.library_snapshot.playlists.clone(),
-                        guard.config.library_snapshot.liked_songs.len(),
+                        liked_count(&guard.config.library_snapshot),
                         guard.config.artwork_enabled,
                         guard.selected_playlist_uri.clone(),
                     )
                 };
-                config::save_config_background(config_to_save);
                 if audio_settings_changed {
                     // Clicking through the options should cause one restart, so
                     // only the last change after a short pause goes ahead.
@@ -1243,9 +1363,12 @@ fn bind_callbacks(
                     // Release the old registrations before registering again,
                     // otherwise the same keys report "already registered".
                     *hotkeys = None;
-                    if ui.get_global_hotkeys() || ui.get_media_keys_enabled() {
+                    if media_controls::set_enabled(ui.get_media_keys_enabled()) {
+                        now_playing_changed(&ui, &state);
+                    }
+                    if ui.get_global_hotkeys() {
                         let bindings = hotkey_bindings(&state.lock().unwrap().config);
-                        match MediaKeyGuard::install(media_tx.clone(), ui.get_media_keys_enabled(), ui.get_global_hotkeys(), &bindings) {
+                        match MediaKeyGuard::install(media_tx.clone(), &bindings) {
                             Ok(guard) => {
                                 for warning in &guard.warnings {
                                     append_log(&ui, warning);
@@ -1269,6 +1392,17 @@ fn bind_callbacks(
                 append_log(&ui, "Saved settings.");
             }
         }
+    });
+
+    let ui_weak = ui.as_weak();
+    ui.on_measure_cover_cache(move || show_cover_cache_size(ui_weak.clone(), false));
+    let ui_weak = ui.as_weak();
+    ui.on_clear_cover_cache(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            // Pressed once is enough, while the clearing goes on.
+            ui.set_cover_cache_clearable(false);
+        }
+        show_cover_cache_size(ui_weak.clone(), true);
     });
 
     let ui_weak = ui.as_weak();
@@ -1388,17 +1522,50 @@ fn bind_callbacks(
         let state = Arc::clone(&state);
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let config_to_save = {
+                {
                     let mut guard = state.lock().unwrap();
+                    guard.session = guard.session.wrapping_add(1);
+                    guard.track_view_generation = guard.track_view_generation.wrapping_add(1);
                     guard.token = None;
                     guard.local_playback_token = None;
                     guard.config.token = None;
                     guard.config.local_playback_token = None;
+                    // Its Recently played stays on this PC, for when it signs in again. A song
+                    // still waiting to count doesn't count for whoever comes next.
+                    guard.config.account_id = None;
+                    guard.account_asked_at = None;
+                    guard.play_watch.stopped();
                     if let Some(engine) = guard.playback_engine.as_ref() {
                         engine.shutdown();
                     }
-                    guard.config.clone()
-                };
+                    // The next account mustn't see this one's playlists, even for a moment,
+                    // and its library loads straight away rather than after a wait.
+                    guard.config.library_snapshot = Default::default();
+                    guard.config.startup_snapshot = Default::default();
+                    guard.next_allowed_library_refresh_at_epoch = 0;
+                    guard.playlists_revision = guard.playlists_revision.wrapping_add(1);
+                    guard.playlist_uris.clear();
+                    guard.playlist_track_hrefs.clear();
+                    guard.playlist_track_counts.clear();
+                    guard.track_uris.clear();
+                    guard.playlist_track_cache = HashMap::from([(LIKED_SONGS_PLAYLIST_URI.to_string(), Vec::new())]);
+                    guard.playlist_cache_versions.clear();
+                    guard.loaded.clear();
+                    guard.selected_playlist_uri = LIKED_SONGS_PLAYLIST_URI.to_string();
+                    // Nor its Next up.
+                    guard.queue_override_tracks.clear();
+                    guard.queue_override_active = false;
+                    guard.spotify_queue_tracks = None;
+                    guard.spotify_queue_current_uri = None;
+                    guard.last_queue_display.clear();
+                    guard.last_queue_summary.clear();
+                    guard.queue_painted_uris.clear();
+                    config::save_config_background(&guard.config);
+                }
+                apply_playlist_rows(&ui, &[], 0, false, None);
+                ui.set_more_playlists(false);
+                show_tracks(&ui, Vec::new());
+                clear_queue_rows(&ui);
                 clear_local_playback_engine(&state);
                 {
                     let mut guard = state.lock().unwrap();
@@ -1406,12 +1573,12 @@ fn bind_callbacks(
                     guard.device_id = None;
                     guard.preferred_device_id = None;
                 }
-                config::save_config_background(config_to_save);
                 forget_home(&ui);
                 clear_now_playing(&ui, &state);
                 left_off::forget();
                 ui.set_connection_status("Signed out".into());
                 ui.set_player_status("Offline".into());
+                ui.set_sync_trouble("".into());
                 ui.set_signed_in(false);
                 ui.set_connect_stage("".into());
                 ui.set_player_ready(false);
@@ -1427,17 +1594,21 @@ fn bind_callbacks(
         let state = Arc::clone(&state);
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let config_to_save = {
+                {
                     let mut guard = state.lock().unwrap();
+                    guard.session = guard.session.wrapping_add(1);
+                    guard.track_view_generation = guard.track_view_generation.wrapping_add(1);
                     guard.token = None;
                     guard.local_playback_token = None;
                     guard.config.token = None;
                     guard.config.local_playback_token = None;
+                    guard.config.account_id = None;
+                    guard.account_asked_at = None;
+                    guard.play_watch.stopped();
                     guard.config.library_snapshot = Default::default();
                     guard.config.startup_snapshot = Default::default();
-                    guard.config.clone()
-                };
-                config::save_config_background(config_to_save);
+                    config::save_config_background(&guard.config);
+                }
                 if let Ok(dir) = config::config_dir() {
                     let art_dir = dir.join("album-art");
                     let _ = std::thread::Builder::new()
@@ -1491,9 +1662,16 @@ fn bind_callbacks(
                     Ok(token) => {
                         let player_signed_in = {
                             let mut guard = state.lock().unwrap();
+                            // It may be another account than before, so what's still being asked
+                            // for the one before, which account it is included, is out of date,
+                            // and a song waiting to count doesn't count for this one.
+                            guard.session = guard.session.wrapping_add(1);
+                            guard.play_watch.stopped();
                             guard.token = Some(token.clone());
                             guard.config.token = Some(token.clone());
-                            let _ = config::save_config(&guard.config);
+                            guard.config.account_id = None;
+                            guard.account_asked_at = None;
+                            config::save_config_background(&guard.config);
                             guard.local_playback_token.is_some()
                         };
                         let ui_weak_signed = ui_weak.clone();
@@ -1569,6 +1747,128 @@ fn bind_callbacks(
     });
 
     let ui_weak = ui.as_weak();
+    ui.on_load_more_tracks({
+        let runtime = Arc::clone(&runtime);
+        let state = Arc::clone(&state);
+        let spotify_api = spotify_api.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if ui.get_track_view_more_busy() {
+                return;
+            }
+            let (list_uri, loaded, session) = {
+                let guard = state.lock().unwrap();
+                let list_uri = guard.selected_playlist_uri.clone();
+                let Some(loaded) = guard.loaded.get(&list_uri).copied().filter(|loaded| loaded.more_from.is_some()) else {
+                    return;
+                };
+                (list_uri, loaded, guard.session)
+            };
+            ui.set_track_view_more_busy(true);
+            let ui_weak = ui_weak.clone();
+            let state = Arc::clone(&state);
+            let spotify_api = spotify_api.clone();
+            runtime.spawn(async move {
+                let result = load_more_songs(&state, &spotify_api, session, &list_uri, loaded).await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    let (same_session, same_list) = {
+                        let guard = state.lock().unwrap();
+                        (guard.session == session, guard.selected_playlist_uri == list_uri)
+                    };
+                    // Another list is shown now, which let go of the button. This one keeps what
+                    // came, for when it's back.
+                    if !same_list {
+                        return;
+                    }
+                    ui.set_track_view_more_busy(false);
+                    // Signed out or in again meanwhile: what came was for the session before.
+                    if !same_session {
+                        show_more_to_load(&ui, &state);
+                        return;
+                    }
+                    match result {
+                        Ok(Some(tracks)) => {
+                            refresh_tracks_in_place(&ui, tracks);
+                            show_more_to_load(&ui, &state);
+                        }
+                        Ok(None) => show_more_to_load(&ui, &state),
+                        Err(error) => {
+                            append_log(&ui, &format!("Loading more songs failed: {error}"));
+                            show_toast(&ui, "Couldn't load more songs", true);
+                        }
+                    }
+                });
+            });
+        }
+    });
+
+    let ui_weak = ui.as_weak();
+    ui.on_load_more_playlists({
+        let runtime = Arc::clone(&runtime);
+        let state = Arc::clone(&state);
+        let spotify_api = spotify_api.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if ui.get_more_playlists_busy() {
+                return;
+            }
+            let (from, session, revision) = {
+                let guard = state.lock().unwrap();
+                (guard.config.library_snapshot.playlists.len(), guard.session, guard.playlists_revision)
+            };
+            ui.set_more_playlists_busy(true);
+            let ui_weak = ui_weak.clone();
+            let state = Arc::clone(&state);
+            let spotify_api = spotify_api.clone();
+            runtime.spawn(async move {
+                let fetched = match current_token(&state).await {
+                    Ok(token) => spotify_api.playlists(&token, from, spotify::PLAYLISTS_PER_PART).await,
+                    Err(error) => Err(error),
+                };
+                let failed = match fetched {
+                    Ok(part) => {
+                        let mut guard = state.lock().unwrap();
+                        // Signed out, or the library changed meanwhile: it asks again if need be.
+                        if ensure_same_session(&guard, session).is_ok() && guard.playlists_revision == revision {
+                            guard.playlists_revision = revision.wrapping_add(1);
+                            for item in &part.items {
+                                guard.playlist_uris.push(item.uri.clone());
+                                guard.playlist_track_hrefs.push(item.tracks.href.clone());
+                                guard.playlist_track_counts.push(item.tracks.total);
+                                guard.config.library_snapshot.playlists.push(cached_playlist(item));
+                            }
+                            guard.config.library_snapshot.playlists_total = part.total;
+                            guard.config.library_snapshot.playlists_wanted = from + spotify::PLAYLISTS_PER_PART;
+                            config::save_config_background(&guard.config);
+                        }
+                        None
+                    }
+                    Err(error) => Some(error.to_string()),
+                };
+                let _ = slint::invoke_from_event_loop({
+                    let ui_weak = ui_weak.clone();
+                    let state = Arc::clone(&state);
+                    move || {
+                        let Some(ui) = ui_weak.upgrade() else { return };
+                        ui.set_more_playlists_busy(false);
+                        if let Some(error) = failed {
+                            append_log(&ui, &format!("Loading more playlists failed: {error}"));
+                            show_toast(&ui, "Couldn't load more playlists", true);
+                            return;
+                        }
+                        let guard = state.lock().unwrap();
+                        let snapshot = &guard.config.library_snapshot;
+                        apply_playlist_rows(&ui, &snapshot.playlists, liked_count(snapshot), guard.config.artwork_enabled, Some(guard.selected_playlist_uri.as_str()));
+                        ui.set_more_playlists(more_playlists(snapshot));
+                    }
+                });
+                warm_playlist_art_and_repaint(ui_weak, state).await;
+            });
+        }
+    });
+
+    let ui_weak = ui.as_weak();
     ui.on_select_playlist({
         let runtime = Arc::clone(&runtime);
         let state = Arc::clone(&state);
@@ -1624,7 +1924,7 @@ fn bind_callbacks(
             if !needle.is_empty() {
                 let images = ui.get_playlist_images();
                 let guard = state.lock().unwrap();
-                let names = std::iter::once(("Liked Songs".to_string(), format!("{} songs", guard.config.library_snapshot.liked_songs.len())))
+                let names = std::iter::once(("Liked Songs".to_string(), format!("{} songs", liked_count(&guard.config.library_snapshot))))
                     .chain(guard.config.library_snapshot.playlists.iter().map(|playlist| {
                         (
                             playlist.name.clone(),
@@ -1910,7 +2210,7 @@ fn bind_callbacks(
                 if let Some(position) = left_at {
                     let mut guard = state.lock().unwrap();
                     guard.config.mini_position = Some(position);
-                    config::save_config_background(guard.config.clone());
+                    config::save_config_background(&guard.config);
                 }
             } else {
                 let (on_top, position) = {
@@ -1933,7 +2233,7 @@ fn bind_callbacks(
             window_chrome::set_mini_on_top(on_top);
             let mut guard = state.lock().unwrap();
             guard.config.mini_on_top = on_top;
-            config::save_config_background(guard.config.clone());
+            config::save_config_background(&guard.config);
         }
     });
     ui.on_mini_moved({
@@ -1942,7 +2242,7 @@ fn bind_callbacks(
             let mut guard = state.lock().unwrap();
             if guard.config.mini_position != Some((x, y)) {
                 guard.config.mini_position = Some((x, y));
-                config::save_config_background(guard.config.clone());
+                config::save_config_background(&guard.config);
             }
         }
     });
@@ -2237,7 +2537,7 @@ fn bind_callbacks(
             guard.config.compact_sidebars = ui.get_compact_sidebars();
             guard.config.library_width = ui.get_library_width().round().max(0.0) as u32;
             guard.config.panel_width = ui.get_panel_width().round().max(0.0) as u32;
-            config::save_config_background(guard.config.clone());
+            config::save_config_background(&guard.config);
         }
     });
     ui.on_refresh_home({
@@ -2457,7 +2757,7 @@ fn bind_callbacks(
             apply_playlist_rows(
                 &ui,
                 &guard.config.library_snapshot.playlists,
-                guard.config.library_snapshot.liked_songs.len(),
+                liked_count(&guard.config.library_snapshot),
                 guard.config.artwork_enabled,
                 Some(guard.selected_playlist_uri.as_str()),
             );
@@ -2543,7 +2843,7 @@ fn bind_callbacks(
             };
             let (generation, source) = generation;
             let uris = uris_from_queue_click(&queue_uris, index, &source);
-            remember_last_track_uri(&state, &selected.uri);
+            remember_last_track_uri(&state, current_session(&state), &selected.uri);
             if let Some(ui) = ui_weak.upgrade() {
                 set_now_playing_from_track(&ui, &state, &selected, NowPlayingUpdate::Optimistic);
                 repaint_queue(&ui, &state);
@@ -2971,7 +3271,7 @@ fn bind_playback_callbacks(
                     }
                     return;
                   }
-                  remember_last_playlist_uri(&state, &context_uri);
+                  remember_last_playlist_uri(&state, current_session(&state), &context_uri);
                   {
                       let playlist_tracks = state
                           .lock()
@@ -3113,11 +3413,36 @@ fn bind_playback_callbacks(
 /// unliked (`None`), so menus know without asking Spotify.
 fn remember_liked(state: &Mutex<AppState>, uri: &str, song: Option<&FullTrack>) {
     let mut guard = state.lock().unwrap();
+    let mut was_loaded = false;
     if let Some(songs) = guard.playlist_track_cache.get_mut(LIKED_SONGS_PLAYLIST_URI) {
+        was_loaded = songs.iter().any(|known| known.uri == uri);
         songs.retain(|known| known.uri != uri);
         if let Some(song) = song {
             songs.insert(0, song.clone());
         }
+    }
+    // A new like goes at the top, moving the rest down one, and an unlike takes one out. A part
+    // still loading was counted from before either, so it's numbered afresh.
+    let (more, fewer) = (song.is_some() && !was_loaded, song.is_none());
+    if more || fewer {
+        guard.load_stamp = guard.load_stamp.wrapping_add(1);
+        let stamp = guard.load_stamp;
+        if let Some(loaded) = guard.loaded.get_mut(LIKED_SONGS_PLAYLIST_URI) {
+            loaded.stamp = stamp;
+            if more {
+                loaded.total += 1;
+                loaded.more_from = loaded.more_from.map(|from| from + 1);
+            } else {
+                loaded.total = loaded.total.saturating_sub(1);
+                if was_loaded {
+                    loaded.more_from = loaded.more_from.map(|from| from.saturating_sub(1));
+                }
+            }
+        }
+    }
+    let total = &mut guard.config.library_snapshot.liked_songs_total;
+    if *total > 0 {
+        *total = if more { *total + 1 } else if fewer { total.saturating_sub(1) } else { *total };
     }
     let saved = &mut guard.config.library_snapshot.liked_songs;
     saved.retain(|known| known.uri != uri);
@@ -3135,9 +3460,14 @@ fn remember_liked(state: &Mutex<AppState>, uri: &str, song: Option<&FullTrack>) 
 
 /// A playlist just made, at the top of the library.
 fn add_new_playlist_to_library(ui: &AppWindow, state: &Mutex<AppState>, playlist: models::PlaylistItem, has_song: bool) {
-    let (playlists, liked_count, artwork_enabled, selected_uri, config) = {
+    let (playlists, liked_count, artwork_enabled, selected_uri) = {
         let mut guard = state.lock().unwrap();
         let count = Some(u32::from(has_song));
+        guard.playlists_revision = guard.playlists_revision.wrapping_add(1);
+        // One more in the library too, so "Load more" still knows how many are left.
+        if guard.config.library_snapshot.playlists_total > 0 {
+            guard.config.library_snapshot.playlists_total += 1;
+        }
         guard.playlist_uris.insert(0, playlist.uri.clone());
         guard.playlist_track_hrefs.insert(0, playlist.tracks.href.clone());
         guard.playlist_track_counts.insert(0, count);
@@ -3146,16 +3476,16 @@ fn add_new_playlist_to_library(ui: &AppWindow, state: &Mutex<AppState>, playlist
             uri: playlist.uri.clone(),
             image_url: None,
             track_count: count,
+            snapshot_id: playlist.snapshot_id.clone(),
         });
+        config::save_config_background(&guard.config);
         (
             guard.config.library_snapshot.playlists.clone(),
-            guard.config.library_snapshot.liked_songs.len(),
+            liked_count(&guard.config.library_snapshot),
             guard.config.artwork_enabled,
             guard.selected_playlist_uri.clone(),
-            guard.config.clone(),
         )
     };
-    config::save_config_background(config);
     // Everything below Liked Songs moves down one.
     let selected = ui.get_selected_playlist_index();
     apply_playlist_rows(ui, &playlists, liked_count, artwork_enabled, Some(selected_uri.as_str()));
@@ -3181,10 +3511,11 @@ fn apply_cached_library_to_ui(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
     apply_playlist_rows(
         ui,
         &guard.config.library_snapshot.playlists,
-        guard.config.library_snapshot.liked_songs.len(),
+        liked_count(&guard.config.library_snapshot),
         guard.config.artwork_enabled,
         Some(guard.selected_playlist_uri.as_str()),
     );
+    ui.set_more_playlists(more_playlists(&guard.config.library_snapshot));
     ui.set_queue_summary("Queue unavailable until playback starts".into());
     clear_queue_rows(ui);
     ui.set_device_titles(ModelRc::from(Rc::new(VecModel::<SharedString>::from(Vec::new()))));
@@ -3253,6 +3584,10 @@ struct TrackView {
     art_by_url: HashMap<String, slint::Image>,
     /// Displayed rows waiting for each thumbnail.
     rows_by_url: HashMap<String, Vec<usize>>,
+    /// Songs shown, songs in the list, and how long those shown play.
+    counts: (usize, usize, i64),
+    /// How long the whole list is on Spotify, while only part of it is loaded.
+    in_spotify: Option<usize>,
 }
 
 thread_local! {
@@ -3450,7 +3785,8 @@ async fn load_detail_page(
             };
             // Spotify leaves out what this PC's player plays, so those come from Spotlight's
             // own list.
-            let played_here = tokio::task::spawn_blocking(history::load).await.unwrap_or_default();
+            let account = state.lock().unwrap().config.account_id.clone();
+            let played_here = tokio::task::spawn_blocking(move || history::load(account.as_deref())).await.unwrap_or_default();
             let from_spotify = match from_spotify {
                 Ok(songs) => songs,
                 Err(_) if !played_here.is_empty() => Vec::new(),
@@ -3735,13 +4071,20 @@ fn format_total_duration(total_ms: i64) -> String {
 /// Replace the main track list. Resets the in-playlist filter.
 fn show_tracks(ui: &AppWindow, tracks: Vec<FullTrack>) {
     ui.set_track_filter("".into());
+    // A long library list offers the rest again once it's shown, by `show_more_to_load`.
+    ui.set_track_view_more(false);
+    ui.set_track_view_more_busy(false);
     TRACK_VIEW.with(|view| {
         let mut view = view.borrow_mut();
         view.source = tracks;
         view.filter.clear();
-        // 64px thumbnails are ~16 KB each; keep the total bounded.
-        if view.art_by_url.len() > 2_000 {
-            view.art_by_url.clear();
+        view.in_spotify = None;
+        // 64px thumbnails are ~16 KB each. Other lists' covers decode again quickly from the
+        // disk, so once there are many only this list's stay.
+        if view.art_by_url.len() > 300 {
+            let view = &mut *view;
+            let shown: std::collections::HashSet<&str> = view.source.iter().filter_map(row_art_url).collect();
+            view.art_by_url.retain(|url, _| shown.contains(url.as_str()));
         }
     });
     apply_track_filter(ui);
@@ -3770,7 +4113,7 @@ fn set_track_filter(ui: &AppWindow, filter: &str) {
 }
 
 fn apply_track_filter(ui: &AppWindow) {
-    let (mut rows, total, total_ms, generation, missing) = TRACK_VIEW.with(|view| {
+    let (mut rows, generation, missing) = TRACK_VIEW.with(|view| {
         let mut view = view.borrow_mut();
         // A new list supersedes any thumbnail stream still running for the old one.
         view.generation = view.generation.wrapping_add(1);
@@ -3805,9 +4148,9 @@ fn apply_track_filter(ui: &AppWindow) {
         let mut missing = rows_by_url.keys().cloned().collect::<Vec<_>>();
         missing.sort_by_key(|url| rows_by_url[url].first().copied().unwrap_or(usize::MAX));
         view.rows_by_url = rows_by_url;
-        (rows, view.source.len(), total_ms, view.generation, missing)
+        view.counts = (rows.len(), view.source.len(), total_ms);
+        (rows, view.generation, missing)
     });
-    let shown = rows.len();
     ui.set_tracks_have_album(rows.iter().any(|row| !row.album.is_empty()));
     if !rows.is_empty() {
         // An empty last row lets the final songs scroll clear of the player bar.
@@ -3816,18 +4159,132 @@ fn apply_track_filter(ui: &AppWindow) {
     let model = Rc::new(VecModel::from(rows));
     ui.set_track_rows(ModelRc::from(model.clone()));
     TRACK_VIEW.with(|view| view.borrow_mut().model = Some(model));
-    let songs = |n: usize| if n == 1 { "1 song".to_string() } else { format!("{n} songs") };
-    let meta = if shown == total {
-        if total_ms > 0 {
-            format!("{} • {}", songs(total), format_total_duration(total_ms))
-        } else {
-            songs(total)
-        }
-    } else {
-        format!("{shown} of {}", songs(total))
-    };
-    ui.set_track_view_meta(meta.into());
+    show_track_meta(ui);
     stream_row_art(ui.as_weak(), generation, missing);
+}
+
+/// The line under the list's title: how many songs, and how long they play.
+fn show_track_meta(ui: &AppWindow) {
+    let meta = TRACK_VIEW.with(|view| {
+        let view = view.borrow();
+        let (shown, total, total_ms) = view.counts;
+        let songs = |n: usize| if n == 1 { "1 song".to_string() } else { format!("{n} songs") };
+        match view.in_spotify {
+            // Only part is loaded, which says why the list ends where it does.
+            Some(in_spotify) => format!("{shown} of {}", songs(in_spotify)),
+            None if shown == total && total_ms > 0 => format!("{} • {}", songs(total), format_total_duration(total_ms)),
+            None if shown == total => songs(total),
+            None => format!("{shown} of {}", songs(total)),
+        }
+    });
+    ui.set_track_view_meta(meta.into());
+}
+
+/// Offers the rest of the library list shown, if only part of it is loaded.
+fn show_more_to_load(ui: &AppWindow, state: &Mutex<AppState>) {
+    let in_spotify = {
+        let guard = state.lock().unwrap();
+        guard
+            .loaded
+            .get(&guard.selected_playlist_uri)
+            .filter(|loaded| loaded.more_from.is_some())
+            .map(|loaded| loaded.total)
+    };
+    TRACK_VIEW.with(|view| view.borrow_mut().in_spotify = in_spotify);
+    ui.set_track_view_more(in_spotify.is_some());
+    show_track_meta(ui);
+}
+
+/// Whether the library has more playlists than are loaded.
+fn more_playlists(snapshot: &models::LibrarySnapshot) -> bool {
+    snapshot.playlists_total > snapshot.playlists.len()
+}
+
+/// A library list's songs from the start, as far as was asked for, fetched and kept with how
+/// much more there is. Liked Songs too.
+async fn fetch_list_songs(
+    state: &Arc<Mutex<AppState>>,
+    spotify_api: &spotify::SpotifyApi,
+    token: &TokenStore,
+    session: u64,
+    list_uri: &str,
+) -> Result<Vec<FullTrack>> {
+    let wanted = songs_wanted(&state.lock().unwrap(), list_uri);
+    let part = fetch_songs(state, spotify_api, token, list_uri, 0, wanted).await?;
+    let mut guard = state.lock().unwrap();
+    ensure_same_session(&guard, session)?;
+    mark_loaded(&mut guard, list_uri, Loaded { total: part.total, wanted, more_from: part.more_from, stamp: 0 });
+    guard.playlist_track_cache.insert(list_uri.to_string(), part.items.clone());
+    Ok(part.items)
+}
+
+/// About `count` of a library list's songs from `from` on.
+async fn fetch_songs(
+    state: &Arc<Mutex<AppState>>,
+    spotify_api: &spotify::SpotifyApi,
+    token: &TokenStore,
+    list_uri: &str,
+    from: usize,
+    count: usize,
+) -> Result<spotify::Part<FullTrack>> {
+    if list_uri == LIKED_SONGS_PLAYLIST_URI {
+        return spotify_api.liked_songs(token, from, count).await;
+    }
+    let href = {
+        let guard = state.lock().unwrap();
+        guard
+            .playlist_uris
+            .iter()
+            .position(|uri| uri == list_uri)
+            .and_then(|index| guard.playlist_track_hrefs.get(index).filter(|href| !href.is_empty()).cloned())
+    };
+    match href {
+        Some(href) => spotify_api.playlist_tracks_by_href(token, &href, from, count).await,
+        None => {
+            let playlist_id = spotify_playlist_id_from_uri(list_uri).ok_or_else(|| anyhow!("invalid playlist URI"))?;
+            spotify_api.playlist_tracks(token, &playlist_id, from, count).await
+        }
+    }
+}
+
+/// The next part of a long list, added to what's kept of it. Gives the whole list as it now
+/// stands, or `None` if the list changed meanwhile, as a library refresh can.
+async fn load_more_songs(
+    state: &Arc<Mutex<AppState>>,
+    spotify_api: &spotify::SpotifyApi,
+    session: u64,
+    list_uri: &str,
+    loaded: Loaded,
+) -> Result<Option<Vec<FullTrack>>> {
+    let Some(from) = loaded.more_from else { return Ok(None) };
+    let token = current_token(state).await?;
+    let part = fetch_songs(state, spotify_api, &token, list_uri, from, spotify::SONGS_PER_PART).await?;
+    let mut guard = state.lock().unwrap();
+    ensure_same_session(&guard, session)?;
+    if guard.loaded.get(list_uri) != Some(&loaded) {
+        return Ok(None);
+    }
+    let Some(tracks) = guard.playlist_track_cache.get_mut(list_uri) else { return Ok(None) };
+    if list_uri == LIKED_SONGS_PLAYLIST_URI {
+        // A like elsewhere can move a song across the cut. A playlist can hold a song twice.
+        let known: std::collections::HashSet<String> = tracks.iter().map(|track| track.uri.clone()).collect();
+        tracks.extend(part.items.into_iter().filter(|track| !known.contains(&track.uri)));
+    } else {
+        tracks.extend(part.items);
+    }
+    let tracks = tracks.clone();
+    mark_loaded(
+        &mut guard,
+        list_uri,
+        Loaded { total: part.total, wanted: from + spotify::SONGS_PER_PART, more_from: part.more_from, stamp: 0 },
+    );
+    if list_uri == LIKED_SONGS_PLAYLIST_URI {
+        guard.config.library_snapshot.liked_songs_total = part.total;
+    }
+    if guard.selected_playlist_uri == list_uri {
+        guard.track_uris = tracks.iter().map(|track| track.uri.clone()).collect();
+    }
+    Ok(Some(tracks))
 }
 
 /// Download (if needed) and decode row thumbnails in the background, patching
@@ -3904,7 +4361,10 @@ fn bind_updates(ui: &AppWindow, runtime: &Arc<Runtime>, http: reqwest::Client, c
                 ui.set_update_busy("checking".into());
                 ui.set_update_note("".into());
             }
-            runtime.spawn(check_for_update(ui_weak.clone(), http.clone(), kind, false));
+            let (ui_weak, http) = (ui_weak.clone(), http.clone());
+            runtime.spawn(async move {
+                check_for_update(ui_weak, http, kind, false).await;
+            });
         }
     });
 
@@ -3929,6 +4389,13 @@ fn bind_updates(ui: &AppWindow, runtime: &Arc<Runtime>, http: reqwest::Client, c
                 let _ = webbrowser::open(&release.page);
                 return;
             };
+            // Without a checksum the download can't be checked against the release, so the
+            // user says first that it's fine.
+            if download.sha256.is_none() && !ui.get_update_confirming() {
+                ui.set_update_confirming(true);
+                return;
+            }
+            ui.set_update_confirming(false);
             let destination = match updates::download_path(kind, &download) {
                 Ok(destination) => destination,
                 Err(error) => {
@@ -3984,24 +4451,37 @@ fn bind_updates(ui: &AppWindow, runtime: &Arc<Runtime>, http: reqwest::Client, c
         // started this copy has finished, so what it left can go.
         tokio::time::sleep(Duration::from_secs(20)).await;
         let _ = tokio::task::spawn_blocking(updates::clean_up).await;
+        let _ = tokio::task::spawn_blocking(trim_album_art_cache).await;
         const DAY: Duration = Duration::from_secs(24 * 60 * 60);
         let mut last_check: Option<std::time::SystemTime> = None;
+        let mut hours_since_trim = 0u32;
         loop {
             // By the clock on the wall, so a day asleep counts.
             let due = last_check.map_or(true, |at| at.elapsed().map_or(true, |since| since >= DAY));
             if due && UPDATE_AUTO_CHECK.load(Ordering::Relaxed) && !UPDATE_BUSY.swap(true, Ordering::SeqCst) {
-                last_check = Some(std::time::SystemTime::now());
-                check_for_update(ui_weak.clone(), http.clone(), kind, true).await;
+                let started = std::time::SystemTime::now();
+                // One that fails, say with no connection yet, is tried again in an hour.
+                if check_for_update(ui_weak.clone(), http.clone(), kind, true).await {
+                    last_check = Some(started);
+                }
             }
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            // A copy left running in the tray for weeks keeps fetching covers too.
+            hours_since_trim += 1;
+            if hours_since_trim >= 24 {
+                hours_since_trim = 0;
+                let _ = tokio::task::spawn_blocking(trim_album_art_cache).await;
+            }
         }
     });
 }
 
 /// Asks GitHub for a newer version and shows the answer. The caller has set `UPDATE_BUSY`.
-/// Found without being asked, a new version gets a toast; failures then stay quiet.
-async fn check_for_update(ui_weak: slint::Weak<AppWindow>, http: reqwest::Client, kind: updates::Kind, automatic: bool) {
+/// Found without being asked, a new version gets a toast; failures then stay quiet. True if
+/// GitHub answered.
+async fn check_for_update(ui_weak: slint::Weak<AppWindow>, http: reqwest::Client, kind: updates::Kind, automatic: bool) -> bool {
     let result = updates::check(&http, kind).await;
+    let answered = result.is_ok();
     let _ = slint::invoke_from_event_loop(move || {
         UPDATE_BUSY.store(false, Ordering::SeqCst);
         let Some(ui) = ui_weak.upgrade() else {
@@ -4013,6 +4493,10 @@ async fn check_for_update(ui_weak: slint::Weak<AppWindow>, http: reqwest::Client
         match result {
             Ok(Some(release)) => {
                 let new_to_us = ui.get_update_version() != release.version.as_str();
+                if new_to_us {
+                    // A yes was for the file asked about, not for this one.
+                    ui.set_update_confirming(false);
+                }
                 ui.set_update_version(release.version.as_str().into());
                 ui.set_update_note("".into());
                 if automatic && new_to_us {
@@ -4035,6 +4519,7 @@ async fn check_for_update(ui_weak: slint::Weak<AppWindow>, http: reqwest::Client
             }
         }
     });
+    answered
 }
 
 fn show_toast(ui: &AppWindow, message: &str, is_error: bool) {
@@ -4213,6 +4698,11 @@ fn apply_device_rows(
     ui.set_device_is_local(ModelRc::from(Rc::new(VecModel::from(local))));
 }
 
+thread_local! {
+    /// What the queue shows: its songs, which have covers, and whether it can be edited.
+    static QUEUE_PAINTED: RefCell<Option<(Vec<String>, Vec<bool>, bool)>> = const { RefCell::new(None) };
+}
+
 fn apply_queue_rows(
     ui: &AppWindow,
     state: &Arc<Mutex<AppState>>,
@@ -4223,27 +4713,34 @@ fn apply_queue_rows(
         return;
     }
     let tracks = current_queue_tracks(state);
-    state.lock().unwrap().queue_painted_uris = tracks.iter().map(|track| track.uri.clone()).collect();
+    let uris: Vec<String> = tracks.iter().map(|track| track.uri.clone()).collect();
+    state.lock().unwrap().queue_painted_uris = uris.clone();
+    let mut missing = Vec::new();
+    let art_paths = tracks
+        .iter()
+        .map(|track| {
+            let url = row_art_url(track)?;
+            let path = cached_album_art_path(url);
+            if path.is_none() {
+                missing.push(url.to_string());
+            }
+            path
+        })
+        .collect::<Vec<_>>();
+    // Spotify's queue is fetched every few seconds while music plays, and is mostly the same.
+    let painted = (uris, art_paths.iter().map(Option::is_some).collect::<Vec<_>>(), reorder_enabled);
+    if QUEUE_PAINTED.with(|last| last.borrow().as_ref() == Some(&painted)) {
+        return;
+    }
+    QUEUE_PAINTED.with(|last| *last.borrow_mut() = Some(painted));
     let titles = tracks.iter().map(|t| SharedString::from(t.name.clone())).collect::<Vec<_>>();
     let artists = tracks
         .iter()
         .map(|t| SharedString::from(t.artists.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")))
         .collect::<Vec<_>>();
-    let mut missing = Vec::new();
-    let images = tracks
+    let images = art_paths
         .iter()
-        .map(|track| {
-            let Some(url) = row_art_url(track) else {
-                return slint::Image::default();
-            };
-            match cached_album_art_path(url) {
-                Some(path) => load_image_from_path(&path),
-                None => {
-                    missing.push(url.to_string());
-                    slint::Image::default()
-                }
-            }
-        })
+        .map(|path| path.as_ref().map_or_else(slint::Image::default, load_image_from_path))
         .collect::<Vec<_>>();
 
     ui.set_queue_titles(ModelRc::from(Rc::new(VecModel::from(titles))));
@@ -4367,6 +4864,47 @@ fn optimistic_previous(ui: &AppWindow, state: &Arc<Mutex<AppState>>) -> bool {
     set_now_playing_from_track(ui, state, &previous_track, NowPlayingUpdate::Optimistic);
     begin_fast_playback_refresh(state, Duration::from_secs(4));
     true
+}
+
+/// What the title bar says while Spotify asks Spotlight to slow down.
+const RATE_LIMITED: &str = "Spotify asked Spotlight to wait";
+
+/// What keeps Spotlight from keeping up with Spotify, after a background check, or "" for
+/// nothing. A single miss passes unremarked, since the next check usually works.
+fn sync_trouble(result: &Result<()>, misses: &mut u32) -> &'static str {
+    let Err(error) = result else {
+        *misses = 0;
+        return "";
+    };
+    *misses = misses.saturating_add(1);
+    let offline = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(|error| error.is_connect() || error.is_timeout()));
+    if error.downcast_ref::<spotify::RateLimitError>().is_some() || spotify::rate_limit_wait().is_some() {
+        RATE_LIMITED
+    } else if error.downcast_ref::<auth::SignInExpired>().is_some() {
+        "Reconnect Spotify in Settings"
+    } else if *misses < 2 {
+        ""
+    } else if offline {
+        "Offline · trying again"
+    } else {
+        "Reconnecting to Spotify…"
+    }
+}
+
+/// Puts `trouble` in the title bar, unless it's there already.
+fn show_sync_trouble(ui_weak: &slint::Weak<AppWindow>, shown: &mut &'static str, trouble: &'static str) {
+    if *shown == trouble {
+        return;
+    }
+    *shown = trouble;
+    let ui_weak = ui_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_sync_trouble(trouble.into());
+        }
+    });
 }
 
 fn begin_fast_playback_refresh(state: &Arc<Mutex<AppState>>, duration: Duration) {
@@ -4493,7 +5031,7 @@ async fn warm_playlist_art_and_repaint(
                 let guard = state.lock().unwrap();
                 (
                     guard.config.library_snapshot.playlists.clone(),
-                    guard.config.library_snapshot.liked_songs.len(),
+                    liked_count(&guard.config.library_snapshot),
                     guard.config.artwork_enabled,
                     guard.selected_playlist_uri.clone(),
                 )
@@ -4526,9 +5064,8 @@ async fn backfill_missing_playlist_image_urls(
             .library_snapshot
             .playlists
             .iter()
-            .enumerate()
-            .filter(|(_, playlist)| playlist.image_url.as_deref().unwrap_or_default().is_empty())
-            .filter_map(|(index, playlist)| spotify_playlist_id_from_uri(&playlist.uri).map(|id| (index, id)))
+            .filter(|playlist| playlist.image_url.as_deref().unwrap_or_default().is_empty())
+            .filter_map(|playlist| spotify_playlist_id_from_uri(&playlist.uri).map(|id| (playlist.uri.clone(), id)))
             .take(limit)
             .collect::<Vec<_>>()
     };
@@ -4538,9 +5075,9 @@ async fn backfill_missing_playlist_image_urls(
     }
 
     let mut found = Vec::new();
-    for (index, playlist_id) in missing {
+    for (uri, playlist_id) in missing {
         if let Ok(Some(image_url)) = spotify_api.playlist_image_url(token, &playlist_id).await {
-            found.push((index, image_url));
+            found.push((uri, image_url));
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
@@ -4550,12 +5087,13 @@ async fn backfill_missing_playlist_image_urls(
     }
 
     let mut guard = state.lock().unwrap();
-    for (index, image_url) in found {
-        if let Some(playlist) = guard.config.library_snapshot.playlists.get_mut(index) {
+    // By link, as the list may have changed meanwhile.
+    for (uri, image_url) in found {
+        if let Some(playlist) = guard.config.library_snapshot.playlists.iter_mut().find(|playlist| playlist.uri == uri) {
             playlist.image_url = Some(image_url);
         }
     }
-    let _ = config::save_config(&guard.config);
+    config::save_config_background(&guard.config);
     true
 }
 
@@ -4638,6 +5176,7 @@ fn clear_queue_rows(ui: &AppWindow) {
     ui.set_queue_artists(ModelRc::from(Rc::new(VecModel::<SharedString>::from(Vec::new()))));
     ui.set_queue_images(ModelRc::from(Rc::new(VecModel::<slint::Image>::from(Vec::new()))));
     ui.set_queue_reorder_enabled(false);
+    QUEUE_PAINTED.with(|painted| *painted.borrow_mut() = None);
 }
 
 fn set_now_playing_from_track(
@@ -4766,29 +5305,8 @@ async fn build_startup_queue_from_playlist(
         );
     }
 
-    let playlist_tracks_href = {
-        let guard = state.lock().unwrap();
-        guard
-            .playlist_uris
-            .iter()
-            .position(|uri| uri == playlist_uri)
-            .and_then(|index| guard.playlist_track_hrefs.get(index).cloned())
-    };
-
-    let fetched_tracks = if playlist_uri == LIKED_SONGS_PLAYLIST_URI {
-        spotify_api.liked_songs(token).await.ok()
-    } else if let Some(href) = playlist_tracks_href {
-        spotify_api.playlist_tracks_by_href(token, &href).await.ok()
-    } else if let Some(playlist_id) = spotify_playlist_id_from_uri(playlist_uri) {
-        spotify_api.playlist_tracks(token, &playlist_id).await.ok()
-    } else {
-        None
-    }?;
-
-    if fetched_tracks.is_empty() {
-        return None;
-    }
-
+    let session = current_session(state);
+    let fetched_tracks = fetch_list_songs(state, spotify_api, token, session, playlist_uri).await.ok()?;
     let start_index = fetched_tracks.iter().position(|track| track.uri == track_uri)?;
     let queue = fetched_tracks
         .iter()
@@ -4797,10 +5315,7 @@ async fn build_startup_queue_from_playlist(
         .collect::<Vec<_>>();
 
     let mut guard = state.lock().unwrap();
-    guard
-        .playlist_track_cache
-        .insert(playlist_uri.to_string(), fetched_tracks.clone());
-    if playlist_uri == LIKED_SONGS_PLAYLIST_URI {
+    if guard.selected_playlist_uri == playlist_uri {
         guard.track_uris = fetched_tracks.into_iter().map(|track| track.uri).collect();
     }
 
@@ -4852,6 +5367,9 @@ fn queue_tail_start<'a>(mut queue: impl Iterator<Item = &'a str>, current: &str)
 }
 
 fn reserve_spotify_queue_refresh(state: &Arc<Mutex<AppState>>) -> bool {
+    if spotify::rate_limit_wait().is_some() {
+        return false;
+    }
     let mut guard = state.lock().unwrap();
     // A song change shouldn't wait out the usual gap for its new queue.
     let queue_is_behind = guard.spotify_queue_current_uri != guard.current_track_uri
@@ -4877,12 +5395,17 @@ fn reserve_spotify_queue_refresh(state: &Arc<Mutex<AppState>>) -> bool {
 
 fn update_spotify_queue(
     state: &Arc<Mutex<AppState>>,
+    session: u64,
     playback: Option<&PlaybackState>,
     queue: crate::models::QueueResponse,
 ) {
     let playback_uri = playback.and_then(|p| p.item.as_ref()).map(|track| track.uri.as_str());
     let queue_uri = queue.currently_playing.as_ref().map(|track| track.uri.as_str());
     let mut guard = state.lock().unwrap();
+    // Asked for the account that has since signed out.
+    if ensure_same_session(&guard, session).is_err() {
+        return;
+    }
     // Next up is where it was left, until something plays. Music on another device takes
     // over, queue and all, even if its queue arrives before its song has cleared the park.
     if guard.parked.is_some() && playback_uri.is_none() {
@@ -5072,21 +5595,29 @@ fn should_refresh_library_at_startup(state: &Arc<Mutex<AppState>>) -> bool {
     let missing_liked_details = !snapshot.liked_songs.is_empty()
         && snapshot.liked_songs.iter().all(|track| track.image_url.is_none());
     let needs_repair = missing_liked_durations || missing_liked_details;
+    // Spotlight 1.1.0 kept no totals, so whether there's more to load isn't known yet.
+    let missing_totals = (snapshot.liked_songs_total == 0 && snapshot.liked_songs.len() >= spotify::SONGS_PER_PART)
+        || (snapshot.playlists_total == 0 && snapshot.playlists.len() >= spotify::PLAYLISTS_PER_PART);
     let rate_limited = now < guard.next_allowed_library_refresh_at_epoch && !needs_repair;
-    (cache_empty || stale || needs_repair) && !rate_limited
+    (cache_empty || stale || needs_repair || missing_totals) && !rate_limited
 }
 
-fn remember_last_track_uri(state: &Arc<Mutex<AppState>>, track_uri: &str) {
-    let config_to_save = {
-        let mut guard = state.lock().unwrap();
-        if guard.config.startup_snapshot.last_track_uri.as_deref() == Some(track_uri) {
-            return;
-        }
-        guard.config.startup_snapshot.last_track_uri = Some(track_uri.to_string());
-        guard.config.startup_snapshot.last_played_at_epoch = config::now_epoch();
-        guard.config.clone()
-    };
-    config::save_config_background(config_to_save);
+/// The session now, for work done straight away rather than after a wait.
+fn current_session(state: &Mutex<AppState>) -> u64 {
+    state.lock().unwrap().session
+}
+
+fn remember_last_track_uri(state: &Arc<Mutex<AppState>>, session: u64, track_uri: &str) {
+    let mut guard = state.lock().unwrap();
+    if ensure_same_session(&guard, session).is_err() {
+        return;
+    }
+    if guard.config.startup_snapshot.last_track_uri.as_deref() == Some(track_uri) {
+        return;
+    }
+    guard.config.startup_snapshot.last_track_uri = Some(track_uri.to_string());
+    guard.config.startup_snapshot.last_played_at_epoch = config::now_epoch();
+    config::save_config_background(&guard.config);
 }
 
 /// Plays a song from search ahead of what's playing, which then carries on where it was: the
@@ -5221,9 +5752,9 @@ fn play_from_list(
         // same immutable row snapshot. `track_uris` can be replaced
         // independently by an async library refresh.
         let track_uri = selected_track.uri.clone();
-        remember_last_track_uri(state, &track_uri);
+        remember_last_track_uri(state, current_session(state), &track_uri);
         if remember {
-            remember_last_playlist_uri(state, &list_uri);
+            remember_last_playlist_uri(state, current_session(state), &list_uri);
         }
         let rest_follows = list_uri != SEARCH_RESULTS_URI && state.lock().unwrap().config.autoplay_similar;
         {
@@ -5360,17 +5891,17 @@ fn set_crossfade(seconds: u32) {
     librespot_playback::player::set_crossfade(Duration::from_secs(seconds.min(MAX_CROSSFADE_SECONDS).into()));
 }
 
-fn remember_last_playlist_uri(state: &Arc<Mutex<AppState>>, playlist_uri: &str) {
-    let config_to_save = {
-        let mut guard = state.lock().unwrap();
-        if guard.config.startup_snapshot.last_playlist_uri.as_deref() == Some(playlist_uri) {
-            return;
-        }
-        guard.config.startup_snapshot.last_playlist_uri = Some(playlist_uri.to_string());
-        guard.config.startup_snapshot.last_played_at_epoch = config::now_epoch();
-        guard.config.clone()
-    };
-    config::save_config_background(config_to_save);
+fn remember_last_playlist_uri(state: &Arc<Mutex<AppState>>, session: u64, playlist_uri: &str) {
+    let mut guard = state.lock().unwrap();
+    if ensure_same_session(&guard, session).is_err() {
+        return;
+    }
+    if guard.config.startup_snapshot.last_playlist_uri.as_deref() == Some(playlist_uri) {
+        return;
+    }
+    guard.config.startup_snapshot.last_playlist_uri = Some(playlist_uri.to_string());
+    guard.config.startup_snapshot.last_played_at_epoch = config::now_epoch();
+    config::save_config_background(&guard.config);
 }
 
 /// A library playlist's songs, from the cache when it has them in full, otherwise fetched and
@@ -5380,22 +5911,33 @@ async fn library_playlist_songs(
     state: &Arc<Mutex<AppState>>,
     spotify_api: &spotify::SpotifyApi,
 ) -> Result<(String, Vec<FullTrack>)> {
-    let (playlist_uri, playlist_tracks_href) = if playlist_index == 0 {
-        (LIKED_SONGS_PLAYLIST_URI.to_string(), None)
+    let session = state.lock().unwrap().session;
+    let playlist_uri = if playlist_index == 0 {
+        LIKED_SONGS_PLAYLIST_URI.to_string()
     } else {
-        let guard = state.lock().unwrap();
-        (
-            guard
-                .playlist_uris
-                .get(playlist_index.saturating_sub(1))
-                .cloned()
-                .ok_or_else(|| anyhow!("playlist selection out of range"))?,
-            guard.playlist_track_hrefs.get(playlist_index.saturating_sub(1)).cloned(),
-        )
+        state
+            .lock()
+            .unwrap()
+            .playlist_uris
+            .get(playlist_index.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| anyhow!("playlist selection out of range"))?
     };
-    let cached_tracks = {
+    let (cached_tracks, latest_version) = {
         let guard = state.lock().unwrap();
-        guard.playlist_track_cache.get(&playlist_uri).cloned()
+        let latest_version = guard
+            .config
+            .library_snapshot
+            .playlists
+            .iter()
+            .find(|playlist| playlist.uri == playlist_uri)
+            .and_then(|playlist| playlist.snapshot_id.clone());
+        // Edited since its songs were fetched, maybe on another device.
+        let changed = latest_version
+            .as_ref()
+            .is_some_and(|latest| guard.playlist_cache_versions.get(&playlist_uri) != Some(latest));
+        let cached = guard.playlist_track_cache.get(&playlist_uri).filter(|_| !changed).cloned();
+        (cached, latest_version)
     };
 
     let cached_tracks_are_full = cached_tracks
@@ -5404,32 +5946,17 @@ async fn library_playlist_songs(
 
     let tracks = if let Some(cached_tracks) = cached_tracks.filter(|_| cached_tracks_are_full) {
         cached_tracks
-    } else if playlist_uri == LIKED_SONGS_PLAYLIST_URI {
-        let token = current_token(state).await?;
-        let tracks = spotify_api.liked_songs(&token).await?;
-        state
-            .lock()
-            .unwrap()
-            .playlist_track_cache
-            .insert(playlist_uri.clone(), tracks.clone());
-        tracks
     } else {
         let token = current_token(state).await?;
-        let tracks = if let Some(playlist_tracks_href) = playlist_tracks_href {
-            spotify_api.playlist_tracks_by_href(&token, &playlist_tracks_href).await?
-        } else {
-            let playlist_id = playlist_uri
-                .rsplit(':')
-                .next()
-                .ok_or_else(|| anyhow!("invalid playlist URI"))?
-                .to_string();
-            spotify_api.playlist_tracks(&token, &playlist_id).await?
-        };
-        state
-            .lock()
-            .unwrap()
-            .playlist_track_cache
-            .insert(playlist_uri.clone(), tracks.clone());
+        let tracks = fetch_list_songs(state, spotify_api, &token, session, &playlist_uri).await?;
+        if playlist_uri != LIKED_SONGS_PLAYLIST_URI {
+            let mut guard = state.lock().unwrap();
+            ensure_same_session(&guard, session)?;
+            match latest_version {
+                Some(version) => guard.playlist_cache_versions.insert(playlist_uri.clone(), version),
+                None => guard.playlist_cache_versions.remove(&playlist_uri),
+            };
+        }
         tracks
     };
     Ok((playlist_uri, tracks))
@@ -5473,6 +6000,7 @@ async fn populate_tracks_for_playlist(
                 guard.selected_playlist_uri = playlist_uri.clone();
             }
             show_tracks(&ui, tracks);
+            show_more_to_load(&ui, &state);
             ui.set_track_view_title(playlist_label.clone().into());
             ui.set_selected_liked_song_index(-1);
         }
@@ -5833,13 +6361,16 @@ async fn current_token(state: &Arc<Mutex<AppState>>) -> Result<TokenStore> {
         return Ok(token);
     }
     let refreshed = auth::refresh_token(&client_id, &token.refresh_token).await?;
-    let config_to_save = {
+    {
         let mut guard = state.lock().unwrap();
+        // Signing out while the refresh was out mustn't sign back in when it returns.
+        if guard.token.as_ref().map(|current| &current.refresh_token) != Some(&token.refresh_token) {
+            return Err(anyhow!("not connected to Spotify"));
+        }
         guard.token = Some(refreshed.clone());
         guard.config.token = Some(refreshed.clone());
-        guard.config.clone()
-    };
-    config::save_config_background(config_to_save);
+        config::save_config_background(&guard.config);
+    }
     Ok(refreshed)
 }
 
@@ -6177,6 +6708,28 @@ fn set_album_art_if_changed(
     }
 }
 
+/// Learns which account is signed in, once per sign-in, and gives it the plays recorded here
+/// before it was known. A failed try is retried a minute later.
+async fn learn_account(state: &Arc<Mutex<AppState>>, spotify_api: &spotify::SpotifyApi, token: &TokenStore, session: u64) {
+    {
+        let mut guard = state.lock().unwrap();
+        if guard.config.account_id.is_some() || guard.account_asked_at.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        guard.account_asked_at = Some(Instant::now());
+    }
+    let Ok(account_id) = spotify_api.account_id(token).await else { return };
+    {
+        let mut guard = state.lock().unwrap();
+        if ensure_same_session(&guard, session).is_err() || guard.config.account_id.is_some() {
+            return;
+        }
+        guard.config.account_id = Some(account_id.clone());
+        config::save_config_background(&guard.config);
+    }
+    let _ = tokio::task::spawn_blocking(move || history::adopt(&account_id)).await;
+}
+
 async fn refresh_playback_only(
     ui_weak: slint::Weak<AppWindow>,
     state: Arc<Mutex<AppState>>,
@@ -6185,13 +6738,21 @@ async fn refresh_playback_only(
     let refresh_lock = state.lock().unwrap().playback_refresh_lock.clone();
     let _refresh_guard = refresh_lock.lock().await;
     clear_expired_optimistic_state(&state);
+    let session = state.lock().unwrap().session;
     let token = current_token(&state).await?;
+    // On its own, so a slow answer doesn't hold up what's playing, under this lock.
+    if state.lock().unwrap().config.account_id.is_none() {
+        let (state, spotify_api, token) = (Arc::clone(&state), spotify_api.clone(), token.clone());
+        tokio::spawn(async move { learn_account(&state, &spotify_api, &token, session).await });
+    }
 
     // Do not collapse a request/parse failure into Spotify's real 204/no-playback
     // state. An error keeps the last confirmed snapshot and the next tick retries.
     let playback = spotify_api.current_playback(&token).await?;
     let remote_volume = {
         let mut guard = state.lock().unwrap();
+        // Signed out while Spotify answered: the answer was about the account that left.
+        ensure_same_session(&guard, session)?;
         let reported_active = playback
             .as_ref()
             .and_then(|p| p.device.as_ref())
@@ -6261,6 +6822,10 @@ async fn refresh_playback_only(
         let ui_weak = ui_weak.clone();
         let state = Arc::clone(&state);
         move || {
+            // Signing out can come first, while this waits its turn.
+            if state.lock().unwrap().session != session {
+                return;
+            }
             if let Some(ui) = ui_weak.upgrade() {
                 apply_playback_to_ui(&ui, &state, playback, cached_art);
             }
@@ -6269,7 +6834,7 @@ async fn refresh_playback_only(
     drop(_refresh_guard);
 
     if let Some(track_uri) = accepted_track_uri {
-        remember_last_track_uri(&state, &track_uri);
+        remember_last_track_uri(&state, session, &track_uri);
     }
     if let Some(context_uri) = playback_for_background
         .as_ref()
@@ -6277,7 +6842,7 @@ async fn refresh_playback_only(
         .and_then(|context| context.uri.clone())
         .filter(|uri| uri.starts_with("spotify:playlist:"))
     {
-        remember_last_playlist_uri(&state, &context_uri);
+        remember_last_playlist_uri(&state, session, &context_uri);
     }
 
     if reserve_spotify_queue_refresh(&state) {
@@ -6288,7 +6853,7 @@ async fn refresh_playback_only(
         let queue_playback = playback_for_background.clone();
         tokio::spawn(async move {
             if let Ok(queue) = queue_api.queue(&queue_token).await {
-                update_spotify_queue(&queue_state, queue_playback.as_ref(), queue);
+                update_spotify_queue(&queue_state, session, queue_playback.as_ref(), queue);
                 repaint_queue_on_event_loop(queue_ui, queue_state);
             }
         });
@@ -6359,10 +6924,15 @@ async fn refresh_everything(
     resume_on_local_device: bool,
 ) -> Result<bool> {
     clear_expired_optimistic_state(&state);
-    if state.lock().unwrap().token.is_none() {
-        return Ok(false);
-    }
+    let session = {
+        let guard = state.lock().unwrap();
+        if guard.token.is_none() {
+            return Ok(false);
+        }
+        guard.session
+    };
     let token = current_token(&state).await?;
+    learn_account(&state, &spotify_api, &token, session).await;
 
     let devices = match spotify_api.devices(&token).await {
         Ok(devices) => devices,
@@ -6446,17 +7016,21 @@ async fn refresh_everything(
     }
 
     let mut liked_full_tracks: Option<Vec<FullTrack>> = None;
+    // How much of Liked Songs and of the playlists there is, as far as this refresh found.
+    let mut liked_loaded: Option<Loaded> = None;
+    let mut playlists_found: Option<(usize, usize)> = None;
+    let mut asked_at_revision = 0;
     let (playlist_uris, playlist_track_hrefs, playlist_track_counts, liked_uris, liked_table_columns, snapshot) = if include_library {
         let now = config::now_epoch();
         let refresh_gate = {
             let mut guard = state.lock().unwrap();
-            if guard.library_refresh_in_flight {
+            if guard.library_refresh_in_flight == Some(guard.session) {
                 Some(Err::<(), String>("Library refresh already in progress.".to_string()))
             } else if now < guard.next_allowed_library_refresh_at_epoch {
                 let wait_secs = guard.next_allowed_library_refresh_at_epoch.saturating_sub(now);
                 Some(Err::<(), String>(format!("Library refresh cooling down for another {}s.", wait_secs)))
             } else {
-                guard.library_refresh_in_flight = true;
+                guard.library_refresh_in_flight = Some(session);
                 None
             }
         };
@@ -6472,8 +7046,16 @@ async fn refresh_everything(
             });
                 (None, None, None, None, None, None)
         } else {
-            let playlists = match spotify_api.playlists(&token).await {
-                Ok(playlists) => Some(playlists),
+            let (playlists_asked, liked_wanted) = {
+                let guard = state.lock().unwrap();
+                asked_at_revision = guard.playlists_revision;
+                (guard.config.library_snapshot.playlists_wanted.max(spotify::PLAYLISTS_PER_PART), songs_wanted(&guard, LIKED_SONGS_PLAYLIST_URI))
+            };
+            let playlists = match spotify_api.playlists(&token, 0, playlists_asked).await {
+                Ok(part) => {
+                    playlists_found = Some((part.total, playlists_asked));
+                    Some(part.items)
+                }
                 Err(error) => {
                     let retry_after = error.downcast_ref::<spotify::RateLimitError>().map(|e| e.retry_after_secs);
                     if let Some(retry_after) = retry_after {
@@ -6481,7 +7063,7 @@ async fn refresh_everything(
                         let until = config::now_epoch().saturating_add(retry_after);
                         guard.next_allowed_library_refresh_at_epoch = until;
                         guard.config.library_snapshot.next_allowed_refresh_at_epoch = until;
-                        let _ = config::save_config(&guard.config);
+                        config::save_config_background(&guard.config);
                     }
                     let _ = slint::invoke_from_event_loop({
                         let ui_weak = ui_weak.clone();
@@ -6495,8 +7077,11 @@ async fn refresh_everything(
                     None
                 }
             };
-            let liked = match spotify_api.liked_songs(&token).await {
-                Ok(liked) => Some(liked),
+            let liked = match spotify_api.liked_songs(&token, 0, liked_wanted).await {
+                Ok(part) => {
+                    liked_loaded = Some(Loaded { total: part.total, wanted: liked_wanted, more_from: part.more_from, stamp: 0 });
+                    Some(part.items)
+                }
                 Err(error) => {
                     let retry_after = error.downcast_ref::<spotify::RateLimitError>().map(|e| e.retry_after_secs);
                     if let Some(retry_after) = retry_after {
@@ -6504,7 +7089,7 @@ async fn refresh_everything(
                         let until = config::now_epoch().saturating_add(retry_after);
                         guard.next_allowed_library_refresh_at_epoch = until;
                         guard.config.library_snapshot.next_allowed_refresh_at_epoch = until;
-                        let _ = config::save_config(&guard.config);
+                        config::save_config_background(&guard.config);
                     }
                     let _ = slint::invoke_from_event_loop({
                         let ui_weak = ui_weak.clone();
@@ -6520,7 +7105,10 @@ async fn refresh_everything(
             };
 
             {
-                state.lock().unwrap().library_refresh_in_flight = false;
+                let mut guard = state.lock().unwrap();
+                if guard.library_refresh_in_flight == Some(session) {
+                    guard.library_refresh_in_flight = None;
+                }
             }
             liked_full_tracks = liked.clone();
 
@@ -6539,17 +7127,11 @@ async fn refresh_everything(
             let liked_table_columns = liked.clone();
             let snapshot = if let (Some(playlists), Some(liked)) = (playlists.as_ref(), liked.as_ref()) {
                 Some((
-                    playlists
-                        .iter()
-                        .map(|item| CachedPlaylist {
-                            name: item.name.clone(),
-                            uri: item.uri.clone(),
-                            image_url: item.images.first().map(|image| image.url.clone()),
-                            track_count: item.tracks.total,
-                        })
-                        .collect::<Vec<_>>(),
+                    playlists.iter().map(cached_playlist).collect::<Vec<_>>(),
                     liked
                         .iter()
+                        // The rest loads again when asked for, which keeps the settings file small.
+                        .take(spotify::SONGS_PER_PART)
                         .map(|track| CachedLikedSong {
                             name: track.name.clone(),
                             artists: track.artists.iter().map(|artist| artist.name.clone()).collect::<Vec<_>>(),
@@ -6570,19 +7152,18 @@ async fn refresh_everything(
         (None, None, None, None, None, None)
     };
 
-    if let Some((playlist_snapshot, liked_snapshot, fetched_at_epoch)) = snapshot {
-        let config_to_save = {
-            let mut guard = state.lock().unwrap();
-            guard.config.library_snapshot.playlists = playlist_snapshot;
-            guard.config.library_snapshot.liked_songs = liked_snapshot;
-            guard.config.library_snapshot.fetched_at_epoch = fetched_at_epoch;
-            guard.config.library_snapshot.next_allowed_refresh_at_epoch =
-                fetched_at_epoch.saturating_add(120);
-            guard.next_allowed_library_refresh_at_epoch =
-                guard.config.library_snapshot.next_allowed_refresh_at_epoch;
-            guard.config.clone()
-        };
-        let _ = tokio::task::spawn_blocking(move || config::save_config(&config_to_save)).await;
+    {
+        let mut guard = state.lock().unwrap();
+        // Signed out while the library was loading: it belongs to the account that left.
+        if ensure_same_session(&guard, session).is_err() {
+            return Ok(false);
+        }
+        // What was fetched goes in below, with the sidebar; the wait starts now.
+        if let Some((_, _, fetched_at_epoch)) = snapshot.as_ref() {
+            guard.config.library_snapshot.fetched_at_epoch = *fetched_at_epoch;
+            guard.config.library_snapshot.next_allowed_refresh_at_epoch = fetched_at_epoch.saturating_add(120);
+            guard.next_allowed_library_refresh_at_epoch = guard.config.library_snapshot.next_allowed_refresh_at_epoch;
+        }
     }
 
     // Library/device pagination is intentionally outside the playback lock so a
@@ -6595,8 +7176,11 @@ async fn refresh_everything(
     };
     if playback_refresh_error.is_none() && reserve_spotify_queue_refresh(&state) {
         if let Ok(queue) = spotify_api.queue(&token).await {
-            update_spotify_queue(&state, playback.as_ref(), queue);
+            update_spotify_queue(&state, session, playback.as_ref(), queue);
         }
+    }
+    if ensure_same_session(&state.lock().unwrap(), session).is_err() {
+        return Ok(false);
     }
     if playback_refresh_error.is_none() && !resume_on_local_device {
         if let Some(track_uri) = playback
@@ -6605,7 +7189,7 @@ async fn refresh_everything(
             .map(|track| track.uri.clone())
             .filter(|track_uri| !should_ignore_stale_playback_track(&state, track_uri))
         {
-            remember_last_track_uri(&state, &track_uri);
+            remember_last_track_uri(&state, session, &track_uri);
         }
         if let Some(context_uri) = playback
             .as_ref()
@@ -6613,7 +7197,7 @@ async fn refresh_everything(
             .and_then(|context| context.uri.clone())
             .filter(|uri| uri.starts_with("spotify:playlist:"))
         {
-            remember_last_playlist_uri(&state, &context_uri);
+            remember_last_playlist_uri(&state, session, &context_uri);
         }
     }
     let cached_first_liked_uri = {
@@ -6684,9 +7268,9 @@ async fn refresh_everything(
                         spotify_api.play_track(&token, &device_id, &track_uri).await.is_ok()
                     };
                     if started {
-                        remember_last_track_uri(&state, &track_uri);
+                        remember_last_track_uri(&state, session, &track_uri);
                         if let Some(context_uri) = remembered_playlist_uri {
-                            remember_last_playlist_uri(&state, &context_uri);
+                            remember_last_playlist_uri(&state, session, &context_uri);
                         }
                         if let Some(track_id) = track_id_from_uri(&track_uri) {
                             fallback_started_track = spotify_api.track(&token, &track_id).await.ok();
@@ -6696,7 +7280,7 @@ async fn refresh_everything(
                 }
             } else if let Some(context_uri) = remembered_playlist_uri {
                 if spotify_api.play_playlist(&token, &device_id, &context_uri).await.is_ok() {
-                    remember_last_playlist_uri(&state, &context_uri);
+                    remember_last_playlist_uri(&state, session, &context_uri);
                     started_fallback_playback = true;
                 }
             }
@@ -6710,35 +7294,70 @@ async fn refresh_everything(
         .and_then(|image| cached_album_art_path(&image.url));
     let warm_ui_weak = ui_weak.clone();
     let warm_state = Arc::clone(&state);
+    // Dropped once the library below is in, or isn't going in.
+    let (library_in, library_in_wait) = tokio::sync::oneshot::channel::<()>();
     let _ = slint::invoke_from_event_loop(move || {
+        let _library_in = library_in;
+        // Signing out can come first, while this waits its turn.
+        if state.lock().unwrap().session != session {
+            return;
+        }
         if let Some(ui) = ui_weak.upgrade() {
-            // Rows index into the track cache, so whenever fresh liked songs are
-            // shown the cache must update too, even if the playlist fetch failed.
-            if let Some(liked_uris) = liked_uris.as_ref() {
+            // More liked songs loaded meanwhile are kept: this refresh asked for less.
+            let liked_superseded = {
+                let guard = state.lock().unwrap();
+                liked_loaded.is_some_and(|fresh| guard.loaded.get(LIKED_SONGS_PLAYLIST_URI).is_some_and(|now| now.wanted > fresh.wanted))
+            };
+            let liked_uris = liked_uris.filter(|_| !liked_superseded);
+            let liked_table_columns = liked_table_columns.filter(|_| !liked_superseded);
+            {
                 let mut guard = state.lock().unwrap();
-                if guard.selected_playlist_uri == LIKED_SONGS_PLAYLIST_URI {
-                    guard.track_uris = liked_uris.clone();
+                // Rows index into the track cache, so whenever fresh liked songs are
+                // shown the cache must update too, even if the playlist fetch failed.
+                if let Some(liked_uris) = liked_uris.as_ref() {
+                    if guard.selected_playlist_uri == LIKED_SONGS_PLAYLIST_URI {
+                        guard.track_uris = liked_uris.clone();
+                    }
+                    if let Some(liked_tracks) = liked_full_tracks.clone() {
+                        guard
+                            .playlist_track_cache
+                            .insert(LIKED_SONGS_PLAYLIST_URI.to_string(), liked_tracks);
+                    }
+                    if let Some(loaded) = liked_loaded {
+                        mark_loaded(&mut guard, LIKED_SONGS_PLAYLIST_URI, loaded);
+                    }
                 }
-                if let Some(liked_tracks) = liked_full_tracks.clone() {
-                    guard
-                        .playlist_track_cache
-                        .insert(LIKED_SONGS_PLAYLIST_URI.to_string(), liked_tracks);
+                // Replaced only when both fetches succeed. The sidebar draws from the snapshot
+                // and a click goes by these lists, so they change here together, just before
+                // the rows are drawn again, unless a "Load more" or a new playlist changed them
+                // since this refresh asked.
+                if let Some((playlist_snapshot, liked_snapshot, _)) = snapshot {
+                    if let (Some(playlist_uris), Some(playlist_track_hrefs), Some(playlist_track_counts), true) =
+                        (playlist_uris, playlist_track_hrefs, playlist_track_counts, guard.playlists_revision == asked_at_revision)
+                    {
+                        guard.playlists_revision = asked_at_revision.wrapping_add(1);
+                        guard.playlist_uris = playlist_uris;
+                        guard.playlist_track_hrefs = playlist_track_hrefs;
+                        guard.playlist_track_counts = playlist_track_counts;
+                        guard.config.library_snapshot.playlists = playlist_snapshot;
+                        if let Some((total, asked)) = playlists_found {
+                            guard.config.library_snapshot.playlists_total = total;
+                            guard.config.library_snapshot.playlists_wanted = asked;
+                        }
+                    }
+                    guard.config.library_snapshot.liked_songs = liked_snapshot;
+                    if let Some(loaded) = liked_loaded {
+                        guard.config.library_snapshot.liked_songs_total = loaded.total;
+                    }
+                    config::save_config_background(&guard.config);
                 }
-            }
-            // The sidebar draws from the snapshot, which is only replaced when
-            // both fetches succeed, so these stay in step with it.
-            if let (Some(playlist_uris), Some(playlist_track_hrefs), Some(playlist_track_counts), true) = (playlist_uris, playlist_track_hrefs, playlist_track_counts, liked_uris.is_some()) {
-                let mut guard = state.lock().unwrap();
-                guard.playlist_uris = playlist_uris;
-                guard.playlist_track_hrefs = playlist_track_hrefs;
-                guard.playlist_track_counts = playlist_track_counts;
             }
             {
                 let (playlists, liked_count, artwork_enabled, selected_playlist_uri) = {
                     let guard = state.lock().unwrap();
                     (
                         guard.config.library_snapshot.playlists.clone(),
-                        guard.config.library_snapshot.liked_songs.len(),
+                        liked_count(&guard.config.library_snapshot),
                         guard.config.artwork_enabled,
                         guard.selected_playlist_uri.clone(),
                     )
@@ -6750,10 +7369,12 @@ async fn refresh_everything(
                     artwork_enabled,
                     Some(selected_playlist_uri.as_str()),
                 );
+                ui.set_more_playlists(more_playlists(&state.lock().unwrap().config.library_snapshot));
             }
             if state.lock().unwrap().selected_playlist_uri == LIKED_SONGS_PLAYLIST_URI && !ui.get_show_home() {
                 if let Some(liked_tracks) = liked_table_columns {
                     refresh_tracks_in_place(&ui, liked_tracks);
+                    show_more_to_load(&ui, &state);
                 }
             }
             let should_update_devices = {
@@ -6801,6 +7422,8 @@ async fn refresh_everything(
     drop(refresh_guard);
 
     if include_library {
+        // Covers found now go into the fresh list, not one about to be replaced.
+        let _ = library_in_wait.await;
         let _ = backfill_missing_playlist_image_urls(
             &warm_state,
             &spotify_api,
@@ -6824,6 +7447,73 @@ fn album_art_cache_dir() -> Result<PathBuf> {
     let path = config::config_dir()?.join("album-art");
     let _ = ALBUM_ART_CACHE_DIR.set(path.clone());
     Ok(path)
+}
+
+/// The covers saved on disk: when each was fetched, its size and where it is.
+fn album_art_files() -> Vec<(std::time::SystemTime, u64, PathBuf)> {
+    let Ok(entries) = album_art_cache_dir().and_then(|dir| Ok(std::fs::read_dir(dir)?)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| (metadata.modified().unwrap_or(std::time::UNIX_EPOCH), metadata.len(), entry.path()))
+        })
+        .collect()
+}
+
+/// Works out, off the UI thread, how much the saved covers take, first deleting them if asked,
+/// and shows it in Settings.
+fn show_cover_cache_size(ui_weak: slint::Weak<AppWindow>, clear_first: bool) {
+    let _ = std::thread::Builder::new().name("spotlight-cover-cache".to_string()).spawn(move || {
+        if clear_first {
+            // One being written or read just now stays. It's fetched again when it's next needed.
+            for (_, _, path) in album_art_files() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let bytes: u64 = album_art_files().iter().map(|(_, size, _)| size).sum();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_cover_cache_note(cover_cache_note(bytes).into());
+                ui.set_cover_cache_clearable(bytes > 0);
+                if clear_first {
+                    show_toast(&ui, "Saved covers cleared", false);
+                }
+            }
+        });
+    });
+}
+
+fn cover_cache_note(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    match bytes {
+        0 => "None saved yet. Album covers are kept on this PC, so they show at once.".to_string(),
+        _ if bytes < MB => "Less than 1 MB of album covers, kept so they show at once.".to_string(),
+        _ => format!("{} MB of album covers, kept so they show at once.", (bytes + MB / 2) / MB),
+    }
+}
+
+/// Keeps the covers on disk from growing for ever: past 250 MB, the ones fetched longest ago
+/// go until it's 200 MB. One still in use is simply fetched again.
+fn trim_album_art_cache() {
+    const LIMIT: u64 = 250 * 1024 * 1024;
+    const TRIMMED_TO: u64 = 200 * 1024 * 1024;
+    let mut files = album_art_files();
+    let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    if total <= LIMIT {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in files {
+        if total <= TRIMMED_TO {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= size;
+        }
+    }
 }
 
 async fn load_album_art(url: &str) -> Result<std::path::PathBuf> {
@@ -7087,14 +7777,14 @@ async fn start_current_visible_tracks(
 
     if !queue_tracks.is_empty() {
         if selected_playlist_uri != LIKED_SONGS_PLAYLIST_URI {
-            remember_last_playlist_uri(&state, &selected_playlist_uri);
+            remember_last_playlist_uri(&state, current_session(&state), &selected_playlist_uri);
         }
         if let Some(track_uri) = queue_tracks.first() {
-            remember_last_track_uri(&state, track_uri);
+            remember_last_track_uri(&state, current_session(&state), track_uri);
         }
         spotify_api.play_tracks(&token, &device_id, &queue_tracks).await
     } else if let Some(track_uri) = first_track {
-        remember_last_track_uri(&state, &track_uri);
+        remember_last_track_uri(&state, current_session(&state), &track_uri);
         spotify_api.play_track(&token, &device_id, &track_uri).await
     } else {
         Err(anyhow!("nothing is currently queued to resume; start a playlist or liked song first"))
@@ -7365,6 +8055,8 @@ fn clear_local_playback_engine(state: &Arc<Mutex<AppState>>) {
     }
     guard.playback_engine = None;
     guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
+    // The old player's events stop here, its Paused included, so the song stops counting.
+    guard.play_watch.stopped();
     guard.latest_local_track_uri = None;
     guard.local_device_id = None;
     if old_local_device_id.is_some() && guard.device_id == old_local_device_id {
@@ -7392,12 +8084,31 @@ async fn wait_for_local_device_refresh(
     let _ = refresh_everything(ui_weak, state, spotify_api, false, true, false).await;
 }
 
+/// Errs unless still signed in to the account that was signed in when `session` was read.
+fn ensure_same_session(guard: &AppState, session: u64) -> Result<()> {
+    if guard.session != session || guard.token.is_none() {
+        return Err(anyhow!("not connected to Spotify"));
+    }
+    Ok(())
+}
+
+/// Keeps the player's sign-in, unless the account signed out while it was being fetched.
+fn keep_local_playback_token(state: &Arc<Mutex<AppState>>, session: u64, token: TokenStore) -> Result<TokenStore> {
+    let mut guard = state.lock().unwrap();
+    ensure_same_session(&guard, session)?;
+    guard.local_playback_token = Some(token.clone());
+    guard.config.local_playback_token = Some(token.clone());
+    config::save_config_background(&guard.config);
+    Ok(token)
+}
+
 async fn ensure_local_playback(
     state: Arc<Mutex<AppState>>,
     ui_weak: slint::Weak<AppWindow>,
 ) -> Result<()> {
     let start_lock = state.lock().unwrap().local_playback_start_lock.clone();
     let _start_guard = start_lock.lock().await;
+    let session = state.lock().unwrap().session;
     {
         let mut guard = state.lock().unwrap();
         if let Some(engine) = guard.playback_engine.as_ref() {
@@ -7421,20 +8132,13 @@ async fn ensure_local_playback(
         if let Some(existing) = existing {
             if existing.expires_at_epoch <= config::now_epoch() {
                 match auth::refresh_token(&local_client_id, &existing.refresh_token).await {
-                    Ok(refreshed) => {
-                        let mut guard = state.lock().unwrap();
-                        guard.local_playback_token = Some(refreshed.clone());
-                        guard.config.local_playback_token = Some(refreshed.clone());
-                        let _ = config::save_config(&guard.config);
-                        refreshed
-                    }
+                    Ok(refreshed) => keep_local_playback_token(&state, session, refreshed)?,
+                    // Only a turned-down token needs the browser. No network yet, as just after
+                    // the PC wakes, is tried again with the next play.
+                    Err(error) if error.downcast_ref::<auth::SignInExpired>().is_none() => return Err(error),
                     Err(_) => {
                         let local_token = auth::login_for_local_playback(&local_client_id).await?;
-                        let mut guard = state.lock().unwrap();
-                        guard.local_playback_token = Some(local_token.clone());
-                        guard.config.local_playback_token = Some(local_token.clone());
-                        let _ = config::save_config(&guard.config);
-                        local_token
+                        keep_local_playback_token(&state, session, local_token)?
                     }
                 }
             } else {
@@ -7442,11 +8146,7 @@ async fn ensure_local_playback(
             }
         } else {
             let local_token = auth::login_for_local_playback(&local_client_id).await?;
-            let mut guard = state.lock().unwrap();
-            guard.local_playback_token = Some(local_token.clone());
-            guard.config.local_playback_token = Some(local_token.clone());
-            let _ = config::save_config(&guard.config);
-            local_token
+            keep_local_playback_token(&state, session, local_token)?
         }
     };
 
@@ -7481,6 +8181,11 @@ async fn ensure_local_playback(
     let events = engine.take_player_events();
     let engine_generation = {
         let mut guard = state.lock().unwrap();
+        // Signed out while the player was starting: it isn't wanted any more.
+        if let Err(error) = ensure_same_session(&guard, session) {
+            engine.shutdown();
+            return Err(error);
+        }
         guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
         let generation = guard.playback_engine_generation;
         guard.playback_engine = Some(engine);
@@ -7650,11 +8355,18 @@ async fn run_local_player_event_loop(
                 apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, false, engine_generation);
             }
             PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } | PlayerEvent::Unavailable { .. } => {
+                let stopped = matches!(event, PlayerEvent::Stopped { .. });
                 let mut guard = state.lock().unwrap();
                 guard.play_watch.stopped();
                 guard.local_playing = false;
                 crash_restart::note_playing_here(false);
+                drop(guard);
+                if stopped {
+                    // Maybe another device took over, which is then shown at once.
+                    begin_fast_playback_refresh(&state, Duration::from_secs(4));
+                }
             }
+            PlayerEvent::SessionDisconnected { .. } => begin_fast_playback_refresh(&state, Duration::from_secs(4)),
             PlayerEvent::VolumeChanged { volume } => {
                 // Set from a phone or another Spotify app, or our own change coming back.
                 state.lock().unwrap().local_volume_percent = playback::spotify_volume_to_percent(volume);
@@ -7695,9 +8407,19 @@ fn watch_play(state: &Arc<Mutex<AppState>>, track_uri: &str, position_ms: u32) {
     let state = Arc::clone(state);
     tokio::spawn(async move {
         tokio::time::sleep(wait).await;
-        let Some(track) = state.lock().unwrap().play_watch.counts(generation) else { return };
+        let (track, session) = {
+            let mut guard = state.lock().unwrap();
+            let Some(track) = guard.play_watch.counts(generation) else { return };
+            (track, guard.session)
+        };
         let play = history::Play { at_ms: history::now_ms(), track };
-        let _ = tokio::task::spawn_blocking(move || history::record(play)).await;
+        // Asked as it's written, so an account that became known just before has claimed the
+        // plays waiting for it. One that signed out since gets nothing.
+        let whose = move || {
+            let guard = state.lock().unwrap();
+            (guard.session == session).then(|| guard.config.account_id.clone())
+        };
+        let _ = tokio::task::spawn_blocking(move || history::record(whose, play)).await;
     });
 }
 
@@ -8213,30 +8935,21 @@ fn should_show_log(level: &str, message: &str) -> bool {
     }
 }
 
+/// The time of day on this PC's clock, for the log.
 fn chrono_like_time() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let day_secs = secs % 86_400;
-    let h = day_secs / 3600;
-    let m = (day_secs % 3600) / 60;
-    let s = day_secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+    let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
+    format!("{:02}:{:02}:{:02}", now.wHour, now.wMinute, now.wSecond)
 }
 
 #[cfg(target_os = "windows")]
 fn spotlight_window_is_foreground() -> bool {
-    use std::iter;
     use windows_sys::Win32::{
         Foundation::HWND,
-        UI::WindowsAndMessaging::{FindWindowW, GetForegroundWindow, IsIconic, IsWindowVisible},
+        UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible},
     };
 
-    let title: Vec<u16> = "Spotlight".encode_utf16().chain(iter::once(0)).collect();
-    let hwnd: HWND = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    let hwnd: HWND = window_chrome::handle();
     if hwnd.is_null() {
         return true;
     }
@@ -8256,14 +8969,12 @@ static SPOTLIGHT_WINDOW_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 fn toggle_spotlight_window_maximized() {
-    use std::iter;
     use windows_sys::Win32::{
         Foundation::HWND,
-        UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_MAXIMIZE, SW_RESTORE},
+        UI::WindowsAndMessaging::{ShowWindow, SW_MAXIMIZE, SW_RESTORE},
     };
 
-    let title: Vec<u16> = "Spotlight".encode_utf16().chain(iter::once(0)).collect();
-    let hwnd: HWND = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    let hwnd: HWND = window_chrome::handle();
     if hwnd.is_null() || window_chrome::in_mini() {
         return;
     }

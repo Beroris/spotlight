@@ -6288,7 +6288,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -6296,6 +6296,7 @@ dependencies = [
  "dirs",
  "global-hotkey",
  "glow",
+ "i-slint-backend-winit",
  "ico",
  "image",
  "librespot",
