@@ -7,6 +7,7 @@ mod art_tilt;
 mod audio_output;
 mod auth;
 mod config;
+mod crash_restart;
 mod history;
 mod home;
 mod left_off;
@@ -233,31 +234,42 @@ impl PlaybackClock {
     }
 }
 
-/// Writes what went wrong to `crash.log` in the settings folder when Spotlight panics. Most
-/// panics happen inside Windows' callbacks, which can't unwind, so they end the app with nothing
-/// on screen to say why. Only the last few entries are kept.
+/// Writes what went wrong to `crash.log` in the settings folder when Spotlight panics, then
+/// opens it again. Most panics happen inside Windows' callbacks, which can't unwind, so they end
+/// the app with nothing on screen to say why.
 fn keep_crash_log() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Ok(dir) = config::config_dir() {
-            let path = dir.join("crash.log");
-            let mut log = std::fs::read_to_string(&path).unwrap_or_default();
-            if log.len() > 24 * 1024 {
-                let cut = log.len() - 12 * 1024;
-                let start = log[cut..].find("\n\n").map_or(cut, |at| cut + at + 2);
-                log.drain(..start.min(log.len()));
-            }
-            let thread = std::thread::current();
-            log.push_str(&format!(
-                "{} UTC, Spotlight {}, thread {}:\n{info}\n\n",
-                utc_timestamp(std::time::SystemTime::now()),
-                updates::CURRENT_VERSION,
-                thread.name().unwrap_or("unnamed"),
-            ));
-            let _ = std::fs::write(&path, log);
+        let thread = std::thread::current();
+        append_crash_log(&format!("thread {}:\n{info}", thread.name().unwrap_or("unnamed")));
+        // Release builds abort after any panic, so this copy is going whatever happens next.
+        if cfg!(panic = "abort") {
+            crash_restart::restart();
         }
         previous(info);
     }));
+}
+
+/// Adds an entry to `crash.log`. Only the last few entries are kept.
+pub(crate) fn append_crash_log(entry: &str) {
+    let Ok(dir) = config::config_dir() else { return };
+    let path = dir.join("crash.log");
+    let mut log = std::fs::read_to_string(&path).unwrap_or_default();
+    if log.len() > 24 * 1024 {
+        let mut cut = log.len() - 12 * 1024;
+        // Song titles in other languages take several bytes a letter.
+        while !log.is_char_boundary(cut) {
+            cut += 1;
+        }
+        let start = log[cut..].find("\n\n").map_or(cut, |at| cut + at + 2);
+        log.drain(..start.min(log.len()));
+    }
+    log.push_str(&format!(
+        "{} UTC, Spotlight {}, {entry}\n\n",
+        utc_timestamp(std::time::SystemTime::now()),
+        updates::CURRENT_VERSION,
+    ));
+    let _ = std::fs::write(&path, log);
 }
 
 /// "2026-11-09 19:08:08", in UTC.
@@ -284,8 +296,11 @@ fn main() -> Result<()> {
         window_chrome::quit_running();
         return Ok(());
     }
+    let args = std::env::args().collect::<Vec<_>>();
+    // After a crash, the new copy waits here for the old one to be gone.
+    let after_crash = crash_restart::start(&args);
     // After a portable update, the new version waits here for the old one to quit.
-    updates::finish_update(&std::env::args().collect::<Vec<_>>());
+    updates::finish_update(&args);
     // The portable copy leaves Windows as it found it.
     if !config::is_portable() {
         startup_entry::register();
@@ -870,8 +885,11 @@ fn main() -> Result<()> {
             }
 
             let resume = state.lock().unwrap().config.resume_on_startup;
+            // Music that was playing on this PC when Spotlight crashed plays on after the
+            // restart. Opened by hand, it waits for play unless the setting says otherwise.
+            let carry_on = after_crash.is_some_and(|left| left.was_playing);
             // With nothing playing anywhere, resuming carries on from where the music was left.
-            let pick_up = resume && state.lock().unwrap().parked.is_some();
+            let pick_up = (resume || carry_on) && state.lock().unwrap().parked.is_some();
             let _ = refresh_until_local_device_ready(ui_weak.clone(), Arc::clone(&state), spotify_api.clone(), resume && !pick_up).await;
             if !pick_up {
                 return;
@@ -882,20 +900,25 @@ fn main() -> Result<()> {
                         pick_up_left_off(&ui_weak, &runtime_for_pick_up, &state, PickUp::WhereItWas);
                     }
                 });
-            } else {
+            } else if resume {
                 // Something started elsewhere meanwhile, which resuming moves here as before.
+                // Carrying on after a crash leaves it where it is.
                 let _ = refresh_everything(ui_weak, state, spotify_api, false, false, true).await;
             }
         });
     }
 
-    if state.lock().unwrap().config.start_minimized {
-        if state.lock().unwrap().config.close_to_tray || state.lock().unwrap().config.minimize_to_tray {
-            tray::ensure_started();
-            ui.hide().ok();
-        } else {
-            ui.window().set_minimized(true);
+    // A restart after a crash comes back the way the window was. Otherwise the setting says.
+    let (to_tray, minimized) = match after_crash {
+        Some(left) => (left.was_in_tray, left.was_minimized),
+        None => {
+            let guard = state.lock().unwrap();
+            let tray_in_use = guard.config.close_to_tray || guard.config.minimize_to_tray;
+            (guard.config.start_minimized && tray_in_use, guard.config.start_minimized && !tray_in_use)
         }
+    };
+    if to_tray {
+        tray::ensure_started();
     }
 
     {
@@ -925,9 +948,17 @@ fn main() -> Result<()> {
         });
 
         // Slint creates the native window some time after the event loop
-        // starts, so keep trying briefly until it exists.
+        // starts, so keep trying briefly until it exists. `ui.run()` shows the window, so going
+        // to the tray or the taskbar waits for it too. The window stays made while it's in the
+        // tray, so the media keys and Windows' media controls still reach it.
         let ui_weak = ui.as_weak();
-        retry_chrome_install(ui_weak, 500);
+        retry_chrome_install(ui_weak, 500, move |ui| {
+            if to_tray {
+                tray::hide_spotlight_window();
+            } else if minimized {
+                ui.window().set_minimized(true);
+            }
+        });
     }
 
     if ui.get_signed_in() {
@@ -948,6 +979,14 @@ fn main() -> Result<()> {
     }
     {
         let state = Arc::clone(&state);
+        crash_restart::save_place_with(move || {
+            if let Some(left_off) = left_off_now(&state) {
+                let _ = left_off::save(&left_off);
+            }
+        });
+    }
+    {
+        let state = Arc::clone(&state);
         config::before_exit(move || {
             if let Some(left_off) = left_off_now(&state) {
                 let _ = left_off::save(&left_off);
@@ -957,14 +996,24 @@ fn main() -> Result<()> {
 
     window_chrome::center_on_screen(&ui);
     window_chrome::install_frame_driver(&ui);
-    ui.run().context("slint event loop failed")
+    let ran = ui.run();
+    if let Err(error) = &ran {
+        // The window couldn't be drawn, as when the graphics driver is part way through updating.
+        append_crash_log(&format!("the event loop failed: {error}"));
+        crash_restart::restart();
+    }
+    crash_restart::quitting();
+    ran.context("slint event loop failed")
 }
 
-fn retry_chrome_install(ui_weak: slint::Weak<AppWindow>, attempts_left: u32) {
+/// Fits the title bar and the rest once the native window exists, then does `then`.
+fn retry_chrome_install(ui_weak: slint::Weak<AppWindow>, attempts_left: u32, then: impl FnOnce(&AppWindow) + 'static) {
     slint::Timer::single_shot(Duration::from_millis(10), move || {
-        let installed = ui_weak.upgrade().is_none_or(|ui| window_chrome::install(&ui));
-        if !installed && attempts_left > 0 {
-            retry_chrome_install(ui_weak, attempts_left - 1);
+        let Some(ui) = ui_weak.upgrade() else { return };
+        if window_chrome::install(&ui) || attempts_left == 0 {
+            then(&ui);
+        } else {
+            retry_chrome_install(ui_weak, attempts_left - 1, then);
         }
     });
 }
@@ -7604,6 +7653,7 @@ async fn run_local_player_event_loop(
                 let mut guard = state.lock().unwrap();
                 guard.play_watch.stopped();
                 guard.local_playing = false;
+                crash_restart::note_playing_here(false);
             }
             PlayerEvent::VolumeChanged { volume } => {
                 // Set from a phone or another Spotify app, or our own change coming back.
@@ -7671,6 +7721,7 @@ fn apply_local_player_position_event(
             return;
         }
         guard.local_playing = is_playing;
+        crash_restart::note_playing_here(is_playing);
         if is_playing && guard.local_device_id.is_some() {
             guard.active_device_id = guard.local_device_id.clone();
             guard.device_id = guard.local_device_id.clone();

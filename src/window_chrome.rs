@@ -42,6 +42,8 @@ pub fn set_mini_on_top(_on_top: bool) {}
 pub fn in_mini() -> bool { false }
 #[cfg(not(target_os = "windows"))]
 pub fn quit_running() {}
+#[cfg(not(target_os = "windows"))]
+pub fn handle() -> isize { 0 }
 
 /// The mini player's size in logical px. `ui/app.slint` lays it out the same way.
 pub const MINI_WIDTH: f32 = 420.0;
@@ -243,6 +245,11 @@ mod imp {
 
     fn window() -> HWND {
         WINDOW.load(Ordering::Relaxed) as HWND
+    }
+
+    /// The main window, or null before it exists.
+    pub fn handle() -> HWND {
+        window()
     }
 
     fn update_ui(change: impl FnOnce(&AppWindow) + Send + 'static) {

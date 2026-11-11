@@ -141,6 +141,7 @@ pub fn before_exit(work: impl Fn() + Send + Sync + 'static) {
 /// Does what was asked for before quitting. Also for Windows shutting down, which ends the app
 /// without it quitting.
 pub fn run_before_exit() {
+    crate::crash_restart::quitting();
     if let Some(work) = BEFORE_EXIT.get() {
         // A failure here mustn't stop the app from closing.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
