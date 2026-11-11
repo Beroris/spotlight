@@ -6,12 +6,12 @@ disappears: no frames drawn, next to no CPU, and its idle memory handed back to 
 
 ## Install
 
-Download **`Spotlight-1.1.0-Setup.exe`** from the
+Download **`Spotlight-1.2.0-Setup.exe`** from the
 [latest release](https://github.com/Beroris/spotlight/releases/latest) and run it. It installs for
-your account, adds Spotlight to the Start menu and can start it when you sign in. Uninstall it from
-Settings → Apps.
+your account, adds Spotlight to the Start menu and can start it in the tray when you sign in.
+Uninstall it from Settings → Apps.
 
-Rather not install anything? Take **`Spotlight-1.1.0-Portable.exe`** instead. It runs from
+Rather not install anything? Take **`Spotlight-1.2.0-Portable.exe`** instead. It runs from
 anywhere and keeps its settings in a "Spotlight settings" folder beside itself.
 
 You need Windows 10 (version 1809) or later, 64-bit, and Spotify Premium to play music on this PC.
