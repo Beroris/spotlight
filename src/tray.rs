@@ -3,7 +3,7 @@ mod windows_tray {
     use std::{
         iter, mem, ptr,
         sync::{
-            atomic::{AtomicIsize, Ordering},
+            atomic::{AtomicIsize, AtomicU32, Ordering},
             Mutex, Once, OnceLock,
         },
     };
@@ -18,9 +18,10 @@ mod windows_tray {
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
-                RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage,
-                HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, MF_STRING, MSG, SW_HIDE,
+                DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, LoadImageW,
+                PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, ShowWindow,
+                TrackPopupMenu, TranslateMessage, HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE,
+                MF_STRING, MSG, SM_CXSMICON, SW_HIDE,
                 SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_CONTEXTMENU,
                 WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW,
             },
@@ -28,9 +29,11 @@ mod windows_tray {
     };
 
     static START: Once = Once::new();
-    static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
     /// The tray icon's own window, once it has one.
     static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+    /// The message Explorer sends every window when the taskbar comes back after a restart.
+    static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+    static ICON: OnceLock<isize> = OnceLock::new();
     static RESTORE_HANDLER: OnceLock<Mutex<Option<Box<dyn Fn() + Send + 'static>>>> =
         OnceLock::new();
 
@@ -104,6 +107,8 @@ mod windows_tray {
                 return;
             }
             TRAY_HWND.store(hwnd as isize, Ordering::Relaxed);
+            let taskbar_created = wide("TaskbarCreated");
+            TASKBAR_CREATED.store(RegisterWindowMessageW(taskbar_created.as_ptr()), Ordering::Relaxed);
 
             add_tray_icon(hwnd);
 
@@ -123,6 +128,13 @@ mod windows_tray {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
+        if taskbar_created != 0 && msg == taskbar_created {
+            // Explorer restarted and forgot every tray icon. Without this one, a window closed
+            // to the tray would have no way back.
+            add_tray_icon(hwnd);
+            return 0;
+        }
         match msg {
             TRAY_CALLBACK => match low_word(lparam) {
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT | NIN_KEYSELECT => {
@@ -158,7 +170,7 @@ mod windows_tray {
         let mut data = notify_data(hwnd);
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY_CALLBACK;
-        data.hIcon = load_spotlight_icon();
+        data.hIcon = *ICON.get_or_init(|| load_spotlight_icon() as isize) as _;
         write_tip(&mut data, "Spotlight");
         Shell_NotifyIconW(NIM_ADD, &data);
         Shell_NotifyIconW(NIM_MODIFY, &data);
@@ -166,7 +178,9 @@ mod windows_tray {
 
     unsafe fn load_spotlight_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
         let hinstance = GetModuleHandleW(ptr::null());
-        let icon = LoadImageW(hinstance, 1 as _, IMAGE_ICON, 16, 16, 0);
+        // The size the tray draws at, which is more than 16 pixels on a high-DPI screen.
+        let size = GetSystemMetrics(SM_CXSMICON).max(16);
+        let icon = LoadImageW(hinstance, 1 as _, IMAGE_ICON, size, size, 0);
         if !icon.is_null() {
             return icon as _;
         }
@@ -251,16 +265,9 @@ mod windows_tray {
         }
     }
 
+    /// The app's own window. By title it could be another, such as a folder open in Explorer.
     unsafe fn find_spotlight_window() -> HWND {
-        let title = wide("Spotlight");
-        let hwnd =
-            windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(ptr::null(), title.as_ptr());
-        if !hwnd.is_null() {
-            MAIN_HWND.store(hwnd as isize, Ordering::Relaxed);
-            return hwnd;
-        }
-
-        MAIN_HWND.load(Ordering::Relaxed) as HWND
+        crate::window_chrome::handle()
     }
 
     fn wide(value: &str) -> Vec<u16> {

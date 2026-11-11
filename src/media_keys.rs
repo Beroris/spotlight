@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Once, PoisonError,
+    },
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Result};
 use global_hotkey::{
@@ -18,12 +25,46 @@ pub enum MediaCommand {
     SeekTo(i32),
 }
 
+/// Where shortcut presses go: the shortcuts registered now, and who hears about them. Presses
+/// arrive on the thread that registered the shortcuts, as messages there, so no thread of its
+/// own has to sit waiting for them.
+struct Route {
+    owner: u64,
+    tx: mpsc::UnboundedSender<MediaCommand>,
+    registered: Vec<(HotKey, MediaCommand)>,
+    last_seen: HashMap<u32, Instant>,
+}
+
+static ROUTE: Mutex<Option<Route>> = Mutex::new(None);
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+static HANDLER: Once = Once::new();
+
+fn route(event: GlobalHotKeyEvent) {
+    if event.state != HotKeyState::Pressed {
+        return;
+    }
+    let mut route = ROUTE.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(route) = route.as_mut() else {
+        return;
+    };
+    let now = Instant::now();
+    if route.last_seen.get(&event.id).is_some_and(|previous| now.duration_since(*previous) < Duration::from_millis(90)) {
+        return;
+    }
+    route.last_seen.insert(event.id, now);
+    if let Some((_, command)) = route.registered.iter().find(|(key, _)| key.id() == event.id) {
+        let _ = route.tx.send(*command);
+    }
+}
+
+/// The shortcuts from Settings. The keyboard's media keys aren't among them: Windows sends
+/// those to its media controls, which pass them to whichever app played last.
 pub struct MediaKeyGuard {
     manager: Arc<GlobalHotKeyManager>,
-    /// The shortcuts from Settings that registered, as opposed to the media keys.
+    /// The shortcuts that registered.
     custom: Vec<HotKey>,
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    /// Which `Route` is this guard's.
+    owner: u64,
     /// Human-readable problems with individual bindings. A bad binding is
     /// skipped instead of disabling every other shortcut.
     pub warnings: Vec<String>,
@@ -32,74 +73,41 @@ pub struct MediaKeyGuard {
 const BINDING_LABELS: [&str; 5] = ["Play/pause", "Next", "Previous", "Shuffle", "Repeat"];
 
 impl MediaKeyGuard {
-    pub fn install(tx: mpsc::UnboundedSender<MediaCommand>, media_keys: bool, custom_keys: bool, bindings: &[String; 5]) -> Result<Self> {
+    pub fn install(tx: mpsc::UnboundedSender<MediaCommand>, bindings: &[String; 5]) -> Result<Self> {
+        // Set before anything can be pressed: the library takes the first handler it sees.
+        HANDLER.call_once(|| GlobalHotKeyEvent::set_event_handler(Some(route)));
         let manager = Arc::new(GlobalHotKeyManager::new()?);
         let mut candidates = Vec::new();
         let mut warnings = Vec::new();
-        if media_keys {
-            candidates.push(("Media Play/Pause".to_string(), HotKey::new(Some(Modifiers::empty()), Code::MediaPlayPause), MediaCommand::PlayPause, false));
-            candidates.push(("Media Next".to_string(), HotKey::new(Some(Modifiers::empty()), Code::MediaTrackNext), MediaCommand::Next, false));
-            candidates.push(("Media Previous".to_string(), HotKey::new(Some(Modifiers::empty()), Code::MediaTrackPrevious), MediaCommand::Previous, false));
-        }
-        if custom_keys {
-            let commands = [MediaCommand::PlayPause, MediaCommand::Next, MediaCommand::Previous, MediaCommand::Shuffle, MediaCommand::Repeat];
-            for ((binding, command), label) in bindings.iter().zip(commands).zip(BINDING_LABELS) {
-                match parse_hotkey(binding) {
-                    Ok(hotkey) => candidates.push((format!("{label} ({binding})"), hotkey, command, true)),
-                    Err(error) => warnings.push(format!("{label} shortcut \"{binding}\" ignored: {error}")),
-                }
+        let commands = [MediaCommand::PlayPause, MediaCommand::Next, MediaCommand::Previous, MediaCommand::Shuffle, MediaCommand::Repeat];
+        for ((binding, command), label) in bindings.iter().zip(commands).zip(BINDING_LABELS) {
+            match parse_hotkey(binding) {
+                Ok(hotkey) => candidates.push((format!("{label} ({binding})"), hotkey, command)),
+                Err(error) => warnings.push(format!("{label} shortcut \"{binding}\" ignored: {error}")),
             }
         }
         let mut registered: Vec<(HotKey, MediaCommand)> = Vec::new();
-        let mut custom = Vec::new();
-        for (label, hotkey, command, is_custom) in candidates {
+        for (label, hotkey, command) in candidates {
             if registered.iter().any(|(existing, _)| existing.id() == hotkey.id()) {
                 warnings.push(format!("{label} ignored: the same key is already bound."));
                 continue;
             }
             match manager.register(hotkey) {
-                Ok(()) => {
-                    registered.push((hotkey, command));
-                    if is_custom {
-                        custom.push(hotkey);
-                    }
-                }
+                Ok(()) => registered.push((hotkey, command)),
                 Err(error) => warnings.push(format!("{label} could not be registered (another app may own it): {error}")),
             }
         }
+        let custom = registered.iter().map(|(hotkey, _)| *hotkey).collect();
 
-        let receiver = GlobalHotKeyEvent::receiver();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker = std::thread::spawn(move || {
-            let mut last_seen: HashMap<u32, Instant> = HashMap::new();
-            while !worker_stop.load(Ordering::Relaxed) {
-                let Ok(event) = receiver.recv_timeout(Duration::from_millis(50)) else { continue; };
-                if event.state != HotKeyState::Pressed {
-                    continue;
-                }
-                let now = Instant::now();
-                if let Some(previous) = last_seen.get(&event.id) {
-                    if now.duration_since(*previous) < Duration::from_millis(90) {
-                        continue;
-                    }
-                }
-                last_seen.insert(event.id, now);
+        let owner = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
+        *ROUTE.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Route { owner, tx, registered, last_seen: HashMap::new() });
 
-                let command = registered.iter().find(|(key, _)| key.id() == event.id).map(|(_, command)| *command);
-
-                if let Some(command) = command {
-                    let _ = tx.send(command);
-                }
-            }
-        });
-
-        Ok(Self { manager, custom, stop, worker: Some(worker), warnings })
+        Ok(Self { manager, custom, owner, warnings })
     }
 
     /// Lets go of the shortcuts from Settings while a new one is being pressed. Windows hands a
     /// registered shortcut to its owner instead of the window, so the box would never see it.
-    /// The media keys stay.
     pub fn pause_custom(&self) {
         let _ = self.manager.unregister_all(&self.custom);
     }
@@ -191,9 +199,9 @@ pub fn validate_hotkey(value: &str) -> Result<()> {
 
 impl Drop for MediaKeyGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let mut route = ROUTE.lock().unwrap_or_else(PoisonError::into_inner);
+        if route.as_ref().is_some_and(|route| route.owner == self.owner) {
+            *route = None;
         }
     }
 }

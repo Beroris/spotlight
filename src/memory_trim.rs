@@ -694,7 +694,7 @@ mod tests {
                 let mut memory = vec![1u8; 8 * 1024 * 1024];
                 let mut at = 0;
                 let mut last: Option<Instant> = None;
-                move |samples: &mut [f32]| {
+                crate::wasapi::AlwaysPlaying(move |samples: &mut [f32]| {
                     samples.fill(0.0);
                     // About 400 KB, more than decoding a callback's worth of music touches.
                     for _ in 0..100 {
@@ -706,7 +706,7 @@ mod tests {
                         longest_seen.fetch_max(now.duration_since(last).as_micros() as u64, Ordering::Relaxed);
                     }
                     last = Some(now);
-                }
+                })
             })
             .expect("the stream opens");
             stream.begin();

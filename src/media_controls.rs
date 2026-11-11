@@ -24,6 +24,14 @@ pub struct Song {
 
 static PLAYING: AtomicBool = AtomicBool::new(false);
 static COMMANDS: OnceLock<UnboundedSender<MediaCommand>> = OnceLock::new();
+/// Off, Windows shows nothing of Spotlight, and its media keys go to other apps.
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether Spotlight takes part in Windows' media controls, and so hears the media keys. True
+/// if that changed, so what's shown needs sending again.
+pub fn set_enabled(enabled: bool) -> bool {
+    ENABLED.swap(enabled, Ordering::Relaxed) != enabled
+}
 
 /// Windows' play and pause buttons say which they mean, and only the one that changes
 /// something is passed on, so a press can never be undone by the toggle it turns into.
@@ -136,6 +144,7 @@ mod imp {
     /// The song playing, or `None` for nothing, whether it's playing and where it is.
     pub fn show(song: Option<&Song>, playing: bool, position_ms: i32) {
         PLAYING.store(playing, Ordering::Relaxed);
+        let song = song.filter(|_| ENABLED.load(Ordering::Relaxed));
         CONTROLS.with(|cell| {
             let mut cell = cell.borrow_mut();
             let Some(controls) = cell.as_mut() else { return };

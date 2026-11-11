@@ -28,6 +28,13 @@ mod clipboard;
 mod drag_resize_window;
 mod winitwindowadapter;
 use winitwindowadapter::*;
+
+/// Spotlight: the next window to be shown for the first time is made but kept off the screen.
+/// Its native window exists, so messages reach it, and showing it later, as from the tray,
+/// paints it. Call before the event loop runs.
+pub fn keep_first_window_hidden() {
+    KEEP_FIRST_WINDOW_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 pub(crate) mod event_loop;
 mod frame_throttle;
 #[cfg(target_os = "ios")]

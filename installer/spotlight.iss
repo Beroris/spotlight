@@ -72,7 +72,7 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Play Sp
 
 [Registry]
 ; The same entry Spotlight writes itself, which lists it under Startup apps in Task Manager.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --at-sign-in"; Flags: uninsdeletevalue
 ; Task Manager's switch for it is set in the code below, from the sign-in option.
 
 [Run]

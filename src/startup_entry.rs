@@ -12,6 +12,8 @@ use std::{
 };
 
 const VALUE_NAME: &str = "Spotlight";
+/// Passed by the entry, so Spotlight knows Windows started it as the user signed in.
+pub const AT_SIGN_IN_ARG: &str = "--at-sign-in";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 /// Seconds from the start of Windows' clock (1601) to the start of Unix's (1970).
@@ -23,7 +25,7 @@ fn is_dev_build(exe: &Path) -> bool {
 }
 
 fn command_for(exe: &Path) -> String {
-    format!("\"{}\"", exe.display())
+    format!("\"{}\" {AT_SIGN_IN_ARG}", exe.display())
 }
 
 /// Task Manager's own record of a disabled entry: 3, then when it was disabled.
@@ -146,7 +148,10 @@ mod tests {
 
     #[test]
     fn the_command_survives_spaces_in_the_path() {
-        assert_eq!(command_for(&PathBuf::from(r"C:\Program Files\Spotlight\Spotlight.exe")), r#""C:\Program Files\Spotlight\Spotlight.exe""#);
+        assert_eq!(
+            command_for(&PathBuf::from(r"C:\Program Files\Spotlight\Spotlight.exe")),
+            r#""C:\Program Files\Spotlight\Spotlight.exe" --at-sign-in"#
+        );
     }
 
     #[test]

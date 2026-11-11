@@ -2533,6 +2533,8 @@ export component AppWindow inherits Window {
     in-out property <string> client_id;
     in-out property <string> redirect_uri;
     in-out property <string> connection_status: "Not connected";
+    // Why Spotlight can't keep up with Spotify just now, such as "Offline", or "" while it can.
+    in-out property <string> sync_trouble: "";
     in-out property <string> player_status: "Offline";
     in-out property <bool> signed_in: false;
     in-out property <string> track_title: "Nothing playing";
@@ -2595,6 +2597,13 @@ export component AppWindow inherits Window {
     in-out property <string> update_error: "";
     // False for a copy that can only link to the download, such as a build from source.
     in-out property <bool> update_installs_here: false;
+    // Update was pressed for a file GitHub lists no checksum for, so it asks once more.
+    in-out property <bool> update_confirming: false;
+    // How much the covers saved on this PC take, worked out as Settings opens.
+    in-out property <string> cover_cache_note: "";
+    in-out property <bool> cover_cache_clearable: false;
+    callback measure_cover_cache();
+    callback clear_cover_cache();
     callback check_for_update();
     callback install_update();
     callback open_update_notes();
@@ -2632,6 +2641,7 @@ export component AppWindow inherits Window {
     in-out property <bool> minimize_to_tray: false;
     in-out property <bool> close_to_tray: false;
     in-out property <bool> start_minimized: false;
+    in-out property <bool> tray_at_sign_in: true;
     in-out property <bool> low_resource_mode: true;
     in-out property <bool> reduce_animations: false;
     in-out property <bool> disable_background_effects: true;
@@ -2648,6 +2658,14 @@ export component AppWindow inherits Window {
     in-out property <string> track_view_title: "Liked Songs";
     in-out property <string> track_view_meta: "";
     in-out property <bool> track_view_loading: false;
+    // Only part of a long library list is loaded, and the rest can be, at the list's end.
+    in-out property <bool> track_view_more: false;
+    in-out property <bool> track_view_more_busy: false;
+    callback load_more_tracks();
+    // The same for the library's playlists, at the sidebar's end.
+    in-out property <bool> more_playlists: false;
+    in-out property <bool> more_playlists_busy: false;
+    callback load_more_playlists();
     in-out property <bool> show_home: false;
     in-out property <[HomeSection]> home_sections: [];
     in-out property <bool> home_loading: false;
@@ -3369,6 +3387,7 @@ export component AppWindow inherits Window {
         }
         if (root.show_settings) {
             root.refresh_output_devices();
+            root.measure_cover_cache();
         }
         keys.focus();
     }
@@ -3716,6 +3735,27 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // Quiet, and only while it lasts, so the app doesn't look stuck.
+                    if root.sync_trouble != "" && root.signed_in : Rectangle {
+                        width: trouble-text.preferred-width + 34px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: AppTheme.text.with-alpha(0.05);
+                        Rectangle {
+                            x: 13px;
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: AppTheme.warning;
+                        }
+                        trouble-text := Text {
+                            x: 25px;
+                            text: root.sync_trouble;
+                            color: AppTheme.secondary-text;
+                            font-size: 12px;
+                        }
+                    }
+
                     Rectangle { horizontal-stretch: 1; }
 
                     if root.top-connect-shown : Rectangle {
@@ -3966,6 +4006,17 @@ export component AppWindow inherits Window {
 
                                             property <length> lead: playlist-hover.has-hover && !root.compact_sidebars ? 10px : 8px;
                                             animate lead { duration: AppTheme.motion-spring; easing: ease-out; }
+                                        }
+                                    }
+                                    // The library has more playlists than are loaded.
+                                    if root.more_playlists : Rectangle {
+                                        height: 52px;
+                                        TextButton {
+                                            x: (parent.width - self.width) / 2;
+                                            text: root.more_playlists_busy ? (root.compact_sidebars ? "…" : "Loading…") : (root.compact_sidebars ? "More" : "Load more playlists");
+                                            button-width: min(parent.width - 8px, 172px);
+                                            enabled: !root.more_playlists_busy;
+                                            clicked => { root.load_more_playlists(); }
                                         }
                                     }
                                 }
@@ -4585,6 +4636,14 @@ export component AppWindow inherits Window {
                                 // can scroll clear of the floating player bar.
                                 for row[index] in root.track_rows : Rectangle {
                                   height: row.source-index < 0 ? 104px : 48px;
+                                  if row.source-index < 0 && root.track_view_more : TextButton {
+                                    x: (parent.width - self.width) / 2;
+                                    y: 14px;
+                                    text: root.track_view_more_busy ? "Loading…" : "Load more songs";
+                                    button-width: 156px;
+                                    enabled: !root.track_view_more_busy;
+                                    clicked => { root.load_more_tracks(); }
+                                  }
                                   if row.source-index >= 0 : Rectangle {
                                   property <float> reach: root.arrive(root.rows-in, index);
                                   y: root.rise(self.reach);
@@ -4663,10 +4722,21 @@ export component AppWindow inherits Window {
                                     horizontal-alignment: center;
                                 }
                                 Text {
-                                    text: root.track_filter != "" ? "Press Esc to clear the filter." : (root.history-open ? "Songs you play show up here." : (root.in-search ? "Try a different search." : "Refresh your library from the sidebar."));
+                                    text: root.track_filter != "" ? "Press Esc to clear the filter." : (root.track_view_more ? "The rest of the list isn't loaded yet." : (root.history-open ? "Songs you play show up here." : (root.in-search ? "Try a different search." : "Refresh your library from the sidebar.")));
                                     color: AppTheme.muted-text;
                                     font-size: 13px;
                                     horizontal-alignment: center;
+                                }
+                                // Only part of the list is loaded, and none of it is shown.
+                                if root.track_view_more : HorizontalLayout {
+                                    alignment: center;
+                                    padding-top: 8px;
+                                    TextButton {
+                                        text: root.track_view_more_busy ? "Loading…" : "Load more songs";
+                                        button-width: 156px;
+                                        enabled: !root.track_view_more_busy;
+                                        clicked => { root.load_more_tracks(); }
+                                    }
                                 }
                             }
                         }
@@ -5796,10 +5866,11 @@ export component AppWindow inherits Window {
                                                 label: "Spotlight " + root.update_version + " is out";
                                                 description: root.update_busy == "downloading" ? "Downloading… " + round(root.update_progress * 100) + "%"
                                                     : root.update_busy == "installing" ? "Installing…"
+                                                    : root.update_confirming ? "GitHub lists no checksum for this file, so Spotlight can't check it's the real one."
                                                     : root.update_error != "" ? root.update_error
                                                     : root.update_installs_here ? "Updating restarts Spotlight, so the music stops for a moment."
                                                     : "This copy can't update itself. Download the new version from GitHub.";
-                                                control-width: 222px;
+                                                control-width: root.update_confirming && root.update_busy == "" ? 252px : 222px;
                                                 TextButton {
                                                     x: 0px;
                                                     text: "What's new";
@@ -5810,10 +5881,11 @@ export component AppWindow inherits Window {
                                                     x: 116px;
                                                     text: !root.update_installs_here ? "Download"
                                                         : root.update_busy == "downloading" ? round(root.update_progress * 100) + "%"
+                                                        : root.update_confirming ? "Update anyway"
                                                         : "Update";
                                                     primary: true;
                                                     enabled: root.update_busy == "";
-                                                    button-width: 106px;
+                                                    button-width: root.update_confirming && root.update_busy == "" ? 136px : 106px;
                                                     clicked => { root.install_update(); }
                                                 }
                                             }
@@ -5902,7 +5974,19 @@ export component AppWindow inherits Window {
                                             SettingToggle { label: "Minimize to tray"; description: "Keep running in the tray when minimized."; checked <=> root.minimize_to_tray; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Close to tray"; description: "The close button hides the window instead of quitting."; checked <=> root.close_to_tray; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Start minimized"; description: "Open quietly in the background."; checked <=> root.start_minimized; toggled => { root.save_settings(); } }
+                                            SettingToggle { label: "Start in the tray at sign-in"; description: "When Spotlight starts with Windows, it waits in the tray."; checked <=> root.tray_at_sign_in; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Save resources in the background"; description: "Check Spotify less often when Spotlight isn't in front."; checked <=> root.low_resource_mode; toggled => { root.save_settings(); } }
+                                            SettingRow {
+                                                label: "Saved covers";
+                                                description: root.cover_cache_note != "" ? root.cover_cache_note : "Album covers kept on this PC, so they show at once.";
+                                                control-width: 96px;
+                                                TextButton {
+                                                    text: "Clear";
+                                                    button-width: 96px;
+                                                    enabled: root.cover_cache_clearable;
+                                                    clicked => { root.clear_cover_cache(); }
+                                                }
+                                            }
                                             SettingToggle { label: "Developer options"; description: "Show connection details, logs and advanced settings."; checked <=> root.developer_mode; toggled => { root.save_settings(); } }
                                         }
 
@@ -6072,7 +6156,7 @@ export component AppWindow inherits Window {
                                             scroll-y: settings-scroll.viewport-y;
                                             view-height: settings-scroll.visible-height;
 
-                                            SettingToggle { label: "Media keys"; description: "Your keyboard's play and skip keys always control Spotlight."; checked <=> root.media_keys_enabled; toggled => { root.save_settings(); } }
+                                            SettingToggle { label: "Media keys"; description: "Show the song in Windows' media controls, so play and skip keys reach Spotlight when it played last."; checked <=> root.media_keys_enabled; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Shortcuts in the background"; description: "The keys below work even when Spotlight isn't in front."; checked <=> root.global_hotkeys; toggled => { root.save_settings(); } }
                                             SettingRow {
                                                 label: "Play or pause";

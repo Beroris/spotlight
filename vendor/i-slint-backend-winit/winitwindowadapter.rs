@@ -299,6 +299,9 @@ impl WinitWindowOrNone {
     }
 }
 
+/// Spotlight: set by `keep_first_window_hidden`, and cleared when the window it kept hidden is made.
+pub(crate) static KEEP_FIRST_WINDOW_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Default, PartialEq, Clone, Copy)]
 pub(crate) enum WindowVisibility {
     #[default]
@@ -1090,7 +1093,11 @@ impl WinitWindowAdapter {
                 self.resize_window(size.into())?;
             };
 
-            winit_window.set_visible(true);
+            let kept_hidden = visibility == WindowVisibility::ShownFirstTime
+                && KEEP_FIRST_WINDOW_HIDDEN.swap(false, std::sync::atomic::Ordering::Relaxed);
+            if !kept_hidden {
+                winit_window.set_visible(true);
+            }
 
             // Make sure the dark color scheme property is up-to-date, as it may have been queried earlier when
             // the window wasn't mapped yet.

@@ -18,6 +18,78 @@ impl std::fmt::Display for RateLimitError {
 
 impl std::error::Error for RateLimitError {}
 
+/// When Spotify last said to wait until, in ms since Spotlight started. Not by the wall clock,
+/// which setting back could stretch the wait by. Its limit counts every
+/// request the app makes, so background checks hold off for all of them.
+static QUIET_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The longest Spotlight waits on Spotify's word, so a huge Retry-After can't stop it for hours.
+const LONGEST_RATE_LIMIT_WAIT: Duration = Duration::from_secs(600);
+
+fn clock_ms() -> u64 {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    STARTED.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// How long background checks should still wait after Spotify last asked to slow down.
+pub fn rate_limit_wait() -> Option<Duration> {
+    let left = QUIET_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(clock_ms());
+    (left > 0).then(|| Duration::from_millis(left).min(LONGEST_RATE_LIMIT_WAIT))
+}
+
+/// How many songs a long list shows at first, and how many more each time more are asked for.
+pub const SONGS_PER_PART: usize = 500;
+/// The same for the playlists in the library.
+pub const PLAYLISTS_PER_PART: usize = 200;
+
+/// Part of a long list on Spotify, from where it was asked for.
+pub struct Part<T> {
+    pub items: Vec<T>,
+    /// How long the whole list is, as Spotify counts it.
+    pub total: usize,
+    /// Where the next part starts in Spotify's list, while there's more.
+    pub more_from: Option<usize>,
+}
+
+/// A page of a list as Spotify sends it.
+trait Page {
+    type Item;
+    /// What it holds, how many entries that was before any that can't be shown were left
+    /// out, where the next page is, and how long the whole list is.
+    fn open(self) -> (Vec<Self::Item>, usize, Option<String>, usize);
+}
+
+impl Page for PlaylistPage {
+    type Item = PlaylistItem;
+    fn open(self) -> (Vec<PlaylistItem>, usize, Option<String>, usize) {
+        let read = self.items.len();
+        (self.items, read, self.next, self.total.unwrap_or(0) as usize)
+    }
+}
+
+impl Page for SavedTracksPage {
+    type Item = FullTrack;
+    fn open(self) -> (Vec<FullTrack>, usize, Option<String>, usize) {
+        let read = self.items.len();
+        (self.items.into_iter().map(|item| item.track).collect(), read, self.next, self.total.unwrap_or(0) as usize)
+    }
+}
+
+impl Page for PlaylistTracksPage {
+    type Item = FullTrack;
+    fn open(self) -> (Vec<FullTrack>, usize, Option<String>, usize) {
+        let read = self.items.len();
+        // Local files and songs taken off Spotify come without one.
+        let tracks = self.items.into_iter().filter_map(|item: PlaylistTrackItem| item.track).collect();
+        (tracks, read, self.next, self.total.unwrap_or(0) as usize)
+    }
+}
+
+/// `url` with `limit` and `offset` added.
+fn paged(url: &str, limit: usize, offset: usize) -> String {
+    let joiner = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{joiner}limit={limit}&offset={offset}")
+}
+
 #[derive(Clone)]
 pub struct SpotifyApi {
     http: Client,
@@ -57,61 +129,46 @@ impl SpotifyApi {
         Ok(response.json::<DevicesResponse>().await?.devices)
     }
 
-    pub async fn playlists(&self, token: &TokenStore) -> Result<Vec<PlaylistItem>> {
-        let mut url = "https://api.spotify.com/v1/me/playlists?limit=50".to_string();
-        let mut all = Vec::new();
+    /// About `count` entries of a list from `from` on, a page at a time. `first` is the first
+    /// page's address.
+    async fn part<P: Page + serde::de::DeserializeOwned>(&self, token: &TokenStore, first: String, from: usize, count: usize) -> Result<Part<P::Item>> {
+        let mut url = first;
+        let mut items = Vec::new();
+        let mut read = 0;
         loop {
-            let response = self.request(token, Method::GET, &url, None).await?;
-            let page: PlaylistPage = response.json().await?;
-            all.extend(page.items);
-            if all.len() >= 200 {
-                all.truncate(200);
-                return Ok(all);
-            }
-            if let Some(next) = page.next {
-                url = next;
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            } else {
-                return Ok(all);
+            let page: P = self.request(token, Method::GET, &url, None).await?.json().await?;
+            let (page_items, page_read, next, total) = page.open();
+            items.extend(page_items);
+            read += page_read;
+            match next {
+                Some(next) if read < count && page_read > 0 => {
+                    url = next;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                next => {
+                    let more_from = next.filter(|_| page_read > 0).map(|_| from + read);
+                    return Ok(Part { items, total: total.max(from + read), more_from });
+                }
             }
         }
     }
 
-    pub async fn liked_songs(&self, token: &TokenStore) -> Result<Vec<crate::models::FullTrack>> {
-        let mut url = "https://api.spotify.com/v1/me/tracks?limit=50".to_string();
-        let mut all = Vec::new();
-        loop {
-            let response = self.request(token, Method::GET, &url, None).await?;
-            let page: SavedTracksPage = response.json().await?;
-            all.extend(page.items.into_iter().map(|item| item.track));
-            if all.len() >= 500 {
-                all.truncate(500);
-                return Ok(all);
-            }
-            if let Some(next) = page.next {
-                url = next;
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            } else {
-                return Ok(all);
-            }
-        }
+    /// The playlists in the library, `count` of them from `from` on.
+    pub async fn playlists(&self, token: &TokenStore, from: usize, count: usize) -> Result<Part<PlaylistItem>> {
+        self.part::<PlaylistPage>(token, paged("https://api.spotify.com/v1/me/playlists", 50, from), from, count).await
     }
 
-    pub async fn playlist_tracks(&self, token: &TokenStore, playlist_id: &str) -> Result<Vec<FullTrack>> {
-        let mut url = format!(
-            "https://api.spotify.com/v1/playlists/{}/items?limit=100",
-            urlencoding::encode(playlist_id)
-        );
-        self.collect_playlist_tracks(token, &mut url).await
+    pub async fn liked_songs(&self, token: &TokenStore, from: usize, count: usize) -> Result<Part<FullTrack>> {
+        self.part::<SavedTracksPage>(token, paged("https://api.spotify.com/v1/me/tracks", 50, from), from, count).await
     }
 
-    pub async fn playlist_tracks_by_href(&self, token: &TokenStore, href: &str) -> Result<Vec<FullTrack>> {
-        let mut url = if href.contains('?') {
-            href.to_string()
-        } else {
-            format!("{href}?limit=100")
-        };
-        self.collect_playlist_tracks(token, &mut url).await
+    pub async fn playlist_tracks(&self, token: &TokenStore, playlist_id: &str, from: usize, count: usize) -> Result<Part<FullTrack>> {
+        let url = format!("https://api.spotify.com/v1/playlists/{}/items", urlencoding::encode(playlist_id));
+        self.part::<PlaylistTracksPage>(token, paged(&url, 100, from), from, count).await
+    }
+
+    pub async fn playlist_tracks_by_href(&self, token: &TokenStore, href: &str, from: usize, count: usize) -> Result<Part<FullTrack>> {
+        self.part::<PlaylistTracksPage>(token, paged(href, 100, from), from, count).await
     }
 
     pub async fn playlist_image_url(&self, token: &TokenStore, playlist_id: &str) -> Result<Option<String>> {
@@ -128,25 +185,6 @@ impl SpotifyApi {
             .await?;
         let images: Vec<crate::models::AlbumImage> = response.json().await?;
         Ok(images.into_iter().next().map(|image| image.url))
-    }
-
-    async fn collect_playlist_tracks(&self, token: &TokenStore, url: &mut String) -> Result<Vec<FullTrack>> {
-        let mut all = Vec::new();
-        loop {
-            let response = self.request(token, Method::GET, url, None).await?;
-            let page: PlaylistTracksPage = response.json().await?;
-            all.extend(page.items.into_iter().filter_map(|item: PlaylistTrackItem| item.track));
-            if all.len() >= 500 {
-                all.truncate(500);
-                return Ok(all);
-            }
-            if let Some(next) = page.next {
-                *url = next;
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            } else {
-                return Ok(all);
-            }
-        }
     }
 
     pub async fn transfer(&self, token: &TokenStore, device_id: &str, play: bool) -> Result<()> {
@@ -252,6 +290,12 @@ impl SpotifyApi {
         Ok(())
     }
 
+    /// The signed-in account's id.
+    pub async fn account_id(&self, token: &TokenStore) -> Result<String> {
+        let me: Value = self.request(token, Method::GET, "https://api.spotify.com/v1/me", None).await?.json().await?;
+        me.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string).ok_or_else(|| anyhow!("Spotify didn't say which account this is"))
+    }
+
     /// A new private playlist in the account, empty.
     pub async fn create_playlist(&self, token: &TokenStore, name: &str) -> Result<PlaylistItem> {
         let body = json!({ "name": name, "public": false });
@@ -259,9 +303,8 @@ impl SpotifyApi {
             Ok(response) => response,
             // Where it was before Spotify moved it: under the account's id.
             Err(first) => {
-                let me: Value = self.request(token, Method::GET, "https://api.spotify.com/v1/me", None).await?.json().await?;
-                let Some(user) = me.get("id").and_then(Value::as_str) else { return Err(first) };
-                let url = format!("https://api.spotify.com/v1/users/{}/playlists", urlencoding::encode(user));
+                let Ok(user) = self.account_id(token).await else { return Err(first) };
+                let url = format!("https://api.spotify.com/v1/users/{}/playlists", urlencoding::encode(&user));
                 self.request(token, Method::POST, &url, Some(body)).await?
             }
         };
@@ -549,6 +592,8 @@ impl SpotifyApi {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(5);
+            let wait = Duration::from_secs(retry_after_secs.max(1)).min(LONGEST_RATE_LIMIT_WAIT);
+            QUIET_UNTIL_MS.fetch_max(clock_ms() + wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
             // Return immediately. Sleeping here used to hold the caller's
             // playback-refresh permit for the full Retry-After duration.
             return Err(RateLimitError { retry_after_secs }.into());

@@ -137,8 +137,27 @@ pub async fn login(config: &AppConfig) -> Result<TokenStore> {
     exchange_code(&client_id, &redirect, &verifier, &code).await
 }
 
+/// Spotify turned a refresh token down, so only signing in again will do. Any other failure,
+/// such as no network yet after the PC wakes, is worth trying again later instead.
+#[derive(Debug)]
+pub struct SignInExpired(String);
+
+impl std::fmt::Display for SignInExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "token refresh failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for SignInExpired {}
+
+/// Talks to Spotify's sign-in service. A connection that stalls, say just after the PC wakes,
+/// gives up rather than holding up everything that waits for a token.
+fn accounts_client() -> Result<Client> {
+    Ok(Client::builder().timeout(std::time::Duration::from_secs(15)).build()?)
+}
+
 pub async fn refresh_token(client_id: &str, refresh_token: &str) -> Result<TokenStore> {
-    let client = Client::new();
+    let client = accounts_client()?;
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -151,8 +170,13 @@ pub async fn refresh_token(client_id: &str, refresh_token: &str) -> Result<Token
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!("token refresh failed: {}", response.text().await.unwrap_or_default()));
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(SignInExpired(body).into());
+        }
+        return Err(anyhow!("token refresh failed ({status}): {body}"));
     }
 
     let token: TokenResponse = response.json().await?;
@@ -212,7 +236,7 @@ pub async fn login_for_local_playback(client_id: &str) -> Result<TokenStore> {
 }
 
 async fn exchange_code(client_id: &str, redirect_uri: &str, verifier: &str, code: &str) -> Result<TokenStore> {
-    let client = Client::new();
+    let client = accounts_client()?;
     let params = [
         ("grant_type", "authorization_code"),
         ("code", code),

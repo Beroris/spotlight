@@ -8,10 +8,11 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc, Arc, Condvar, Mutex, PoisonError,
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -45,6 +46,72 @@ const STALL_TIMEOUT_MS: u32 = 1_000;
 
 /// Times the queue ran out, which is what makes the margin grow.
 pub static UNDERRUNS: AtomicU64 = AtomicU64::new(0);
+
+/// What a stream plays.
+pub trait Feed {
+    /// Fills the buffer with interleaved stereo. Returns whether any of it was something to
+    /// hear, so a stream doesn't stop with fresh music still in Windows' buffer.
+    fn fill(&mut self, buffer: &mut [f32]) -> bool;
+    /// True while there's nothing to hear, such as when paused or when nothing is queued.
+    fn has_nothing_to_play(&self) -> bool;
+}
+
+/// After this long with nothing to play, a stream stops until `wake_streams`. A running stream
+/// wakes its thread every engine cycle, and keeps Windows from going to sleep by itself.
+const IDLE_BEFORE_STOPPING_MS: u32 = 5_000;
+/// Streams stopped for lack of anything to play.
+static RESTING: AtomicUsize = AtomicUsize::new(0);
+static WAKES: Mutex<u64> = Mutex::new(0);
+static WOKEN: Condvar = Condvar::new();
+
+#[cfg(test)]
+pub fn resting_streams() -> usize {
+    RESTING.load(Ordering::SeqCst)
+}
+
+/// A feed that always has something to play, so its stream never rests.
+#[cfg(test)]
+pub struct AlwaysPlaying<F>(pub F);
+
+#[cfg(test)]
+impl<F: FnMut(&mut [f32])> Feed for AlwaysPlaying<F> {
+    fn fill(&mut self, buffer: &mut [f32]) -> bool {
+        (self.0)(buffer);
+        true
+    }
+
+    fn has_nothing_to_play(&self) -> bool {
+        false
+    }
+}
+
+/// Tells resting streams to look whether they have something to play again. Call it after
+/// queueing audio or unpausing.
+pub fn wake_streams() {
+    if RESTING.load(Ordering::SeqCst) > 0 {
+        *WAKES.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        WOKEN.notify_all();
+    }
+}
+
+/// Waits until the feed has something to play. False if the stream is stopping instead.
+fn rest_until_needed(feed: &impl Feed, stop: &AtomicBool) -> bool {
+    RESTING.fetch_add(1, Ordering::SeqCst);
+    let mut wakes = WAKES.lock().unwrap_or_else(PoisonError::into_inner);
+    let needed = loop {
+        if stop.load(Ordering::SeqCst) {
+            break false;
+        }
+        if !feed.has_nothing_to_play() {
+            break true;
+        }
+        // The timeout is only a backstop: every change that matters wakes it.
+        wakes = WOKEN.wait_timeout(wakes, Duration::from_secs(1)).unwrap_or_else(PoisonError::into_inner).0;
+    };
+    drop(wakes);
+    RESTING.fetch_sub(1, Ordering::SeqCst);
+    needed
+}
 
 /// How many frames to keep queued at first: one engine cycle and a quarter.
 pub fn starting_margin(period_frames: u32) -> u32 {
@@ -129,12 +196,11 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// Connects to the device. Nothing plays until `begin`. `make_filler` is given
-    /// the device's sample rate and returns what fills each buffer with interleaved
-    /// stereo.
-    pub fn open<F, M>(device_id: String, make_filler: M) -> Result<Self>
+    /// Connects to the device. Nothing plays until `begin`. `make_feed` is given the
+    /// device's sample rate and returns what the stream plays.
+    pub fn open<F, M>(device_id: String, make_feed: M) -> Result<Self>
     where
-        F: FnMut(&mut [f32]),
+        F: Feed,
         M: FnOnce(u32) -> F + Send + 'static,
     {
         let broken = Arc::new(AtomicBool::new(false));
@@ -157,8 +223,8 @@ impl Stream {
                 if begin_rx.recv().is_err() {
                     return;
                 }
-                let filler = make_filler(connection.rate);
-                if connection.play(filler, &stop).is_err() {
+                let feed = make_feed(connection.rate);
+                if connection.play(feed, &stop).is_err() {
                     broken.store(true, Ordering::SeqCst);
                 }
             })?
@@ -182,6 +248,7 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        wake_streams();
         self.begin = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -234,17 +301,18 @@ impl Connection {
         }
     }
 
-    fn write(&self, frames: u32, filler: &mut impl FnMut(&mut [f32])) -> Result<()> {
+    /// Returns whether what went in was something to hear.
+    fn write(&self, frames: u32, feed: &mut impl Feed) -> Result<bool> {
         unsafe {
             let data = self.render.GetBuffer(frames)?;
             let samples = (frames * CHANNELS as u32) as usize;
-            filler(std::slice::from_raw_parts_mut(data as *mut f32, samples));
+            let heard = feed.fill(std::slice::from_raw_parts_mut(data as *mut f32, samples));
             self.render.ReleaseBuffer(frames, 0)?;
+            Ok(heard)
         }
-        Ok(())
     }
 
-    fn play(&self, mut filler: impl FnMut(&mut [f32]), stop: &AtomicBool) -> Result<()> {
+    fn play(&self, mut feed: impl Feed, stop: &AtomicBool) -> Result<()> {
         unsafe {
             let mut task = 0u32;
             let _ = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task);
@@ -252,8 +320,10 @@ impl Connection {
             let result = (|| -> Result<()> {
                 self.client.SetEventHandle(wake)?;
                 let mut margin = starting_margin(self.period_frames).min(self.capacity);
-                self.write(margin, &mut filler)?;
+                self.write(margin, &mut feed)?;
                 self.client.Start()?;
+                let idle_limit = self.rate * IDLE_BEFORE_STOPPING_MS / 1_000;
+                let mut idle_frames = 0u32;
                 loop {
                     if WaitForSingleObject(wake, STALL_TIMEOUT_MS) != WAIT_OBJECT_0 {
                         return if stop.load(Ordering::SeqCst) {
@@ -271,7 +341,19 @@ impl Connection {
                         margin = grown_margin(margin, self.period_frames, self.capacity);
                     }
                     if queued < margin {
-                        self.write(margin - queued, &mut filler)?;
+                        let heard = self.write(margin - queued, &mut feed)?;
+                        idle_frames = if heard { 0 } else { idle_frames.saturating_add(margin - queued) };
+                    }
+                    if idle_frames >= idle_limit {
+                        // Only silence is left in Windows' buffer, so it can go.
+                        self.client.Stop()?;
+                        self.client.Reset()?;
+                        if !rest_until_needed(&feed, stop) {
+                            return Ok(());
+                        }
+                        idle_frames = 0;
+                        self.write(margin, &mut feed)?;
+                        self.client.Start()?;
                     }
                 }
             })();

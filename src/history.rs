@@ -1,9 +1,11 @@
 //! The songs played on this PC. Spotify's list of recently played songs leaves out what
 //! Spotlight's own player plays, so Spotlight keeps a short list of its own and puts the two
-//! together for Recently played.
+//! together for Recently played. Each account has its own list, so signing in as someone else
+//! never shows what the last one played.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -31,34 +33,95 @@ struct File {
     plays: Vec<Play>,
 }
 
-fn path() -> Result<PathBuf> {
-    Ok(config::config_dir()?.join("history.json"))
+/// Held while a list is read and written back, so two changes can't cross.
+static FILES: Mutex<()> = Mutex::new(());
+
+/// The list's file name. Without an account it's the list from before lists were kept by
+/// account, which also holds plays from while the account wasn't known yet. The next account
+/// signed in takes those over.
+fn file_name(account: Option<&str>) -> String {
+    match account {
+        None => "history.json".to_string(),
+        Some(account) => {
+            let safe: String = account
+                .chars()
+                .map(|letter| if letter.is_ascii_alphanumeric() || matches!(letter, '-' | '_' | '.') { letter } else { '_' })
+                .collect();
+            format!("history-{safe}.json")
+        }
+    }
+}
+
+fn path(account: Option<&str>) -> Result<PathBuf> {
+    Ok(config::config_dir()?.join(file_name(account)))
 }
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as i64)
 }
 
-/// The songs played here, newest first. A missing or damaged file is an empty list.
-pub fn load() -> Vec<Play> {
-    path()
+/// A missing or damaged file is an empty list.
+fn read(path: &Path) -> Vec<Play> {
+    fs::read(path)
         .ok()
-        .and_then(|path| fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<File>(&bytes).ok())
         .map(|file| file.plays)
         .unwrap_or_default()
 }
 
-/// Adds a song to the front of the list.
-pub fn record(play: Play) -> Result<()> {
-    let mut plays = load();
-    plays.insert(0, play);
-    plays.truncate(KEPT);
-    let path = path()?;
+fn write(path: &Path, plays: Vec<Play>) -> Result<()> {
     let partial = path.with_extension("json.partial");
     fs::write(&partial, serde_json::to_vec(&File { plays })?)?;
-    fs::rename(&partial, &path)?;
+    fs::rename(&partial, path)?;
     Ok(())
+}
+
+/// Two lists as one, newest first.
+fn combined(mut plays: Vec<Play>, more: Vec<Play>) -> Vec<Play> {
+    plays.extend(more);
+    plays.sort_by_key(|play| std::cmp::Reverse(play.at_ms));
+    plays.truncate(KEPT);
+    plays
+}
+
+/// Moves the plays not yet in an account's list into `account`'s.
+fn claim(account: &str) -> Result<()> {
+    let unclaimed = path(None)?;
+    if !unclaimed.exists() {
+        return Ok(());
+    }
+    let own = path(Some(account))?;
+    write(&own, combined(read(&own), read(&unclaimed)))?;
+    fs::remove_file(unclaimed)?;
+    Ok(())
+}
+
+/// Gives `account` the plays recorded before it was known.
+pub fn adopt(account: &str) {
+    let _files = FILES.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = claim(account);
+}
+
+/// The songs `account` played here, newest first.
+pub fn load(account: Option<&str>) -> Vec<Play> {
+    let _files = FILES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(account) = account {
+        let _ = claim(account);
+    }
+    path(account).map(|path| read(&path)).unwrap_or_default()
+}
+
+/// Adds a song to the front of the list of the account `whose` names.
+pub fn record(whose: impl FnOnce() -> Option<Option<String>>, play: Play) -> Result<()> {
+    let _files = FILES.lock().unwrap_or_else(PoisonError::into_inner);
+    // Asked only now, with the files held, so the play can't go into the unclaimed list just
+    // after its account claimed it. `None` leaves it out.
+    let Some(account) = whose() else { return Ok(()) };
+    if let Some(account) = account.as_deref() {
+        let _ = claim(account);
+    }
+    let path = path(account.as_deref())?;
+    write(&path, combined(vec![play], read(&path)))
 }
 
 /// The song the player has, and whether it has counted yet. Everything that starts or stops
@@ -187,6 +250,24 @@ mod tests {
 
     fn uris(songs: &[FullTrack]) -> Vec<&str> {
         songs.iter().map(|song| song.uri.as_str()).collect()
+    }
+
+    #[test]
+    fn each_account_has_a_file_of_its_own() {
+        assert_eq!(file_name(None), "history.json");
+        assert_eq!(file_name(Some("31abcxyz")), "history-31abcxyz.json");
+        // Old accounts have names, which mustn't reach outside the folder.
+        assert_eq!(file_name(Some("../a b\\c")), "history-.._a_b_c.json");
+    }
+
+    #[test]
+    fn unclaimed_plays_join_the_account_by_time() {
+        let own = vec![Play { at_ms: 3, track: song("c", 1) }, Play { at_ms: 1, track: song("a", 1) }];
+        let unclaimed = vec![Play { at_ms: 2, track: song("b", 1) }];
+        let plays = combined(own, unclaimed);
+        assert_eq!(plays.iter().map(|play| play.track.uri.as_str()).collect::<Vec<_>>(), ["c", "b", "a"]);
+        let many = (0..KEPT as i64 + 5).map(|at_ms| Play { at_ms, track: song("x", 1) }).collect();
+        assert_eq!(combined(many, Vec::new()).len(), KEPT);
     }
 
     #[test]
