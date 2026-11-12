@@ -56,8 +56,8 @@ pub fn load_config() -> Result<AppConfig> {
     Ok(cfg)
 }
 
-/// The settings Spotlight starts with.
-fn new_config() -> AppConfig {
+/// The settings Spotlight starts with, and goes back to when its data is reset.
+pub fn new_config() -> AppConfig {
     AppConfig {
         redirect_uri: "http://127.0.0.1:5543/callback/".into(),
         device_name: "Spotlight PC".into(),

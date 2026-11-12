@@ -22,7 +22,8 @@ impl std::error::Error for RateLimitError {}
 /// which setting back could stretch the wait by. Its limit counts every
 /// request the app makes, so background checks hold off for all of them.
 static QUIET_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The longest Spotlight waits on Spotify's word, so a huge Retry-After can't stop it for hours.
+/// The longest one wait lasts before background checks look again. The whole of Spotify's
+/// Retry-After is still kept to: asking sooner only makes it longer.
 const LONGEST_RATE_LIMIT_WAIT: Duration = Duration::from_secs(600);
 
 fn clock_ms() -> u64 {
@@ -592,8 +593,8 @@ impl SpotifyApi {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(5);
-            let wait = Duration::from_secs(retry_after_secs.max(1)).min(LONGEST_RATE_LIMIT_WAIT);
-            QUIET_UNTIL_MS.fetch_max(clock_ms() + wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+            let wait_ms = retry_after_secs.max(1).saturating_mul(1000);
+            QUIET_UNTIL_MS.fetch_max(clock_ms().saturating_add(wait_ms), std::sync::atomic::Ordering::Relaxed);
             // Return immediately. Sleeping here used to hold the caller's
             // playback-refresh permit for the full Retry-After duration.
             return Err(RateLimitError { retry_after_secs }.into());

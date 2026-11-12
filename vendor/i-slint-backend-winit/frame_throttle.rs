@@ -69,7 +69,10 @@ impl FrameThrottle for TimerBasedFrameThrottle {
             // Spotlight: a hidden window is never painted, so its frame stays wanted and this
             // timer would wake at the refresh rate until the window is shown. Showing the window
             // paints it anyway, which draws the frame that was wanted.
-            if adapter.winit_window().is_some_and(|window| window.is_visible() == Some(false)) {
+            // The same goes for a minimized window, which Windows still counts as visible.
+            if adapter.winit_window().is_some_and(|window| {
+                window.is_visible() == Some(false) || window.is_minimized() == Some(true)
+            }) {
                 timer.stop();
                 return;
             }

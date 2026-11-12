@@ -253,7 +253,7 @@ component IconButton inherits Rectangle {
         transform-scale-x: root.icon-scale;
         transform-scale-y: root.icon-scale;
         animate colorize { duration: AppTheme.motion-duration; easing: ease-out; }
-        animate transform-scale-x, transform-scale-y { duration: touch.pressed ? 70ms : AppTheme.motion-spring; easing: ease-out-back; }
+        animate transform-scale-x, transform-scale-y { duration: touch.pressed ? 70ms : AppTheme.motion-spring; easing: ease-out; }
     }
 
     Rectangle {
@@ -263,7 +263,7 @@ component IconButton inherits Rectangle {
         border-radius: self.dot / 2;
         background: AppTheme.accent;
         y: parent.height - 5px - self.dot / 2;
-        animate dot { duration: AppTheme.motion-spring; easing: ease-out-back; }
+        animate dot { duration: AppTheme.motion-spring; easing: ease-out; }
     }
 
     touch := TouchArea {
@@ -474,7 +474,7 @@ component TextButton inherits Rectangle {
     width: root.button-width;
     height: 32px;
     property <length> grow: !root.enabled ? 0px : (touch.pressed ? -3px : (touch.has-hover ? 3px : 0px));
-    animate grow { duration: AppTheme.motion-spring; easing: ease-out-back; }
+    animate grow { duration: AppTheme.motion-spring; easing: ease-out; }
 
     Rectangle {
         width: parent.width + root.grow;
@@ -646,16 +646,17 @@ component CrossfadeArt inherits Rectangle {
     background: root.hide-art ? transparent : AppTheme.elevated-bg;
     clip: true;
 
+    // Only the upper picture fades. The lower one stays opaque under it, so halfway through
+    // a change the background doesn't show through both and dim the cover.
+    property <float> b-fade: root.showing-b ? 1 : 0;
+    animate b-fade { duration: AppTheme.motion-slow; easing: ease-in-out; }
+
     Image {
         source: root.art-a;
         width: parent.width;
         height: parent.height;
         image-fit: cover;
-        // Fully opaque when hidden, as anything see-through here gets a texture of its own.
-        property <float> fade: root.showing-b ? 0 : 1;
-        animate fade { duration: AppTheme.motion-slow; easing: ease-in-out; }
-        visible: !root.hide-art && self.fade > 0.01;
-        opacity: self.fade > 0.01 ? self.fade : 1;
+        visible: !root.hide-art && root.b-fade < 0.99;
         transform-scale-x: root.hover-zoom * root.rest-zoom;
         transform-scale-y: root.hover-zoom * root.rest-zoom;
     }
@@ -664,10 +665,9 @@ component CrossfadeArt inherits Rectangle {
         width: parent.width;
         height: parent.height;
         image-fit: cover;
-        property <float> fade: root.showing-b ? 1 : 0;
-        animate fade { duration: AppTheme.motion-slow; easing: ease-in-out; }
-        visible: !root.hide-art && self.fade > 0.01;
-        opacity: self.fade > 0.01 ? self.fade : 1;
+        visible: !root.hide-art && root.b-fade > 0.01;
+        // Fully opaque once it has faded in, as anything see-through gets a texture of its own.
+        opacity: root.b-fade < 0.99 ? root.b-fade : 1;
         transform-scale-x: root.hover-zoom * root.rest-zoom;
         transform-scale-y: root.hover-zoom * root.rest-zoom;
     }
@@ -774,7 +774,7 @@ component GlassSegments inherits Rectangle {
         background: AppTheme.text.with-alpha(0.11);
         border-width: 1px;
         border-color: AppTheme.text.with-alpha(0.06);
-        animate x { duration: AppTheme.motion-slow; easing: ease-out-back; }
+        animate x { duration: AppTheme.motion-slow; easing: ease-out; }
     }
     for option[index] in root.options : Rectangle {
         x: root.inset + index * root.segment-width;
@@ -866,7 +866,7 @@ component SettingToggle inherits SettingRow {
             height: 16px;
             border-radius: 8px;
             background: root.checked ? AppTheme.on-accent : AppTheme.text.with-alpha(0.8);
-            animate x, width { duration: AppTheme.motion-spring; easing: ease-out-back; }
+            animate x, width { duration: AppTheme.motion-spring; easing: ease-out; }
             animate background { duration: AppTheme.motion-spring; easing: ease-out; }
         }
     }
@@ -895,7 +895,7 @@ component AccentSwatch inherits Rectangle {
     width: 28px;
     height: 28px;
     property <length> dot: swatch-touch.pressed ? 14px : (swatch-touch.has-hover ? 20px : 18px);
-    animate dot { duration: AppTheme.motion-spring; easing: ease-out-back; }
+    animate dot { duration: AppTheme.motion-spring; easing: ease-out; }
 
     Rectangle {
         width: 26px;
@@ -2023,7 +2023,7 @@ component DeviceRow inherits Rectangle {
                 transform-scale-x: device-hover.has-hover ? 114% : 100%;
                 transform-scale-y: device-hover.has-hover ? 114% : 100%;
                 animate colorize { duration: AppTheme.motion-duration; easing: ease-out; }
-                animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out; }
             }
         }
 
@@ -3624,7 +3624,7 @@ export component AppWindow inherits Window {
                             width: parent.width + (search-input.has-focus ? 10px : 0px);
                             height: parent.height + (search-input.has-focus ? 2px : 0px);
                             animate border-color { duration: AppTheme.motion-duration; easing: ease-out; }
-                            animate width, height { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                            animate width, height { duration: AppTheme.motion-spring; easing: ease-out; }
                         }
 
                         search-hover := TouchArea {
@@ -3648,7 +3648,7 @@ export component AppWindow inherits Window {
                                     transform-scale-x: search-input.has-focus ? 116% : 100%;
                                     transform-scale-y: search-input.has-focus ? 116% : 100%;
                                     animate colorize { duration: AppTheme.motion-duration; }
-                                    animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                    animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out; }
                                 }
                             }
 
@@ -3717,8 +3717,8 @@ export component AppWindow inherits Window {
                             transform-scale-x: settings-touch.pressed ? 88% : 100%;
                             transform-scale-y: settings-touch.pressed ? 88% : 100%;
                             animate colorize { duration: AppTheme.motion-duration; easing: ease-out; }
-                            animate transform-rotation { duration: AppTheme.reduce-motion ? 0ms : 360ms; easing: ease-out-back; }
-                            animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                            animate transform-rotation { duration: AppTheme.reduce-motion ? 0ms : 360ms; easing: ease-out; }
+                            animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out; }
                         }
                         // A new version is out: the update waits at the top of Settings.
                         if root.update_version != "" : Rectangle {
@@ -3838,7 +3838,7 @@ export component AppWindow inherits Window {
                                     opacity: root.library-words > 0.01 ? root.library-words : 1;
                                     visible: root.library-words > 0.01;
                                     property <length> nudge: home-nav-touch.has-hover ? 2px : 0px;
-                                    animate nudge { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                    animate nudge { duration: AppTheme.motion-spring; easing: ease-out; }
                                     text: "Home";
                                     color: root.show_home ? AppTheme.text : AppTheme.secondary-text;
                                     font-size: 14px;
@@ -3882,7 +3882,7 @@ export component AppWindow inherits Window {
                                     opacity: root.library-words > 0.01 ? root.library-words : 1;
                                     visible: root.library-words > 0.01;
                                     property <length> nudge: history-nav-touch.has-hover ? 2px : 0px;
-                                    animate nudge { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                    animate nudge { duration: AppTheme.motion-spring; easing: ease-out; }
                                     text: "Recently played";
                                     color: parent.open ? AppTheme.text : AppTheme.secondary-text;
                                     font-size: 14px;
@@ -4446,7 +4446,7 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     width: play-pill-label.preferred-width + 52px;
                                     property <length> pill-grow: play-pill.pressed ? -3px : (play-pill.has-hover ? 4px : 0px);
-                                    animate pill-grow { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                    animate pill-grow { duration: AppTheme.motion-spring; easing: ease-out; }
                                     Rectangle {
                                         width: parent.width + parent.pill-grow;
                                         height: 38px + parent.pill-grow;
@@ -4492,7 +4492,7 @@ export component AppWindow inherits Window {
                                             width: parent.width + (filter-input.has-focus ? 8px : 0px);
                                             height: parent.height + (filter-input.has-focus ? 2px : 0px);
                                             animate border-color { duration: AppTheme.motion-duration; easing: ease-out; }
-                                            animate width, height { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                            animate width, height { duration: AppTheme.motion-spring; easing: ease-out; }
                                         }
 
                                         filter-hover := TouchArea {
@@ -4515,7 +4515,7 @@ export component AppWindow inherits Window {
                                                     transform-scale-x: filter-input.has-focus ? 116% : 100%;
                                                     transform-scale-y: filter-input.has-focus ? 116% : 100%;
                                                     animate colorize { duration: AppTheme.motion-duration; }
-                                                    animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                                    animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out; }
                                                 }
                                             }
                                             FocusScope {
@@ -4753,7 +4753,7 @@ export component AppWindow inherits Window {
 
                         property <length> art-size: max(200px, min(min(self.width - 96px, self.height - 200px - 70px), 620px));
                         property <length> shown-size: root.stage_open ? self.art-size : self.art-size * 0.88;
-                        animate shown-size { duration: AppTheme.reduce-motion ? 0ms : 420ms; easing: ease-out-back; }
+                        animate shown-size { duration: AppTheme.reduce-motion ? 0ms : 420ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                         // Eases in and out over 14 seconds while the stage is open and music plays.
                         // Moves about a fifth of a pixel a step, so 15 steps a second looks the same as
                         // a declared animation, which would redraw at the full frame rate for as long
@@ -4991,7 +4991,7 @@ export component AppWindow inherits Window {
                                             image-fit: contain;
                                             transform-scale-x: np-device.has-hover ? 112% : 100%;
                                             transform-scale-y: np-device.has-hover ? 112% : 100%;
-                                            animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out-back; }
+                                            animate transform-scale-x, transform-scale-y { duration: AppTheme.motion-spring; easing: ease-out; }
                                         }
                                     }
                                     Text {

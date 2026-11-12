@@ -10,7 +10,7 @@ use std::{
     sync::Mutex,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -106,6 +106,11 @@ struct PlayerInternal {
 }
 
 static PLAYER_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Spotlight: goes up each time the player moves to a new place in the music, a seek or a
+/// load, just before it says so. Everything handed to the sink after that comes from the new
+/// place, so the sink can tell what to drop without waiting for the event to be read.
+pub static POSITION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 enum PlayerCommand {
     Load {
@@ -2185,6 +2190,7 @@ impl PlayerInternal {
         );
         self.drop_tail(same_song);
 
+        POSITION_GENERATION.fetch_add(1, Ordering::SeqCst);
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
 
         if !self.config.gapless {
@@ -2480,6 +2486,7 @@ impl PlayerInternal {
                     {
                         *stream_position_ms = new_position_ms;
 
+                        POSITION_GENERATION.fetch_add(1, Ordering::SeqCst);
                         self.send_event(PlayerEvent::Seeked {
                             play_request_id,
                             track_id: track_id.clone(),

@@ -521,10 +521,15 @@ impl SpircTask {
                     session_update,
                     match |session_update| self.handle_session_update(session_update)
                 },
-                cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => if let Some(cmd) = cmd {
-                    if let Err(e) = self.handle_command(cmd).await {
+                cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => match cmd {
+                    Some(cmd) => if let Err(e) = self.handle_command(cmd).await {
                         debug!("could not dispatch command: {e}");
-                    }
+                    },
+                    // Spotlight: no one can command this any more. Shutting down beats coming
+                    // straight back here forever, and a device no one controls playing on.
+                    None => if let Err(e) = self.handle_command(SpircCommand::Shutdown).await {
+                        debug!("could not shut down: {e}");
+                    },
                 },
                 event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
                     if let Err(e) = self.handle_player_event(event) {
@@ -654,11 +659,14 @@ impl SpircTask {
             SpircCommand::Shutdown => {
                 trace!("Received SpircCommand::Shutdown");
                 self.handle_pause();
-                self.handle_disconnect().await?;
+                // Spotlight: shuts down even when Spotify can't be told, as when the network is
+                // gone. Before, a failed disconnect left this running with no one to command it.
+                let disconnected = self.handle_disconnect().await;
                 self.shutdown = true;
                 if let Some(rx) = self.commands.as_mut() {
                     rx.close()
                 }
+                disconnected?;
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
                 let device_id = self.session.device_id();
