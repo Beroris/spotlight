@@ -1,8 +1,9 @@
 # Why this crate is here
 
-This is librespot-playback 0.8.0 from crates.io with one addition: crossfade, a song fading
-into the next as it ends. librespot plays one song at a time, and only its player knows where a
-song ends and has the next one ready, so it has to happen here.
+This is librespot-playback 0.8.0 from crates.io with two additions. The main one is crossfade, a
+song fading into the next as it ends. librespot plays one song at a time, and only its player
+knows where a song ends and has the next one ready, so it has to happen here. The other is a
+counter that lets the sink see a seek or a skip as soon as it happens (see below).
 
 ## How it works
 
@@ -32,6 +33,15 @@ song ends and has the next one ready, so it has to happen here.
 - Stopped after the early end but before the next song is loaded, the fading song is the only one
   playing, so the player sends `Stopped` for it, as it would for any song.
 
+## Knowing when a seek or a skip has happened
+
+Spotlight silences what's buffered the moment a seek or skip is pressed, and drops whatever the
+player hands over until the player has moved. It used to learn that from the `Seeked` or
+`PlayRequestIdChanged` event, but the player keeps decoding while the event waits to be read,
+so music from the new place could be dropped too. `POSITION_GENERATION` in `player.rs` goes up
+just before either event is sent, from the player's own thread, so Spotlight's sink can see the
+move with the very next packet.
+
 ## What to carry over to a newer librespot
 
 - `src/crossfade.rs`: all of the above that doesn't touch the player's state, with its tests.
@@ -42,6 +52,7 @@ song ends and has the next one ready, so it has to happen here.
   - In `poll`, packets come through the `tail` while there is one for the song playing.
   - `normalise`, moved out of `handle_packet` so both songs can be normalised, and the mixing in `handle_packet`.
   - `drop_tail`, and the `fading` and `tail` lines in `handle_player_stop`, `handle_play`, `handle_pause`, `handle_command_load` and `handle_command_seek`.
+  - `POSITION_GENERATION`, and the two lines that raise it, before `PlayRequestIdChanged` in `handle_command_load` and before `Seeked` in `handle_command_seek`.
   - Everything is marked with a `Spotlight:` comment.
 
 The dynamic normalisation method keeps a limiter's state from sample to sample. During a fade

@@ -92,6 +92,9 @@ struct AppState {
     /// The version of each library playlist its cached songs came from, so a playlist
     /// changed elsewhere is fetched again rather than shown as it was.
     playlist_cache_versions: HashMap<String, String>,
+    /// When the songs of a Home card that isn't in the library were fetched. Mixes change
+    /// under the same link, so they're fetched again once Home is.
+    home_songs_at: HashMap<String, Instant>,
     selected_playlist_uri: String,
     active_queue_playlist_uri: String,
     current_track_uri: Option<String>,
@@ -428,6 +431,7 @@ fn main() -> Result<()> {
         track_uris: cached_liked_uris.clone(),
         playlist_track_cache: HashMap::from([(LIKED_SONGS_PLAYLIST_URI.to_string(), cached_liked_tracks)]),
         playlist_cache_versions: HashMap::new(),
+        home_songs_at: HashMap::new(),
         selected_playlist_uri: LIKED_SONGS_PLAYLIST_URI.to_string(),
         active_queue_playlist_uri: LIKED_SONGS_PLAYLIST_URI.to_string(),
         current_track_uri: None,
@@ -1201,8 +1205,9 @@ fn apply_theme_to_ui(ui: &AppWindow) {
     theme.set_disabled_border(ink(20));
     theme.set_text(if light { rgb(18, 18, 20) } else { rgb(246, 246, 248) });
     theme.set_secondary_text(ink(if light { 190 } else { 200 }));
-    theme.set_subtle_text(ink(if light { 150 } else { 158 }));
-    theme.set_muted_text(ink(if light { 115 } else { 118 }));
+    // The faintest text still reads at about 4.5:1 on the plain background.
+    theme.set_subtle_text(ink(if light { 160 } else { 158 }));
+    theme.set_muted_text(ink(if light { 140 } else { 128 }));
     theme.set_track_bg(ink(if light { 40 } else { 56 }));
     theme.set_control_fg(if light { rgb(18, 18, 20) } else { rgb(246, 246, 248) });
     theme.set_focus_ring(ink(if light { 70 } else { 60 }));
@@ -1220,24 +1225,39 @@ fn apply_theme_to_ui(ui: &AppWindow) {
     theme.set_accent_border(Color::from_argb_u8(110, accent.red(), accent.green(), accent.blue()));
 }
 
+/// The settings that each need work done again when they change.
+#[derive(PartialEq)]
+struct SettingsInEffect {
+    /// How the sidebar's rows look.
+    sidebar: bool,
+    theme: (String, String, bool, bool),
+    shortcuts: (bool, bool, [String; 5]),
+}
+
+impl SettingsInEffect {
+    fn of(config: &AppConfig) -> Self {
+        Self {
+            sidebar: config.artwork_enabled,
+            theme: (config.theme_mode.clone(), config.accent_color.clone(), config.reduce_animations, config.album_colors),
+            shortcuts: (config.global_hotkeys, config.media_keys_enabled, hotkey_bindings(config)),
+        }
+    }
+}
+
+/// Whether Windows has apps in light mode. Read straight from the registry, which takes
+/// microseconds, where starting reg.exe for it held up the window for tens of milliseconds.
 fn system_prefers_light() -> bool {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        return std::process::Command::new("reg.exe")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "query",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                "/v",
-                "AppsUseLightTheme",
-            ])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("0x1"))
-            .unwrap_or(false);
+        use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+        let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0".encode_utf16().collect();
+        let name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+        let mut value: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut value as *mut u32 as *mut _, &mut size)
+        };
+        status == 0 && value == 1
     }
     #[cfg(not(target_os = "windows"))]
     false
@@ -1272,13 +1292,14 @@ fn bind_callbacks(
         let spotify_api = spotify_api.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let audio_settings_changed = {
+                let (audio_settings_changed, settings_before) = {
                     let guard = state.lock().unwrap();
-                    guard.playback_engine.is_some()
+                    let audio_settings_changed = guard.playback_engine.is_some()
                         && (guard.config.audio_quality != ui.get_audio_quality().as_str()
-                            || guard.config.normalize_volume != ui.get_normalize_volume())
+                            || guard.config.normalize_volume != ui.get_normalize_volume());
+                    (audio_settings_changed, SettingsInEffect::of(&guard.config))
                 };
-                let (playlists, liked_count, artwork_enabled, selected_playlist_uri) = {
+                let (playlists, liked_count, artwork_enabled, selected_playlist_uri, settings_now) = {
                     let mut guard = state.lock().unwrap();
                     guard.config.client_id = ui.get_client_id().to_string();
                     guard.config.redirect_uri = ui.get_redirect_uri().to_string();
@@ -1319,11 +1340,19 @@ fn bind_callbacks(
                     guard.config.check_for_updates = ui.get_check_for_updates();
                     UPDATE_AUTO_CHECK.store(guard.config.check_for_updates, Ordering::Relaxed);
                     config::save_config_background(&guard.config);
+                    let settings_now = SettingsInEffect::of(&guard.config);
+                    // The sidebar's rows are made again only when how they look changed.
+                    let playlists = if settings_now.sidebar != settings_before.sidebar {
+                        guard.config.library_snapshot.playlists.clone()
+                    } else {
+                        Vec::new()
+                    };
                     (
-                        guard.config.library_snapshot.playlists.clone(),
+                        playlists,
                         liked_count(&guard.config.library_snapshot),
                         guard.config.artwork_enabled,
                         guard.selected_playlist_uri.clone(),
+                        settings_now,
                     )
                 };
                 if audio_settings_changed {
@@ -1350,15 +1379,21 @@ fn bind_callbacks(
                         });
                     });
                 }
-                apply_playlist_rows(
-                    &ui,
-                    &playlists,
-                    liked_count,
-                    artwork_enabled,
-                    Some(selected_playlist_uri.as_str()),
-                );
-                apply_theme_to_ui(&ui);
-                {
+                // Each toggle saves everything, so only what it changed is done again: making the
+                // sidebar's rows, the theme and the shortcuts each take a moment.
+                if settings_now.sidebar != settings_before.sidebar {
+                    apply_playlist_rows(
+                        &ui,
+                        &playlists,
+                        liked_count,
+                        artwork_enabled,
+                        Some(selected_playlist_uri.as_str()),
+                    );
+                }
+                if settings_now.theme != settings_before.theme {
+                    apply_theme_to_ui(&ui);
+                }
+                if settings_now.shortcuts != settings_before.shortcuts {
                     let mut hotkeys = hotkeys_guard.lock().unwrap();
                     // Release the old registrations before registering again,
                     // otherwise the same keys report "already registered".
@@ -1593,35 +1628,39 @@ fn bind_callbacks(
     ui.on_reset_app_data({
         let state = Arc::clone(&state);
         move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                {
-                    let mut guard = state.lock().unwrap();
-                    guard.session = guard.session.wrapping_add(1);
-                    guard.track_view_generation = guard.track_view_generation.wrapping_add(1);
-                    guard.token = None;
-                    guard.local_playback_token = None;
-                    guard.config.token = None;
-                    guard.config.local_playback_token = None;
-                    guard.config.account_id = None;
-                    guard.account_asked_at = None;
-                    guard.play_watch.stopped();
-                    guard.config.library_snapshot = Default::default();
-                    guard.config.startup_snapshot = Default::default();
-                    config::save_config_background(&guard.config);
-                }
-                if let Ok(dir) = config::config_dir() {
-                    let art_dir = dir.join("album-art");
-                    let _ = std::thread::Builder::new()
-                        .name("spotlight-cache-reset".to_string())
-                        .spawn(move || {
-                            let _ = std::fs::remove_dir_all(art_dir);
-                        });
-                }
-                ALBUM_ART_IMAGES.with(|cached| cached.borrow_mut().clear());
-                PLAYLIST_COVERS.with(|cached| cached.borrow_mut().clear());
-                ui.set_status_log("Ready.".into());
-                append_log(&ui, "Reset app data. Restart Spotlight to fully reload clean state.");
+            let Some(ui) = ui_weak.upgrade() else { return };
+            // Signing out stops the player and lets go of everything the account had here.
+            ui.invoke_sign_out();
+            {
+                let mut guard = state.lock().unwrap();
+                guard.config = config::new_config();
+                config::save_config_background(&guard.config);
             }
+            ALBUM_ART_IMAGES.with(|cached| cached.borrow_mut().clear());
+            PLAYLIST_COVERS.with(|cached| cached.borrow_mut().clear());
+            if let Ok(dir) = config::config_dir() {
+                let _ = std::fs::remove_dir_all(dir.join("album-art"));
+                // Recently played, for every account that signed in here.
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("history") && name.ends_with(".json") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            // Everything else, from the theme to the window and the shortcuts, starts again from
+            // the defaults too, as on a first run. Opening again is the sure way to get that.
+            if let Ok(exe) = std::env::current_exe() {
+                let reopened = std::process::Command::new(exe)
+                    .arg(updates::AFTER_UPDATE_ARG)
+                    .arg(std::process::id().to_string())
+                    .spawn();
+                if reopened.is_ok() {
+                    config::exit_after_saving();
+                }
+            }
+            ui.set_status_log("Ready.".into());
+            append_log(&ui, "Reset app data. Open Spotlight again to start afresh.");
         }
     });
 
@@ -1660,16 +1699,54 @@ fn bind_callbacks(
                 }
                 match auth::login(&config_snapshot).await {
                     Ok(token) => {
+                        // Signed in to another account this time: the one before signs out
+                        // first, so its player, library and Next up don't carry over to this one.
+                        // Only an account known to be the same one keeps them. If either can't
+                        // be told, it signs out too: signing the player in again is better than
+                        // playing on someone else's.
+                        let now_signed_in = spotify_api.account_id(&token).await.ok();
+                        let (signed_in_before, other_account) = {
+                            let guard = state.lock().unwrap();
+                            let signed_in_before = guard.token.is_some() || guard.local_playback_token.is_some();
+                            let same_account = matches!(
+                                (&guard.config.account_id, &now_signed_in),
+                                (Some(before), Some(now)) if before == now
+                            );
+                            (signed_in_before, signed_in_before && !same_account)
+                        };
+                        // Spotify asking to wait is no sign of another account, and signing out
+                        // over it would lose the player's sign-in and Next up. Nothing changes.
+                        if signed_in_before && now_signed_in.is_none() && spotify::rate_limit_wait().is_some() {
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_weak.upgrade() {
+                                    ui.set_connect_stage("done".into());
+                                    append_log(&ui, "Reconnect failed: Spotify asked to wait. Nothing changed; try again in a few minutes.");
+                                }
+                            });
+                            return;
+                        }
+                        if other_account {
+                            let (signed_out_tx, signed_out) = tokio::sync::oneshot::channel();
+                            let ui_weak = ui_weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_weak.upgrade() {
+                                    ui.invoke_sign_out();
+                                }
+                                let _ = signed_out_tx.send(());
+                            });
+                            let _ = signed_out.await;
+                        }
                         let player_signed_in = {
                             let mut guard = state.lock().unwrap();
                             // It may be another account than before, so what's still being asked
-                            // for the one before, which account it is included, is out of date,
-                            // and a song waiting to count doesn't count for this one.
+                            // for the one before is out of date, and a song waiting to count
+                            // doesn't count for this one.
                             guard.session = guard.session.wrapping_add(1);
                             guard.play_watch.stopped();
                             guard.token = Some(token.clone());
                             guard.config.token = Some(token.clone());
-                            guard.config.account_id = None;
+                            // Known now, so a Reconnect straight after can still tell.
+                            guard.config.account_id = now_signed_in.clone();
                             guard.account_asked_at = None;
                             config::save_config_background(&guard.config);
                             guard.local_playback_token.is_some()
@@ -2418,17 +2495,28 @@ fn bind_callbacks(
                     let ui_weak = ui_weak.clone();
                     let state = Arc::clone(&state);
                     let spotify_api = spotify_api.clone();
+                    let session = state.lock().unwrap().session;
                     runtime.spawn(async move {
                         let result = async {
                             let token = current_token(&state).await?;
                             spotify_api.set_in_library(&token, &song.uri, liked).await
                         }
                         .await;
-                        if result.is_ok() {
-                            remember_liked(&state, &song.uri, liked.then_some(&song));
+                        {
+                            // As with the heart: only for the account that asked.
+                            let mut guard = state.lock().unwrap();
+                            if ensure_same_session(&guard, session).is_err() {
+                                return;
+                            }
+                            if result.is_ok() {
+                                remember_liked(&mut guard, &song.uri, liked.then_some(&song));
+                            }
                         }
                         let _ = slint::invoke_from_event_loop(move || {
                             let Some(ui) = ui_weak.upgrade() else { return };
+                            if state.lock().unwrap().session != session {
+                                return;
+                            }
                             match result {
                                 Ok(()) => {
                                     if ui.get_current_track_uri() == song.uri.as_str() {
@@ -2614,6 +2702,7 @@ fn bind_callbacks(
             let Some((chosen, _)) = chosen else { return };
             let library_index = library_index_of(&chosen, &state);
             let press = LATEST_PRESS.fetch_add(1, Ordering::SeqCst) + 1;
+            let session = state.lock().unwrap().session;
             let ui_weak = ui_weak.clone();
             let player_runtime = Arc::clone(&runtime);
             let state = Arc::clone(&state);
@@ -2625,7 +2714,8 @@ fn bind_callbacks(
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else { return };
-                    if LATEST_PRESS.load(Ordering::SeqCst) != press {
+                    // Pressed again since, or by an account that has since signed out.
+                    if LATEST_PRESS.load(Ordering::SeqCst) != press || state.lock().unwrap().session != session {
                         return;
                     }
                     match (loaded, library_index) {
@@ -2694,6 +2784,7 @@ fn bind_callbacks(
             let ui_weak = ui_weak.clone();
             let state = Arc::clone(&state);
             let spotify_api = spotify_api.clone();
+            let session = state.lock().unwrap().session;
             runtime.spawn(async move {
                 let result = async {
                     let token = current_token(&state).await?;
@@ -2708,11 +2799,31 @@ fn bind_callbacks(
                     })
                 }
                 .await;
-                if let Ok(track) = &result {
-                    remember_liked(&state, &uri, track.as_ref());
+                {
+                    // Signed out or into another account meanwhile: this was for the one before.
+                    // Checked in the same hold of the lock as the change, so a sign-out can't
+                    // come in between.
+                    let mut guard = state.lock().unwrap();
+                    if ensure_same_session(&guard, session).is_err() {
+                        return;
+                    }
+                    match (&result, liked) {
+                        (Ok(track), false) | (Ok(track @ Some(_)), true) => remember_liked(&mut guard, &uri, track.as_ref()),
+                        // Liked, but the song's details didn't come. The song playing has them,
+                        // if it's this one. If not, Liked Songs is fetched afresh when it next
+                        // opens, rather than taking this as an unlike.
+                        (Ok(None), true) => match guard.now_playing.clone().filter(|song| song.uri == uri) {
+                            Some(song) => remember_liked(&mut guard, &uri, Some(&song)),
+                            None => forget_liked_songs_list(&mut guard),
+                        },
+                        (Err(_), _) => {}
+                    }
                 }
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else { return };
+                    if state.lock().unwrap().session != session {
+                        return;
+                    }
                     match result {
                         Ok(_) => {
                             show_toast(&ui, if liked { "Added to Liked Songs" } else { "Removed from Liked Songs" }, false);
@@ -3411,8 +3522,7 @@ fn bind_playback_callbacks(
 
 /// Keeps Liked Songs and the saved library in step with a song just liked (`Some`) or
 /// unliked (`None`), so menus know without asking Spotify.
-fn remember_liked(state: &Mutex<AppState>, uri: &str, song: Option<&FullTrack>) {
-    let mut guard = state.lock().unwrap();
+fn remember_liked(guard: &mut AppState, uri: &str, song: Option<&FullTrack>) {
     let mut was_loaded = false;
     if let Some(songs) = guard.playlist_track_cache.get_mut(LIKED_SONGS_PLAYLIST_URI) {
         was_loaded = songs.iter().any(|known| known.uri == uri);
@@ -3456,6 +3566,13 @@ fn remember_liked(state: &Mutex<AppState>, uri: &str, song: Option<&FullTrack>) 
             image_url: song.album.images.last().map(|image| image.url.clone()),
         });
     }
+}
+
+/// Drops the songs of Liked Songs held here, so they're fetched afresh when it next opens.
+fn forget_liked_songs_list(guard: &mut AppState) {
+    guard.playlist_track_cache.remove(LIKED_SONGS_PLAYLIST_URI);
+    guard.loaded.remove(LIKED_SONGS_PLAYLIST_URI);
+    guard.load_stamp = guard.load_stamp.wrapping_add(1);
 }
 
 /// A playlist just made, at the top of the library.
@@ -3813,7 +3930,25 @@ async fn home_card_songs(
     state: &Arc<Mutex<AppState>>,
     spotify_api: &spotify::SpotifyApi,
 ) -> Result<Vec<FullTrack>> {
-    let known = state.lock().unwrap().playlist_track_cache.get(&card.uri).cloned();
+    let (known, session) = {
+        let guard = state.lock().unwrap();
+        // A playlist in the library is fresh while it hasn't been edited since, as when it's
+        // opened from the sidebar. Anything else, such as a mix, is only as fresh as when it
+        // was fetched, which Home's refresh forgets.
+        let fresh = match guard.home_songs_at.get(&card.uri) {
+            Some(fetched) => fetched.elapsed() < HOME_MAX_AGE,
+            None => guard
+                .config
+                .library_snapshot
+                .playlists
+                .iter()
+                .find(|playlist| playlist.uri == card.uri)
+                .is_some_and(|playlist| {
+                    playlist.snapshot_id.is_none() || guard.playlist_cache_versions.get(&card.uri) == playlist.snapshot_id.as_ref()
+                }),
+        };
+        (fresh.then(|| guard.playlist_track_cache.get(&card.uri).cloned()).flatten(), guard.session)
+    };
     if let Some(songs) = known.filter(|songs| !songs.is_empty()) {
         return Ok(songs);
     }
@@ -3829,7 +3964,20 @@ async fn home_card_songs(
     if songs.is_empty() {
         return Err(anyhow!("no songs to show"));
     }
-    state.lock().unwrap().playlist_track_cache.insert(card.uri.clone(), songs.clone());
+    let mut guard = state.lock().unwrap();
+    // Signed out or into another account meanwhile: these were for the one before.
+    ensure_same_session(&guard, session)?;
+    let in_library = guard.config.library_snapshot.playlists.iter().find(|playlist| playlist.uri == card.uri).map(|playlist| playlist.snapshot_id.clone());
+    match in_library {
+        Some(Some(version)) => {
+            guard.playlist_cache_versions.insert(card.uri.clone(), version);
+        }
+        Some(None) => {}
+        None => {
+            guard.home_songs_at.insert(card.uri.clone(), Instant::now());
+        }
+    }
+    guard.playlist_track_cache.insert(card.uri.clone(), songs.clone());
     Ok(songs)
 }
 
@@ -3864,6 +4012,8 @@ struct HomeView {
     fetched_at: Option<Instant>,
     loading: bool,
     generation: u64,
+    /// Goes up when the account goes, so a load for the account before is ignored.
+    account: u64,
 }
 
 thread_local! {
@@ -3932,15 +4082,22 @@ fn forget_home(ui: &AppWindow) {
         view.generation = view.generation.wrapping_add(1);
         view.sections.clear();
         view.model = None;
+        view.account = view.account.wrapping_add(1);
         view.fetched_at = None;
+        // A load still under way was for the account before, and is ignored when it ends.
+        view.loading = false;
     });
     ui.set_show_home(false);
+    ui.set_home_loading(false);
     ui.set_home_error("".into());
     ui.set_home_sections(ModelRc::default());
 }
 
 fn refresh_home(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState>>, spotify_api: spotify::SpotifyApi) {
-    let already = HOME_VIEW.with(|view| std::mem::replace(&mut view.borrow_mut().loading, true));
+    let (already, account) = HOME_VIEW.with(|view| {
+        let mut view = view.borrow_mut();
+        (std::mem::replace(&mut view.loading, true), view.account)
+    });
     let Some(handle) = RUNTIME_HANDLE.get().filter(|_| !already) else {
         return;
     };
@@ -3972,11 +4129,26 @@ fn refresh_home(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState>>, sp
         }
         .await;
         let _ = slint::invoke_from_event_loop(move || {
-            HOME_VIEW.with(|view| view.borrow_mut().loading = false);
+            let current = HOME_VIEW.with(|view| {
+                let mut view = view.borrow_mut();
+                let current = view.account == account;
+                if current {
+                    view.loading = false;
+                }
+                current
+            });
+            // Signed out meanwhile: this Home was for the account before.
+            if !current {
+                return;
+            }
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.set_home_loading(false);
             match result {
-                Ok(sections) if !sections.is_empty() => show_home_sections(&ui, sections),
+                Ok(sections) if !sections.is_empty() => {
+                    // Its mixes may have new songs under the same links now.
+                    state.lock().unwrap().home_songs_at.clear();
+                    show_home_sections(&ui, sections);
+                }
                 Ok(_) => ui.set_home_error("Spotify sent an empty Home page.".into()),
                 Err(error) => {
                     append_log(&ui, &format!("Home failed to load: {error}"));
@@ -4564,8 +4736,34 @@ fn ambient_color_from_image(image: &slint::Image, light: bool) -> Option<Color> 
     let (r, g, b) = ((r / n) as f32 / 255.0, (g / n) as f32 / 255.0, (b / n) as f32 / 255.0);
     let (h, s, _) = rgb_to_hsl(r, g, b);
     let (s, l) = if light { (s.min(0.55), 0.86) } else { (s.min(0.48), 0.22) };
-    let (r, g, b) = hsl_to_rgb(h, s, l);
-    Some(Color::from_rgb_u8((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
+    let (r, g, b) = even_brightness(hsl_to_rgb(h, s, l), light);
+    Some(Color::from_rgb_u8((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8))
+}
+
+/// HSL lightness makes a yellow or green tint several times brighter than a blue one, enough
+/// that faint text on it gets hard to read. This brings the tint to an even brightness: no
+/// brighter than a blue one in the dark theme, and no darker than a pale one in the light.
+fn even_brightness((r, g, b): (f32, f32, f32), light: bool) -> (f32, f32, f32) {
+    let to_linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let to_srgb = |c: f32| if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    let (lr, lg, lb) = (to_linear(r), to_linear(g), to_linear(b));
+    let luminance = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+    let (lr, lg, lb) = if light {
+        const LEAST: f32 = 0.72;
+        if luminance >= LEAST {
+            return (r, g, b);
+        }
+        let toward_white = (LEAST - luminance) / (1.0 - luminance);
+        (lr + (1.0 - lr) * toward_white, lg + (1.0 - lg) * toward_white, lb + (1.0 - lb) * toward_white)
+    } else {
+        const MOST: f32 = 0.04;
+        if luminance <= MOST {
+            return (r, g, b);
+        }
+        let scale = MOST / luminance;
+        (lr * scale, lg * scale, lb * scale)
+    };
+    (to_srgb(lr).clamp(0.0, 1.0), to_srgb(lg).clamp(0.0, 1.0), to_srgb(lb).clamp(0.0, 1.0))
 }
 
 fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -6933,6 +7131,16 @@ async fn refresh_everything(
     };
     let token = current_token(&state).await?;
     learn_account(&state, &spotify_api, &token, session).await;
+    // Spotify may have just asked to wait, maybe over the account question above. Asking
+    // sooner only makes the wait longer, so the rest waits for the next regular check.
+    if spotify::rate_limit_wait().is_some() {
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_connection_status("Connected - refresh delayed".into());
+            }
+        });
+        return Err(anyhow!("waiting, as Spotify asked"));
+    }
 
     let devices = match spotify_api.devices(&token).await {
         Ok(devices) => devices,
@@ -7008,6 +7216,10 @@ async fn refresh_everything(
     let device_names = ordered_devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
     {
         let mut guard = state.lock().unwrap();
+        // These are the devices of the account before, if it signed out meanwhile.
+        if ensure_same_session(&guard, session).is_err() {
+            return Ok(false);
+        }
         guard.local_device_id = local_device_id.clone();
         guard.active_device_id = active_device_id;
         guard.device_id = selected_device_id;
@@ -7077,7 +7289,12 @@ async fn refresh_everything(
                     None
                 }
             };
-            let liked = match spotify_api.liked_songs(&token, 0, liked_wanted).await {
+            // Spotify just asked to wait, so asking it for more now would only stretch the wait.
+            let liked = match spotify::rate_limit_wait() {
+                Some(_) => Err(anyhow!("waiting, as Spotify asked")),
+                None => spotify_api.liked_songs(&token, 0, liked_wanted).await,
+            };
+            let liked = match liked {
                 Ok(part) => {
                     liked_loaded = Some(Loaded { total: part.total, wanted: liked_wanted, more_from: part.more_from, stamp: 0 });
                     Some(part.items)
@@ -7170,14 +7387,27 @@ async fn refresh_everything(
     // manual refresh cannot starve the now-playing poller.
     let refresh_lock = state.lock().unwrap().playback_refresh_lock.clone();
     let refresh_guard = refresh_lock.lock().await;
-    let (playback, playback_refresh_error) = match spotify_api.current_playback(&token).await {
+    // Spotify asked to wait just now, maybe for the library above. The regular check asks
+    // again once it may.
+    let playback = match spotify::rate_limit_wait() {
+        Some(_) => Err(anyhow!("waiting, as Spotify asked")),
+        None => spotify_api.current_playback(&token).await,
+    };
+    let (playback, playback_refresh_error) = match playback {
         Ok(playback) => (playback, None),
         Err(error) => (None, Some(error.to_string())),
     };
     if playback_refresh_error.is_none() && reserve_spotify_queue_refresh(&state) {
-        if let Ok(queue) = spotify_api.queue(&token).await {
-            update_spotify_queue(&state, session, playback.as_ref(), queue);
-        }
+        // On its own, as in the quick refresh, so a slow queue doesn't hold up what's playing
+        // or the next refresh, which waits for this one's lock.
+        let (queue_state, queue_ui, queue_api) = (Arc::clone(&state), ui_weak.clone(), spotify_api.clone());
+        let (queue_token, queue_playback) = (token.clone(), playback.clone());
+        tokio::spawn(async move {
+            if let Ok(queue) = queue_api.queue(&queue_token).await {
+                update_spotify_queue(&queue_state, session, queue_playback.as_ref(), queue);
+                repaint_queue_on_event_loop(queue_ui, queue_state);
+            }
+        });
     }
     if ensure_same_session(&state.lock().unwrap(), session).is_err() {
         return Ok(false);
@@ -7611,18 +7841,34 @@ fn load_full_size_art(path: &std::path::Path) -> slint::Image {
 
 /// Spotify's playlist covers are usually 640px and every one is on screen at once,
 /// so decoding them at the size they're drawn is what keeps the sidebar small.
+///
+/// Shrinking a 640px cover takes about 7 ms, which for 30 playlists held up the first frame by
+/// a fifth of a second. So the small copy is saved beside the cover and read back next time,
+/// which takes about half a millisecond.
 fn load_playlist_cover(path: &std::path::PathBuf, scale_factor: f32) -> slint::Image {
     PLAYLIST_COVERS.with(|cached| {
         if let Some(image) = cached.borrow().get(path).cloned() {
             return image;
         }
         let size = (PLAYLIST_COVER_PX * scale_factor).round() as u32;
-        let image = std::fs::read(path)
+        let small_copy = path.with_file_name(format!(
+            "{}.sidebar-{size}.png",
+            path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default()
+        ));
+        let saved = std::fs::read(&small_copy)
             .ok()
-            .and_then(|bytes| image::load_from_memory(&bytes).ok())
-            .map(|decoded| {
-                // Same crop as the `image-fit: cover` these are drawn with.
-                let rgba = decoded.resize_to_fill(size, size, image::imageops::FilterType::Triangle).into_rgba8();
+            .and_then(|bytes| image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok())
+            .map(|decoded| decoded.into_rgba8())
+            .filter(|rgba| rgba.width() == size && rgba.height() == size);
+        let rgba = saved.or_else(|| {
+            let decoded = image::load_from_memory(&std::fs::read(path).ok()?).ok()?;
+            // Same crop as the `image-fit: cover` these are drawn with.
+            let rgba = decoded.resize_to_fill(size, size, image::imageops::FilterType::Triangle).into_rgba8();
+            save_small_cover(small_copy, rgba.clone());
+            Some(rgba)
+        });
+        let image = rgba
+            .map(|rgba| {
                 let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(rgba.as_raw(), rgba.width(), rgba.height());
                 slint::Image::from_rgba8(buffer)
             })
@@ -7630,6 +7876,19 @@ fn load_playlist_cover(path: &std::path::PathBuf, scale_factor: f32) -> slint::I
         cached.borrow_mut().insert(path.clone(), image.clone());
         image
     })
+}
+
+/// Written off the UI thread, under another name first so a half-written copy is never read.
+/// It lives with the covers, so clearing or trimming them takes it too.
+fn save_small_cover(path: PathBuf, rgba: image::RgbaImage) {
+    let Some(handle) = RUNTIME_HANDLE.get() else { return };
+    handle.spawn_blocking(move || {
+        let part = path.with_extension("png.part");
+        let saved = rgba.save_with_format(&part, image::ImageFormat::Png).is_ok() && std::fs::rename(&part, &path).is_ok();
+        if !saved {
+            let _ = std::fs::remove_file(&part);
+        }
+    });
 }
 
 /// The cached file's extension comes from its URL, which can be wrong (Spotify
@@ -8267,7 +8526,7 @@ async fn run_local_player_event_loop(
         }
         // From here on, what the player decodes is from the new place in the music.
         if matches!(event, PlayerEvent::PlayRequestIdChanged { .. } | PlayerEvent::Seeked { .. }) {
-            audio_output::end_skip();
+            audio_output::end_skip_once_the_player_has_moved();
         }
         match event {
             PlayerEvent::TrackChanged { audio_item } => {
@@ -8343,16 +8602,21 @@ async fn run_local_player_event_loop(
             PlayerEvent::Playing { track_id, position_ms, .. } => {
                 let track_uri = track_id.to_string();
                 watch_play(&state, &track_uri, position_ms);
-                apply_local_player_position_event(&ui_weak, &state, track_uri, position_ms as i32, true, engine_generation);
+                apply_local_player_position_event(&ui_weak, &state, track_uri, position_ms as i32, Some(true), engine_generation);
             }
+            // Only sent while the song plays.
             PlayerEvent::PositionCorrection { track_id, position_ms, .. }
-            | PlayerEvent::PositionChanged { track_id, position_ms, .. }
-            | PlayerEvent::Seeked { track_id, position_ms, .. } => {
-                apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, true, engine_generation);
+            | PlayerEvent::PositionChanged { track_id, position_ms, .. } => {
+                apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, Some(true), engine_generation);
+            }
+            // Also sent for a seek while paused, which stays paused.
+            PlayerEvent::Seeked { track_id, position_ms, .. } => {
+                apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, None, engine_generation);
             }
             PlayerEvent::Paused { track_id, position_ms, .. } => {
                 state.lock().unwrap().play_watch.stopped();
-                apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, false, engine_generation);
+                apply_local_player_position_event(&ui_weak, &state, track_id.to_string(), position_ms as i32, Some(false), engine_generation);
+                note_audio_dropouts(&ui_weak);
             }
             PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } | PlayerEvent::Unavailable { .. } => {
                 let stopped = matches!(event, PlayerEvent::Stopped { .. });
@@ -8365,6 +8629,7 @@ async fn run_local_player_event_loop(
                     // Maybe another device took over, which is then shown at once.
                     begin_fast_playback_refresh(&state, Duration::from_secs(4));
                 }
+                note_audio_dropouts(&ui_weak);
             }
             PlayerEvent::SessionDisconnected { .. } => begin_fast_playback_refresh(&state, Duration::from_secs(4)),
             PlayerEvent::VolumeChanged { volume } => {
@@ -8423,15 +8688,34 @@ fn watch_play(state: &Arc<Mutex<AppState>>, track_uri: &str, position_ms: u32) {
     });
 }
 
+/// Notes in the log when the audio ran out since the last note, which is heard as a click or a
+/// gap. Each time, Windows is kept a little more ahead, so it shouldn't happen again soon.
+fn note_audio_dropouts(ui_weak: &slint::Weak<AppWindow>) {
+    static NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let total = wasapi::UNDERRUNS.load(std::sync::atomic::Ordering::Relaxed);
+    let new = total.saturating_sub(NOTED.swap(total, std::sync::atomic::Ordering::Relaxed));
+    if new == 0 {
+        return;
+    }
+    let ui_weak = ui_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            let times = if new == 1 { "once".to_string() } else { format!("{new} times") };
+            write_log(&ui, &format!("The audio ran out {times} while playing, so Spotlight now keeps a little more ready."));
+        }
+    });
+}
+
 fn apply_local_player_position_event(
     ui_weak: &slint::Weak<AppWindow>,
     state: &Arc<Mutex<AppState>>,
     track_uri: String,
     position_ms: i32,
-    is_playing: bool,
+    // `None` leaves playing or paused as it was.
+    is_playing: Option<bool>,
     engine_generation: u64,
 ) {
-    {
+    let is_playing = {
         let mut guard = state.lock().unwrap();
         if guard.playback_engine_generation != engine_generation {
             return;
@@ -8442,6 +8726,7 @@ fn apply_local_player_position_event(
         if !matches_current {
             return;
         }
+        let is_playing = is_playing.unwrap_or(guard.local_playing);
         guard.local_playing = is_playing;
         crash_restart::note_playing_here(is_playing);
         if is_playing && guard.local_device_id.is_some() {
@@ -8450,7 +8735,8 @@ fn apply_local_player_position_event(
         }
         let duration = guard.playback_clock.duration_ms;
         guard.playback_clock.sync(position_ms, duration, is_playing);
-    }
+        is_playing
+    };
     let ui_weak = ui_weak.clone();
     let state = Arc::clone(state);
     let _ = slint::invoke_from_event_loop(move || {
@@ -9219,6 +9505,26 @@ mod tests {
         assert_ne!(client_id_problem("0123456789abcdef"), "", "too short");
         assert_ne!(client_id_problem("http://127.0.0.1:5543/callback/"), "", "the redirect URI by mistake");
         assert_ne!(client_id_problem("0123456789abcdef0123456789abcdeg"), "", "not hex");
+    }
+
+    #[test]
+    fn album_tints_come_out_evenly_bright() {
+        let luminance = |(r, g, b): (f32, f32, f32)| {
+            let linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        };
+        let yellow = hsl_to_rgb(1.0 / 6.0, 0.48, 0.22);
+        let blue = hsl_to_rgb(2.0 / 3.0, 0.48, 0.22);
+        assert!(luminance(yellow) > 0.07, "the problem this is for");
+        assert!(luminance(even_brightness(yellow, false)) <= 0.0401);
+        assert_eq!(even_brightness(blue, false), blue, "already dark enough");
+        let pale_blue = hsl_to_rgb(2.0 / 3.0, 0.55, 0.86);
+        assert!(luminance(even_brightness(pale_blue, true)) >= 0.719);
+        let pale_yellow = hsl_to_rgb(1.0 / 6.0, 0.55, 0.86);
+        assert_eq!(even_brightness(pale_yellow, true), pale_yellow, "already light enough");
+        // The hue stays: yellow is still more red and green than blue.
+        let (r, g, b) = even_brightness(yellow, false);
+        assert!(r > b * 1.5 && g > b * 1.5);
     }
 
     #[test]

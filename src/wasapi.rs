@@ -46,6 +46,22 @@ const STALL_TIMEOUT_MS: u32 = 1_000;
 
 /// Times the queue ran out, which is what makes the margin grow.
 pub static UNDERRUNS: AtomicU64 = AtomicU64::new(0);
+/// The margin each device grew to, by its id, so a new stream on it starts there instead of
+/// running out again to find it. Streams open after a device change, a rest or a new player.
+static GROWN_MARGINS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+
+fn remembered_margin(device_id: &str) -> Option<u32> {
+    let margins = GROWN_MARGINS.lock().unwrap_or_else(PoisonError::into_inner);
+    margins.iter().find(|(id, _)| id == device_id).map(|(_, margin)| *margin)
+}
+
+fn remember_margin(device_id: &str, margin: u32) {
+    let mut margins = GROWN_MARGINS.lock().unwrap_or_else(PoisonError::into_inner);
+    match margins.iter_mut().find(|(id, _)| id == device_id) {
+        Some((_, known)) => *known = (*known).max(margin),
+        None => margins.push((device_id.to_string(), margin)),
+    }
+}
 
 /// What a stream plays.
 pub trait Feed {
@@ -259,6 +275,7 @@ impl Drop for Stream {
 struct Connection {
     client: IAudioClient,
     render: IAudioRenderClient,
+    device_id: String,
     rate: u32,
     period_frames: u32,
     capacity: u32,
@@ -297,7 +314,7 @@ impl Connection {
             let period_frames = ((rate as i64 * period) / 10_000_000).max(1) as u32;
             let capacity = client.GetBufferSize()?;
             let render = client.GetService()?;
-            Ok(Self { client, render, rate, period_frames, capacity })
+            Ok(Self { client, render, device_id: device_id.to_string(), rate, period_frames, capacity })
         }
     }
 
@@ -319,7 +336,9 @@ impl Connection {
             let wake = CreateEventW(None, false, false, None)?;
             let result = (|| -> Result<()> {
                 self.client.SetEventHandle(wake)?;
-                let mut margin = starting_margin(self.period_frames).min(self.capacity);
+                let mut margin = starting_margin(self.period_frames)
+                    .max(remembered_margin(&self.device_id).unwrap_or(0))
+                    .min(self.capacity);
                 self.write(margin, &mut feed)?;
                 self.client.Start()?;
                 let idle_limit = self.rate * IDLE_BEFORE_STOPPING_MS / 1_000;
@@ -339,6 +358,7 @@ impl Connection {
                     if queued == 0 {
                         UNDERRUNS.fetch_add(1, Ordering::Relaxed);
                         margin = grown_margin(margin, self.period_frames, self.capacity);
+                        remember_margin(&self.device_id, margin);
                     }
                     if queued < margin {
                         let heard = self.write(margin - queued, &mut feed)?;

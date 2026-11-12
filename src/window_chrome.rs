@@ -818,6 +818,24 @@ mod imp {
         ui.window().dispatch_event(event);
     }
 
+    /// Whether a WM_SETTINGCHANGE is about Windows' colours, which is when light or dark mode
+    /// changes. Its lParam names what changed, or is null.
+    fn is_colour_change(lparam: LPARAM) -> bool {
+        let name = lparam as *const u16;
+        if name.is_null() {
+            return false;
+        }
+        let wanted: Vec<u16> = "ImmersiveColorSet".encode_utf16().collect();
+        // Read no further than the name could be, and stop at its end.
+        (0..=wanted.len()).all(|at| {
+            let letter = unsafe { *name.add(at) };
+            match wanted.get(at) {
+                Some(expected) => letter == *expected,
+                None => letter == 0,
+            }
+        })
+    }
+
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         message: u32,
@@ -863,6 +881,15 @@ mod imp {
             // Windows is shutting down or signing out, which ends the app without it quitting.
             windows_sys::Win32::UI::WindowsAndMessaging::WM_ENDSESSION if wparam != 0 => {
                 crate::config::run_before_exit();
+                DefSubclassProc(hwnd, message, wparam, lparam)
+            }
+            // Windows went from light to dark or back. The "System" theme follows it.
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE if is_colour_change(lparam) => {
+                update_ui(|ui| {
+                    if ui.get_theme_mode() == "System" {
+                        crate::apply_theme_to_ui(ui);
+                    }
+                });
                 DefSubclassProc(hwnd, message, wparam, lparam)
             }
             WM_KILLFOCUS => {

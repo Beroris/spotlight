@@ -12,7 +12,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        Mutex, OnceLock,
+        Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -49,6 +49,22 @@ static CHOICE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub fn choose_device(name: &str) {
     *CHOSEN_DEVICE.lock().unwrap() = name.to_string();
     CHOICE_COUNT.fetch_add(1, Ordering::SeqCst);
+    wake_player();
+}
+
+/// The player thread waits on this while enough audio is ready, instead of looking every few
+/// milliseconds. It's woken when the device takes some audio, or when a control changes.
+static PLAYER_WAKE: Condvar = Condvar::new();
+static PLAYER_WAKE_LOCK: Mutex<()> = Mutex::new(());
+/// The longest the player thread waits without being woken, in case a change came in just
+/// as it went to sleep. Far less than the audio kept ready.
+const PLAYER_WAKE_BACKSTOP: Duration = Duration::from_millis(50);
+
+/// Wakes the player thread after a control changed. Taking the lock means it can't be missed
+/// between the player thread's last look and its wait.
+fn wake_player() {
+    let _lock = PLAYER_WAKE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    PLAYER_WAKE.notify_all();
 }
 
 /// The names of the output devices Windows has active. This can take a while,
@@ -83,6 +99,12 @@ pub struct StereoResampler {
     /// `None` when the device already runs at 44.1 kHz: no conversion at all.
     filter: Option<SincFixedIn<f64>>,
     pending: [Vec<f64>; CHANNELS],
+    /// Output frames per input frame.
+    ratio: f64,
+    /// Frames gone in and come out since it was last emptied, which say how much music is
+    /// still inside when it ends.
+    frames_in: u64,
+    frames_out: u64,
 }
 
 impl StereoResampler {
@@ -108,7 +130,13 @@ impl StereoResampler {
                 .map_err(|error| anyhow!("could not create resampler: {error}"))?,
             )
         };
-        Ok(Self { filter, pending: [Vec::new(), Vec::new()] })
+        Ok(Self {
+            filter,
+            pending: [Vec::new(), Vec::new()],
+            ratio: output_rate as f64 / SOURCE_RATE as f64,
+            frames_in: 0,
+            frames_out: 0,
+        })
     }
 
     /// Forgets the audio so far, so nothing from before a skip reaches the output.
@@ -118,6 +146,8 @@ impl StereoResampler {
         }
         self.pending[0].clear();
         self.pending[1].clear();
+        self.frames_in = 0;
+        self.frames_out = 0;
     }
 
     /// Feed interleaved stereo; returns whatever interleaved output is ready.
@@ -125,6 +155,7 @@ impl StereoResampler {
         let Some(filter) = self.filter.as_mut() else {
             return Ok(interleaved.iter().map(|sample| *sample as f32).collect());
         };
+        self.frames_in += (interleaved.len() / CHANNELS) as u64;
         for frame in interleaved.chunks_exact(CHANNELS) {
             self.pending[0].push(frame[0]);
             self.pending[1].push(frame[1]);
@@ -144,6 +175,42 @@ impl StereoResampler {
             self.pending[0].drain(..needed);
             self.pending[1].drain(..needed);
         }
+        self.frames_out += (output.len() / CHANNELS) as u64;
+        Ok(output)
+    }
+
+    /// Hands over the last of the music when it ends here: the part of a chunk still waiting
+    /// for more, and what the filter holds back to look ahead. Without it the final song lost
+    /// up to its last 25 ms. Only for a real end: mid-song, as on a pause, it would leave a dip.
+    pub fn finish(&mut self) -> Result<Vec<f32>> {
+        let Some(filter) = self.filter.as_mut() else {
+            return Ok(Vec::new());
+        };
+        // Counted rather than worked out from the filter's figures: what went in, at the
+        // output's rate, less what already came out.
+        let wanted = ((self.frames_in as f64 * self.ratio).round() as u64).saturating_sub(self.frames_out) as usize;
+        if wanted == 0 {
+            self.reset();
+            return Ok(Vec::new());
+        }
+        let mut rest = (!self.pending[0].is_empty()).then(|| std::mem::take(&mut self.pending));
+        let mut output = Vec::with_capacity(wanted * CHANNELS);
+        while output.len() < wanted * CHANNELS {
+            let converted = match rest.take() {
+                Some(chunk) => filter.process_partial(Some(&chunk[..]), None),
+                None => filter.process_partial::<Vec<f64>>(None, None),
+            }
+            .map_err(|error| anyhow!("resampling failed: {error}"))?;
+            if converted[0].is_empty() {
+                break;
+            }
+            for (left, right) in converted[0].iter().zip(&converted[1]) {
+                output.push(*left as f32);
+                output.push(*right as f32);
+            }
+        }
+        output.truncate(wanted * CHANNELS);
+        self.reset();
         Ok(output)
     }
 }
@@ -162,12 +229,16 @@ static USER_VOLUME_AT: AtomicU64 = AtomicU64::new(0);
 static SKIPPING: AtomicBool = AtomicBool::new(false);
 static SKIP_AT: AtomicU64 = AtomicU64::new(0);
 static SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Where the player was in the music when the skip began. Once it has moved on, everything
+/// it hands over is from the new place, even before the app has read the news.
+static SKIP_FROM_POSITION: AtomicU64 = AtomicU64::new(0);
 
 /// How much audio to keep ready. Enough to ride out a busy moment on the player
 /// thread. Pause, volume and skips don't wait for it.
 const BUFFER_MS: usize = 300;
-/// Fades that keep pause, mute and skips from clicking.
-const FADE_MS: f32 = 3.0;
+/// Fades that keep pause, mute and skips from clicking. Shorter ones can tick on loud bass,
+/// where they cut a low note off in under half a cycle.
+const FADE_MS: f32 = 6.0;
 /// How long a skip may silence the player if the player never acts on it.
 const SKIP_TIMEOUT_MS: u64 = 3_000;
 /// The player's own volume messages echo the user's for a moment after a change.
@@ -186,6 +257,7 @@ pub fn set_paused(paused: bool) {
     if !paused {
         wasapi::wake_streams();
     }
+    wake_player();
 }
 
 /// Applies a volume the user just chose.
@@ -211,14 +283,28 @@ fn clear_queue() {
 /// Drops what's buffered, because the user asked for a different place in the
 /// music. Silence lasts until `end_skip`, when the player has moved.
 pub fn begin_skip() {
+    SKIP_FROM_POSITION.store(player_position_generation(), Ordering::SeqCst);
     SKIP_AT.store(clock_ms(), Ordering::SeqCst);
     SKIPPING.store(true, Ordering::SeqCst);
     SKIP_COUNT.fetch_add(1, Ordering::SeqCst);
     clear_queue();
+    wake_player();
 }
 
 pub fn end_skip() {
     SKIPPING.store(false, Ordering::SeqCst);
+}
+
+/// For the player's word that it moved. Late word of an earlier skip doesn't end a newer
+/// one, whose new place the player hasn't reached yet.
+pub fn end_skip_once_the_player_has_moved() {
+    if player_position_generation() != SKIP_FROM_POSITION.load(Ordering::SeqCst) {
+        end_skip();
+    }
+}
+
+fn player_position_generation() -> u64 {
+    librespot_playback::player::POSITION_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Feeds the device from the queue. It reads the controls on every frame, so a
@@ -237,11 +323,20 @@ struct OutputFeed {
     fading_out_old_audio: bool,
     /// Counts chunks taken from the queue.
     chunks_taken: u64,
+    /// The sink this feeds, from `SINK_GENERATION`. Once a newer one is made, this fades out
+    /// and takes nothing more from the queue.
+    sink: u64,
 }
 
 impl OutputFeed {
+    #[cfg(test)]
     fn new(rate: u32) -> Self {
+        Self::for_sink(rate, SINK_GENERATION.load(Ordering::SeqCst))
+    }
+
+    fn for_sink(rate: u32, sink: u64) -> Self {
         Self {
+            sink,
             gain: f32::from_bits(GAIN.load(Ordering::SeqCst)),
             gain_step: 1.0 / (rate as f32 * FADE_MS / 1000.0),
             chunk: Vec::new(),
@@ -260,7 +355,7 @@ impl OutputFeed {
             self.seen_skip = skips;
             self.fading_out_old_audio = true;
         }
-        let stop = self.fading_out_old_audio || PAUSED.load(Ordering::Relaxed);
+        let stop = self.fading_out_old_audio || PAUSED.load(Ordering::Relaxed) || self.replaced();
         let target = if stop { 0.0 } else { f32::from_bits(GAIN.load(Ordering::Relaxed)) };
         self.gain = if self.gain < target {
             (self.gain + self.gain_step).min(target)
@@ -276,14 +371,26 @@ impl OutputFeed {
         self.holding = stop && self.gain == 0.0;
     }
 
+    fn replaced(&self) -> bool {
+        self.sink != SINK_GENERATION.load(Ordering::Relaxed)
+    }
+
     fn next_queued_sample(&mut self) -> f32 {
         if self.position >= self.chunk.len() {
             let mut queue = QUEUE.lock().unwrap();
+            // Looked at under the lock, which a new sink takes to clear the queue after it
+            // counts itself, so nothing meant for it is taken here.
+            if self.replaced() {
+                return 0.0;
+            }
             let Some(next) = queue.pop_front() else {
                 return 0.0;
             };
             QUEUED_SAMPLES.fetch_sub(next.len(), Ordering::SeqCst);
             drop(queue);
+            // There's room for more now. This thread feeds the device, so it never waits for
+            // the lock: a wake missed here is caught by the player's backstop.
+            PLAYER_WAKE.notify_all();
             self.chunk = next;
             self.position = 0;
             self.chunks_taken = self.chunks_taken.wrapping_add(1);
@@ -322,6 +429,9 @@ impl wasapi::Feed for OutputFeed {
     }
 
     fn has_nothing_to_play(&self) -> bool {
+        if self.replaced() && self.gain == 0.0 {
+            return true;
+        }
         let paused_and_faded = PAUSED.load(Ordering::SeqCst) && self.gain == 0.0;
         paused_and_faded || (self.position >= self.chunk.len() && QUEUED_SAMPLES.load(Ordering::SeqCst) == 0)
     }
@@ -338,7 +448,7 @@ struct Output {
 
 /// Opens the chosen device. If `may_fall_back`, music keeps playing through the
 /// Windows default, or failing that any device, when the chosen one can't open.
-fn open_output(chosen: &str, may_fall_back: bool) -> Result<Output> {
+fn open_output(chosen: &str, may_fall_back: bool, sink: u64) -> Result<Output> {
     let devices = wasapi::devices();
     let names: Vec<String> = devices.iter().map(|device| device.name.clone()).collect();
     let wanted = if chosen.is_empty() { None } else { find_device(chosen, &names) };
@@ -351,7 +461,7 @@ fn open_output(chosen: &str, may_fall_back: bool) -> Result<Output> {
 
     let mut first_error = None;
     for (index, id) in candidates.into_iter().enumerate() {
-        match open_on(id, !chosen.is_empty() && (wanted.is_none() || index > 0)) {
+        match open_on(id, !chosen.is_empty() && (wanted.is_none() || index > 0), sink) {
             Ok(output) => return Ok(output),
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -364,12 +474,18 @@ fn open_output(chosen: &str, may_fall_back: bool) -> Result<Output> {
     })
 }
 
-fn open_on(device_id: String, on_fallback: bool) -> Result<Output> {
-    let stream = wasapi::Stream::open(device_id.clone(), OutputFeed::new)?;
+fn open_on(device_id: String, on_fallback: bool, sink: u64) -> Result<Output> {
+    let stream = wasapi::Stream::open(device_id.clone(), move |rate| OutputFeed::for_sink(rate, sink))?;
     Ok(Output { stream, device_id, on_fallback })
 }
 
+/// Counts the sinks made. Only the newest one plays: a player being replaced can take a moment
+/// to go, and two streams taking turns at one queue would each play half of the music.
+static SINK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 pub struct HighQualitySink {
+    /// Which sink this is, from `SINK_GENERATION`.
+    generation: u64,
     /// Nothing is opened until there's something to play.
     output: Option<Output>,
     resampler: StereoResampler,
@@ -383,13 +499,23 @@ pub struct HighQualitySink {
 }
 
 pub fn new_sink() -> Box<dyn Sink> {
-    // A new player starts from nothing. What the last one left isn't wanted.
-    clear_queue();
+    // A new player starts from nothing. What the last one left isn't wanted. It takes over
+    // under the queue's lock, which the older sink also holds to change the queue or the
+    // pause, so each such change lands wholly before the takeover or not at all.
+    let generation = {
+        let mut queue = QUEUE.lock().unwrap();
+        let generation = SINK_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        queue.clear();
+        QUEUED_SAMPLES.store(0, Ordering::SeqCst);
+        PAUSED.store(false, Ordering::SeqCst);
+        generation
+    };
     set_paused(false);
     end_skip();
     Box::new(HighQualitySink {
+        generation,
         output: None,
-        resampler: StereoResampler { filter: None, pending: [Vec::new(), Vec::new()] },
+        resampler: StereoResampler { filter: None, pending: [Vec::new(), Vec::new()], ratio: 1.0, frames_in: 0, frames_out: 0 },
         resampler_rate: SOURCE_RATE,
         seen_choice: 0,
         seen_skip: SKIP_COUNT.load(Ordering::SeqCst),
@@ -400,6 +526,23 @@ pub fn new_sink() -> Box<dyn Sink> {
 }
 
 impl HighQualitySink {
+    /// A newer player has the queue and the controls now. This one only winds down.
+    fn replaced(&self) -> bool {
+        self.generation != SINK_GENERATION.load(Ordering::SeqCst)
+    }
+
+    /// Makes a change to the queue or the pause only while this sink is the newest. The check
+    /// and the change share the queue's lock with `new_sink`'s takeover, so nothing slips in
+    /// between them.
+    fn while_current(&self, change: impl FnOnce(&mut VecDeque<Vec<f32>>)) -> bool {
+        let mut queue = QUEUE.lock().unwrap();
+        if self.replaced() {
+            return false;
+        }
+        change(&mut queue);
+        true
+    }
+
     fn needs_new_output(&self) -> bool {
         match &self.output {
             Some(output) => {
@@ -413,8 +556,12 @@ impl HighQualitySink {
         if output.stream.rate != self.resampler_rate {
             self.resampler = StereoResampler::new(output.stream.rate)?;
             self.resampler_rate = output.stream.rate;
-            // What's queued was made for the old rate.
-            clear_queue();
+            // What's queued was made for the old rate, unless a newer player made it while
+            // this device opened.
+            self.while_current(|queue| {
+                queue.clear();
+                QUEUED_SAMPLES.store(0, Ordering::SeqCst);
+            });
         }
         // The old stream goes first, so only one feed ever reads the queue. What's
         // queued carries over, so switching device loses next to nothing.
@@ -427,10 +574,15 @@ impl HighQualitySink {
     /// Makes sure audio has a working stream on the right device.
     fn refresh_output(&mut self) -> SinkResult<()> {
         let not_connected = |error: anyhow::Error| SinkError::NotConnected(error.to_string());
+        if self.replaced() {
+            // A newer player has the queue now. This one lets its stream go and plays nothing.
+            self.output = None;
+            return Err(SinkError::NotConnected("a newer player took over".into()));
+        }
         if self.needs_new_output() {
             self.seen_choice = CHOICE_COUNT.load(Ordering::SeqCst);
             let chosen = CHOSEN_DEVICE.lock().unwrap().clone();
-            match open_output(&chosen, true).and_then(|output| self.install(output)) {
+            match open_output(&chosen, true, self.generation).and_then(|output| self.install(output)) {
                 Ok(()) => {}
                 // A choice that can't open shouldn't stop music that is playing.
                 Err(error) => match &self.output {
@@ -447,7 +599,7 @@ impl HighQualitySink {
         {
             self.last_missing_check = Instant::now();
             let chosen = CHOSEN_DEVICE.lock().unwrap().clone();
-            if let Ok(output) = open_output(&chosen, false) {
+            if let Ok(output) = open_output(&chosen, false, self.generation) {
                 self.install(output).map_err(not_connected)?;
             }
         } else if self.last_default_check.elapsed() >= DEFAULT_DEVICE_RECHECK
@@ -470,7 +622,7 @@ impl HighQualitySink {
             let Some(default) = default.filter(|id| Some(id.as_str()) != playing_on && !failed_lately) else {
                 return Ok(());
             };
-            match open_on(default.clone(), false) {
+            match open_on(default.clone(), false, self.generation) {
                 Ok(output) => {
                     self.unopenable_default = None;
                     self.install(output).map_err(not_connected)?;
@@ -487,6 +639,12 @@ impl HighQualitySink {
         if !SKIPPING.load(Ordering::SeqCst) {
             return false;
         }
+        // The player has moved, so this is from the new place. Waiting for the app to hear
+        // of it instead would drop real music, about ten times faster than it plays.
+        if player_position_generation() != SKIP_FROM_POSITION.load(Ordering::SeqCst) {
+            end_skip();
+            return false;
+        }
         if clock_ms().saturating_sub(SKIP_AT.load(Ordering::SeqCst)) >= SKIP_TIMEOUT_MS {
             end_skip();
             return false;
@@ -499,7 +657,9 @@ impl HighQualitySink {
     fn wait_for_room(&self, limit: usize) {
         let started = Instant::now();
         loop {
-            if self.needs_new_output() || SKIPPING.load(Ordering::SeqCst) {
+            // Looked at under the lock, so a control changed after this is still heard.
+            let lock = PLAYER_WAKE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.replaced() || self.needs_new_output() || SKIPPING.load(Ordering::SeqCst) {
                 return;
             }
             let queued = QUEUED_SAMPLES.load(Ordering::SeqCst);
@@ -510,13 +670,58 @@ impl HighQualitySink {
                     return;
                 }
                 if started.elapsed() > Duration::from_secs(2) {
-                    // The command never came, so the player isn't paused after all.
-                    set_paused(false);
+                    // The command never came, so the player isn't paused after all. Once a
+                    // newer player has the pause, it isn't this one's to change.
+                    drop(lock);
+                    if self.while_current(|_| PAUSED.store(false, Ordering::SeqCst)) {
+                        wasapi::wake_streams();
+                        wake_player();
+                    }
+                    continue;
                 }
             } else if queued <= limit {
                 return;
             }
-            thread::sleep(Duration::from_millis(5));
+            let _ = PLAYER_WAKE.wait_timeout(lock, PLAYER_WAKE_BACKSTOP);
+        }
+    }
+
+    /// Queues what the resampler still holds once the music has ended.
+    fn hand_over_the_end(&mut self) {
+        // A sink with no stream has nothing to hand over to.
+        if self.output.is_none() {
+            self.resampler.reset();
+            return;
+        }
+        let Ok(end) = self.resampler.finish() else {
+            self.resampler.reset();
+            return;
+        };
+        if end.is_empty() {
+            return;
+        }
+        let mut queue = QUEUE.lock().unwrap();
+        if !SKIPPING.load(Ordering::SeqCst) && !self.replaced() {
+            QUEUED_SAMPLES.fetch_add(end.len(), Ordering::SeqCst);
+            queue.push_back(end);
+        }
+        drop(queue);
+        wasapi::wake_streams();
+    }
+
+    /// Waits while the end of the music is still playing out.
+    fn wait_for_queue_to_play_out(&self) {
+        loop {
+            let lock = PLAYER_WAKE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if QUEUED_SAMPLES.load(Ordering::SeqCst) == 0
+                || PAUSED.load(Ordering::SeqCst)
+                || SKIPPING.load(Ordering::SeqCst)
+                || self.replaced()
+                || self.needs_new_output()
+            {
+                return;
+            }
+            let _ = PLAYER_WAKE.wait_timeout(lock, PLAYER_WAKE_BACKSTOP);
         }
     }
 }
@@ -525,24 +730,31 @@ impl Sink for HighQualitySink {
     fn start(&mut self) -> SinkResult<()> {
         // The app clears its own pause before it tells the player to resume. Still
         // being paused means the player started from elsewhere, maybe on another
-        // track, so what was held back is out of date.
-        if PAUSED.swap(false, Ordering::SeqCst) {
-            clear_queue();
-        }
+        // track, so what was held back is out of date. Once a newer player has the
+        // pause and the queue, they're left alone.
+        self.while_current(|queue| {
+            if PAUSED.swap(false, Ordering::SeqCst) {
+                queue.clear();
+                QUEUED_SAMPLES.store(0, Ordering::SeqCst);
+            }
+        });
         self.refresh_output()
     }
 
     // librespot exits the whole app if this returns an error.
     fn stop(&mut self) -> SinkResult<()> {
+        if self.replaced() {
+            return Ok(());
+        }
+        // Not the app's pause or a skip, so the music ends here, maybe for good: what the
+        // resampler still holds is its last moment. A pause from another device lands here
+        // too, and resumes cleanly from silence.
+        if !PAUSED.load(Ordering::SeqCst) && !SKIPPING.load(Ordering::SeqCst) {
+            self.hand_over_the_end();
+        }
         // After the app's own pause, what's queued stays for an instant resume.
         // Anything else, like the end of the last song, plays out.
-        while QUEUED_SAMPLES.load(Ordering::SeqCst) > 0
-            && !PAUSED.load(Ordering::SeqCst)
-            && !SKIPPING.load(Ordering::SeqCst)
-            && !self.needs_new_output()
-        {
-            thread::sleep(Duration::from_millis(5));
-        }
+        self.wait_for_queue_to_play_out();
         Ok(())
     }
 
@@ -566,8 +778,9 @@ impl Sink for HighQualitySink {
             .map_err(|error| SinkError::OnWrite(error.to_string()))?;
         if !resampled.is_empty() {
             let mut queue = QUEUE.lock().unwrap();
-            // Checked under the lock, so nothing old slips in behind a skip.
-            if !SKIPPING.load(Ordering::SeqCst) {
+            // Checked under the lock, so nothing old slips in behind a skip, or into the
+            // queue of a newer player.
+            if !SKIPPING.load(Ordering::SeqCst) && !self.replaced() {
                 QUEUED_SAMPLES.fetch_add(resampled.len(), Ordering::SeqCst);
                 queue.push_back(resampled);
             }
@@ -630,6 +843,37 @@ mod tests {
                 mono[base] * (1.0 - fraction) + mono[base + 1] * fraction
             })
             .collect()
+    }
+
+    #[test]
+    fn the_end_of_the_last_song_is_heard() {
+        let rate = 48_000;
+        // Ends part-way through a chunk, with a tone over its last 10 ms, all held back.
+        let frames = 44_800;
+        let tone_frames = 441;
+        let mut input = vec![0.0; frames * 2];
+        for index in frames - tone_frames..frames {
+            let sample = 0.5 * (TAU * 1_000.0 * index as f64 / SOURCE_RATE as f64).sin();
+            input[index * 2] = sample;
+            input[index * 2 + 1] = sample;
+        }
+        let mut resampler = StereoResampler::new(rate).unwrap();
+        let mut output = Vec::new();
+        for packet in input.chunks(1_628) {
+            output.extend(resampler.process(packet).unwrap());
+        }
+        let peak = |samples: &[f32]| samples.iter().fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(peak(&output) < 0.001, "the tone shouldn't be out yet");
+
+        output.extend(resampler.finish().unwrap());
+        let expected = (frames as f64 * rate as f64 / SOURCE_RATE as f64).round() as usize;
+        assert!((output.len() / 2).abs_diff(expected) <= 1, "{} frames, expected {expected}", output.len() / 2);
+        let tone_out = (tone_frames as f64 * rate as f64 / SOURCE_RATE as f64) as usize;
+        assert!(peak(&output[output.len() - tone_out * 2..]) > 0.45, "the tone should come out at the end");
+
+        // Nothing more is held, and ending again adds no silence.
+        assert!(resampler.finish().unwrap().is_empty());
+        assert!(StereoResampler::new(SOURCE_RATE).unwrap().finish().unwrap().is_empty());
     }
 
     #[test]
@@ -752,8 +996,9 @@ mod tests {
     fn a_sink_keeps_queued_audio_for_the_apps_own_pause_only() {
         let _controls = fresh_controls();
         let mut sink = HighQualitySink {
+            generation: SINK_GENERATION.load(Ordering::SeqCst),
             output: None,
-            resampler: StereoResampler { filter: None, pending: [Vec::new(), Vec::new()] },
+            resampler: StereoResampler { filter: None, pending: [Vec::new(), Vec::new()], ratio: 1.0, frames_in: 0, frames_out: 0 },
             resampler_rate: SOURCE_RATE,
             seen_choice: 0,
             seen_skip: 0,
@@ -766,6 +1011,45 @@ mod tests {
         // With no output this returns at once either way; the queue must survive.
         sink.stop().unwrap();
         assert_eq!(QUEUED_SAMPLES.load(Ordering::SeqCst), 200);
+    }
+
+    #[test]
+    fn a_replaced_sink_leaves_the_queue_and_controls_to_the_new_one() {
+        let _controls = fresh_controls();
+        let mut old_sink = HighQualitySink {
+            generation: SINK_GENERATION.load(Ordering::SeqCst),
+            output: None,
+            resampler: StereoResampler { filter: None, pending: [Vec::new(), Vec::new()], ratio: 1.0, frames_in: 0, frames_out: 0 },
+            resampler_rate: SOURCE_RATE,
+            seen_choice: 0,
+            seen_skip: 0,
+            last_missing_check: Instant::now(),
+            last_default_check: Instant::now(),
+            unopenable_default: None,
+        };
+        let mut old_feed = OutputFeed::new(48_000);
+        // A newer player counts itself, as new_sink does, and fills the queue.
+        SINK_GENERATION.fetch_add(1, Ordering::SeqCst);
+        queue_numbered_frames(1, 1_000);
+
+        assert!(pull_frames(&mut old_feed, 500).iter().all(|sample| *sample == 0.0), "the old feed played new audio");
+        assert_eq!(QUEUED_SAMPLES.load(Ordering::SeqCst), 2_000, "the old feed took from the new queue");
+
+        // The new player is paused. The old one starting or stopping changes neither.
+        set_paused(true);
+        assert!(old_sink.start().is_err());
+        assert!(PAUSED.load(Ordering::SeqCst), "the old player unpaused the new one");
+        old_sink.stop().unwrap();
+        assert_eq!(QUEUED_SAMPLES.load(Ordering::SeqCst), 2_000);
+
+        // Nor does it add its own audio.
+        let mut converter = Converter::new(None);
+        assert!(old_sink.write(AudioPacket::Samples(vec![0.5; 2_000]), &mut converter).is_err());
+        assert_eq!(QUEUED_SAMPLES.load(Ordering::SeqCst), 2_000);
+
+        // Nor clear it, as a device at a new rate would.
+        assert!(!old_sink.while_current(|queue| queue.clear()));
+        assert!(!QUEUE.lock().unwrap().is_empty(), "the old player cleared the new queue");
     }
 
     #[test]
