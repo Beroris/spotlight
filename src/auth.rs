@@ -150,6 +150,13 @@ impl std::fmt::Display for SignInExpired {
 
 impl std::error::Error for SignInExpired {}
 
+impl SignInExpired {
+    /// No sign-in is kept at all, so the browser is the only way.
+    pub fn needed() -> Self {
+        Self("not signed in".into())
+    }
+}
+
 /// Talks to Spotify's sign-in service. A connection that stalls, say just after the PC wakes,
 /// gives up rather than holding up everything that waits for a token.
 fn accounts_client() -> Result<Client> {
