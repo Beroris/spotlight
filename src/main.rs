@@ -8365,6 +8365,67 @@ async fn ensure_local_playback(
     state: Arc<Mutex<AppState>>,
     ui_weak: slint::Weak<AppWindow>,
 ) -> Result<()> {
+    start_local_playback(state, ui_weak, true).await
+}
+
+/// Brings this PC back as a device after its player stopped on its own, as when the
+/// connection to Spotify drops while idle or asleep. Tries again with growing waits while
+/// there's no network, and gives up only on a change of account or if Spotify wants the
+/// browser sign-in, which never pops up unasked.
+fn restart_local_player_when_it_stops(
+    finished: tokio::sync::oneshot::Receiver<()>,
+    state: Arc<Mutex<AppState>>,
+    ui_weak: slint::Weak<AppWindow>,
+    engine_generation: u64,
+    session: u64,
+) {
+    tokio::spawn(async move {
+        // An error only means the player went without saying so; it has stopped all the same.
+        let _ = finished.await;
+        if state.lock().unwrap().playback_engine_generation != engine_generation {
+            return; // Stopped on purpose, by a restart or a sign-out.
+        }
+        let still_needed = |state: &Arc<Mutex<AppState>>| {
+            let guard = state.lock().unwrap();
+            ensure_same_session(&guard, session).is_ok()
+                && !guard.playback_engine.as_ref().is_some_and(|engine| !engine.is_finished())
+        };
+        let mut delay = Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(delay).await;
+            if !still_needed(&state) {
+                return;
+            }
+            match start_local_playback(Arc::clone(&state), ui_weak.clone(), false).await {
+                Ok(()) => return,
+                Err(error) => {
+                    let gave_up = error.downcast_ref::<auth::SignInExpired>().is_some();
+                    let message = if gave_up {
+                        "This PC's player stopped and needs signing in again. Press play here to sign in.".to_string()
+                    } else {
+                        format!("This PC's player stopped; trying again in a moment ({error}).")
+                    };
+                    let ui_weak = ui_weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_weak.upgrade() {
+                            append_log(&ui, &message);
+                        }
+                    });
+                    if gave_up {
+                        return;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(300));
+                }
+            }
+        }
+    });
+}
+
+async fn start_local_playback(
+    state: Arc<Mutex<AppState>>,
+    ui_weak: slint::Weak<AppWindow>,
+    allow_browser_sign_in: bool,
+) -> Result<()> {
     let start_lock = state.lock().unwrap().local_playback_start_lock.clone();
     let _start_guard = start_lock.lock().await;
     let session = state.lock().unwrap().session;
@@ -8395,6 +8456,7 @@ async fn ensure_local_playback(
                     // Only a turned-down token needs the browser. No network yet, as just after
                     // the PC wakes, is tried again with the next play.
                     Err(error) if error.downcast_ref::<auth::SignInExpired>().is_none() => return Err(error),
+                    Err(error) if !allow_browser_sign_in => return Err(error),
                     Err(_) => {
                         let local_token = auth::login_for_local_playback(&local_client_id).await?;
                         keep_local_playback_token(&state, session, local_token)?
@@ -8404,6 +8466,9 @@ async fn ensure_local_playback(
                 existing
             }
         } else {
+            if !allow_browser_sign_in {
+                return Err(auth::SignInExpired::needed().into());
+            }
             let local_token = auth::login_for_local_playback(&local_client_id).await?;
             keep_local_playback_token(&state, session, local_token)?
         }
@@ -8438,6 +8503,7 @@ async fn ensure_local_playback(
     };
 
     let events = engine.take_player_events();
+    let finished = engine.take_finished_signal();
     let engine_generation = {
         let mut guard = state.lock().unwrap();
         // Signed out while the player was starting: it isn't wanted any more.
@@ -8457,6 +8523,9 @@ async fn ensure_local_playback(
             Arc::clone(&state),
             engine_generation,
         ));
+    }
+    if let Some(finished) = finished {
+        restart_local_player_when_it_stops(finished, Arc::clone(&state), ui_weak.clone(), engine_generation, session);
     }
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_weak.upgrade() {

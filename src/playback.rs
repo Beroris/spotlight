@@ -46,6 +46,7 @@ pub struct PlaybackEngine {
     _spirc: Spirc,
     _spirc_task: JoinHandle<()>,
     player_events: Option<PlayerEventChannel>,
+    finished: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl PlaybackEngine {
@@ -111,8 +112,12 @@ impl PlaybackEngine {
             mixer,
         ).await?;
 
+        // The Connect loop ends for good when the connection to Spotify drops, as after
+        // sleep or a network blip, and the device vanishes from Spotify's list with it.
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             let _ = spirc_task.await;
+            let _ = finished_tx.send(());
         });
 
         Ok(Self {
@@ -121,6 +126,7 @@ impl PlaybackEngine {
             _spirc: spirc,
             _spirc_task: handle,
             player_events: Some(player_events),
+            finished: Some(finished_rx),
         })
     }
 
@@ -131,6 +137,11 @@ impl PlaybackEngine {
 
     pub fn take_player_events(&mut self) -> Option<PlayerEventChannel> {
         self.player_events.take()
+    }
+
+    /// Resolves once the player has stopped, for whatever reason.
+    pub fn take_finished_signal(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.finished.take()
     }
 
     pub fn play_pause(&self) -> Result<()> {
