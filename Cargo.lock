@@ -6305,12 +6305,14 @@ dependencies = [
 name = "spotlight"
 version = "1.2.1"
 dependencies = [
+ "alsa",
  "anyhow",
  "axum",
  "base64",
  "block2 0.6.2",
  "cpal",
  "dirs",
+ "futures-util",
  "global-hotkey",
  "glow",
  "i-slint-backend-winit",
@@ -6344,6 +6346,7 @@ dependencies = [
  "windows 0.54.0",
  "windows-sys 0.59.0",
  "winres",
+ "zbus",
 ]
 
 [[package]]

@@ -4,6 +4,8 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod art_tilt;
+#[cfg(target_os = "linux")]
+mod audio_devices_linux;
 mod audio_output;
 mod auth;
 mod config;
@@ -490,12 +492,20 @@ fn main() -> Result<()> {
         account_asked_at: None,
     }));
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     window_chrome::prepare()?;
     let ui = AppWindow::new()?;
     #[cfg(target_os = "windows")]
     apply_runtime_window_icon();
     ui.set_is_mac(cfg!(target_os = "macos"));
+    ui.set_is_linux(cfg!(target_os = "linux"));
+    #[cfg(target_os = "linux")]
+    {
+        ui.set_open_at_sign_in(startup_entry::opens_at_sign_in());
+        ui.on_open_at_sign_in_changed(|on| {
+            let _ = startup_entry::open_at_sign_in(on);
+        });
+    }
     {
         let guard = state.lock().unwrap();
         ui.set_client_id(guard.config.client_id.clone().into());
@@ -640,7 +650,8 @@ fn main() -> Result<()> {
                 .map(|enabled| enabled || config_wants_tray)
                 .unwrap_or(config_wants_tray);
             // On a Mac the red button always only puts the window away. Quit is in the menu.
-            if hide_to_tray || cfg!(target_os = "macos") {
+            // Linux has no tray to go to, so there the window closing ends the app.
+            if (hide_to_tray && cfg!(not(target_os = "linux"))) || cfg!(target_os = "macos") {
                 tray::ensure_started();
                 tray::hide_spotlight_window();
                 CloseRequestResponse::KeepWindowShown
@@ -1044,6 +1055,9 @@ fn main() -> Result<()> {
             ((at_sign_in && guard.config.tray_at_sign_in) || (start_minimized && tray_in_use), start_minimized && !tray_in_use)
         }
     };
+    // Linux has no tray to wait in, so there it waits minimized.
+    #[cfg(target_os = "linux")]
+    let (to_tray, minimized) = (false, to_tray || minimized);
     if to_tray {
         // The window is made but not shown: the tray brings it out. Hiding it once the event
         // loop has shown it would flash it on the screen first.
@@ -1268,11 +1282,11 @@ fn system_prefers_light() -> bool {
         };
         status == 0 && value == 1
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         window_chrome::system_is_light()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     false
 }
 
@@ -9350,12 +9364,12 @@ fn spotlight_window_is_foreground() -> bool {
     foreground == hwnd
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spotlight_window_is_foreground() -> bool {
     window_chrome::is_front()
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn spotlight_window_is_foreground() -> bool {
     true
 }
@@ -9387,7 +9401,12 @@ fn toggle_spotlight_window_maximized() {
     window_chrome::toggle_full_screen();
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn toggle_spotlight_window_maximized() {
+    window_chrome::toggle_maximized();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn toggle_spotlight_window_maximized() {}
 
 #[cfg(target_os = "windows")]

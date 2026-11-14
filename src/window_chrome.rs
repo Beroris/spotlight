@@ -8,18 +8,22 @@
 // Most of this is only called on Windows.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use slint::ComponentHandle;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::AppWindow;
 
 #[cfg(target_os = "macos")]
 #[path = "window_chrome_macos.rs"]
 mod imp;
 
+#[cfg(target_os = "linux")]
+#[path = "window_chrome_linux.rs"]
+mod imp;
+
 /// Anywhere else the window keeps the frame its system gives it.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::*;
 

@@ -22,9 +22,9 @@ use std::{
 };
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Whether Spotlight looks for new versions by itself. Not on a Mac yet: no release has a file
-/// for one, so word of a new version would lead nowhere.
-pub const OFFERED_HERE: bool = cfg!(not(target_os = "macos"));
+/// Whether Spotlight looks for new versions by itself. Not on a Mac or on Linux yet: no release
+/// has a file for either, so word of a new version would lead nowhere.
+pub const OFFERED_HERE: bool = cfg!(target_os = "windows");
 const LATEST_RELEASE: &str = "https://api.github.com/repos/Beroris/spotlight/releases/latest";
 /// Where a release's files may come from.
 const DOWNLOADS_FROM: &str = "https://github.com/";

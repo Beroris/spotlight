@@ -2807,9 +2807,19 @@ export component AppWindow inherits Window {
     in property <bool> is_mac: false;
     // The Mac's full screen, which has none of those buttons.
     in property <bool> mac_full_screen: false;
+    // Running on Linux, which keeps Windows' top bar and buttons but has no tray, no
+    // shortcuts of its own in the background and no updates to fetch.
+    in property <bool> is_linux: false;
+    // Only Windows has those.
+    property <bool> is-windows: !root.is_mac && !root.is_linux;
+    // Whether a window may keep itself above the others. Not under Wayland.
+    in property <bool> can_keep_on_top: true;
+    // Linux only: whether Spotlight opens as the owner signs in.
+    in-out property <bool> open_at_sign_in: false;
+    callback open_at_sign_in_changed(bool);
     property <bool> mac-buttons-shown: root.is_mac && !root.mac_full_screen;
-    property <string> this-computer: root.is_mac ? "this Mac" : "this PC";
-    property <string> default-device-label: root.is_mac ? "System default" : "Windows default";
+    property <string> this-computer: root.is_mac ? "this Mac" : root.is_linux ? "this computer" : "this PC";
+    property <string> default-device-label: root.is-windows ? "Windows default" : "System default";
     // The key that goes with a letter for a shortcut, as in "Ctrl+K".
     property <string> command-key: root.is_mac ? "⌘" : "Ctrl+";
     // A press on an empty part of the top bar or of the mini player, for the Mac to move the window by.
@@ -3079,7 +3089,7 @@ export component AppWindow inherits Window {
     // A list page opened from Home goes back there.
     property <bool> back-to-home: false;
     property <string> output-label: root.active_device_name == "" ? "No active device"
-        : (root.active_device_name == root.local_device_name ? (root.is_mac ? "This Mac" : "This PC") : root.active_device_name);
+        : (root.active_device_name == root.local_device_name ? (root.is_mac ? "This Mac" : root.is_linux ? "This computer" : "This PC") : root.active_device_name);
     property <length> row-height: 48px;
     property <bool> reset-armed: false;
     property <int> suggestion-count: root.search_suggestions.length + 1;
@@ -3405,6 +3415,8 @@ export component AppWindow inherits Window {
     }
 
     title: "Spotlight";
+    // Linux draws no frame of its own around the window. The top bar is all there is.
+    no-frame: root.is_linux;
     // The size the window opens at. Rust reads these to center it before it first shows.
     out property <length> opening-width: 1600px;
     out property <length> opening-height: 940px;
@@ -5981,7 +5993,7 @@ export component AppWindow inherits Window {
                                                     : root.update_note != "" ? root.update_note
                                                     : "New versions come from Spotlight's page on GitHub.";
                                                 control-width: 120px;
-                                                if !root.is_mac : TextButton {
+                                                if root.is-windows : TextButton {
                                                     x: 120px - self.width;
                                                     text: root.update_busy == "checking" ? "Checking…" : "Check now";
                                                     enabled: root.update_busy == "";
@@ -5989,12 +6001,13 @@ export component AppWindow inherits Window {
                                                     clicked => { root.check_for_update(); }
                                                 }
                                             }
-                                            if !root.is_mac : SettingToggle { label: "Check for updates"; description: "Look for a new version when Spotlight opens, and once a day."; checked <=> root.check_for_updates; toggled => { root.save_settings(); } }
+                                            if root.is-windows : SettingToggle { label: "Check for updates"; description: "Look for a new version when Spotlight opens, and once a day."; checked <=> root.check_for_updates; toggled => { root.save_settings(); } }
 
-                                            if !root.is_mac : SettingToggle { label: "Minimize to tray"; description: "Keep running in the tray when minimized."; checked <=> root.minimize_to_tray; toggled => { root.save_settings(); } }
-                                            if !root.is_mac : SettingToggle { label: "Close to tray"; description: "The close button hides the window instead of quitting."; checked <=> root.close_to_tray; toggled => { root.save_settings(); } }
+                                            if root.is-windows : SettingToggle { label: "Minimize to tray"; description: "Keep running in the tray when minimized."; checked <=> root.minimize_to_tray; toggled => { root.save_settings(); } }
+                                            if root.is-windows : SettingToggle { label: "Close to tray"; description: "The close button hides the window instead of quitting."; checked <=> root.close_to_tray; toggled => { root.save_settings(); } }
+                                            if root.is_linux : SettingToggle { label: "Open at sign-in"; description: "Start Spotlight, minimized, when you sign in to this computer."; checked <=> root.open_at_sign_in; toggled => { root.open_at_sign_in_changed(root.open_at_sign_in); } }
                                             SettingToggle { label: "Start minimized"; description: "Open quietly in the background."; checked <=> root.start_minimized; toggled => { root.save_settings(); } }
-                                            if !root.is_mac : SettingToggle { label: "Start in the tray at sign-in"; description: "When Spotlight starts with Windows, it waits in the tray."; checked <=> root.tray_at_sign_in; toggled => { root.save_settings(); } }
+                                            if root.is-windows : SettingToggle { label: "Start in the tray at sign-in"; description: "When Spotlight starts with Windows, it waits in the tray."; checked <=> root.tray_at_sign_in; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Save resources in the background"; description: "Check Spotify less often when Spotlight isn't in front."; checked <=> root.low_resource_mode; toggled => { root.save_settings(); } }
                                             SettingRow {
                                                 label: "Saved covers";
@@ -6017,7 +6030,7 @@ export component AppWindow inherits Window {
 
                                             SettingRow {
                                                 label: "Output device";
-                                                description: root.output_device_missing ? (root.is_mac ? "Not connected right now, so Spotlight is using the Mac's own choice." : "Not connected right now, so Spotlight is using the Windows default.") : (root.is_mac ? "Where Spotlight plays, whatever the Mac is set to." : "Where Spotlight plays, whatever Windows is set to.");
+                                                description: root.output_device_missing ? (root.is_mac ? "Not connected right now, so Spotlight is using the Mac's own choice." : root.is_linux ? "Not connected right now, so Spotlight is using the system default." : "Not connected right now, so Spotlight is using the Windows default.") : (root.is_mac ? "Where Spotlight plays, whatever the Mac is set to." : root.is_linux ? "Where Spotlight plays, whatever the system is set to." : "Where Spotlight plays, whatever Windows is set to.");
                                                 control-width: 290px;
                                                 clickable: true;
                                                 clicked => {
@@ -6134,7 +6147,7 @@ export component AppWindow inherits Window {
 
                                             SettingSegments {
                                                 label: "Theme";
-                                                description: root.is_mac ? "Follow the Mac, or stay dark or light." : "Follow Windows, or stay dark or light.";
+                                                description: root.is_mac ? "Follow the Mac, or stay dark or light." : root.is_linux ? "Follow the desktop, or stay dark or light." : "Follow Windows, or stay dark or light.";
                                                 options: ["System", "Dark", "Light"];
                                                 selected: root.theme_mode == "System" ? 0 : (root.theme_mode == "Dark" ? 1 : 2);
                                                 chosen(index) => {
@@ -6176,9 +6189,9 @@ export component AppWindow inherits Window {
                                             scroll-y: settings-scroll.viewport-y;
                                             view-height: settings-scroll.visible-height;
 
-                                            SettingToggle { label: "Media keys"; description: root.is_mac ? "Show the song in the Mac's Now Playing, so play and skip keys reach Spotlight when it played last." : "Show the song in Windows' media controls, so play and skip keys reach Spotlight when it played last."; checked <=> root.media_keys_enabled; toggled => { root.save_settings(); } }
-                                            if !root.is_mac : SettingToggle { label: "Shortcuts in the background"; description: "The keys below work even when Spotlight isn't in front."; checked <=> root.global_hotkeys; toggled => { root.save_settings(); } }
-                                            if !root.is_mac : SettingRow {
+                                            SettingToggle { label: "Media keys"; description: root.is_mac ? "Show the song in the Mac's Now Playing, so play and skip keys reach Spotlight when it played last." : root.is_linux ? "Show the song in the desktop's media controls, so play and skip keys reach Spotlight." : "Show the song in Windows' media controls, so play and skip keys reach Spotlight when it played last."; checked <=> root.media_keys_enabled; toggled => { root.save_settings(); } }
+                                            if root.is-windows : SettingToggle { label: "Shortcuts in the background"; description: "The keys below work even when Spotlight isn't in front."; checked <=> root.global_hotkeys; toggled => { root.save_settings(); } }
+                                            if root.is-windows : SettingRow {
                                                 label: "Play or pause";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6190,7 +6203,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("play-pause"); }
                                                 }
                                             }
-                                            if !root.is_mac : SettingRow {
+                                            if root.is-windows : SettingRow {
                                                 label: "Next song";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6202,7 +6215,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("next"); }
                                                 }
                                             }
-                                            if !root.is_mac : SettingRow {
+                                            if root.is-windows : SettingRow {
                                                 label: "Previous song";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6214,7 +6227,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("previous"); }
                                                 }
                                             }
-                                            if !root.is_mac : SettingRow {
+                                            if root.is-windows : SettingRow {
                                                 label: "Shuffle";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6226,7 +6239,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("shuffle"); }
                                                 }
                                             }
-                                            if !root.is_mac : SettingRow {
+                                            if root.is-windows : SettingRow {
                                                 label: "Repeat";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6466,9 +6479,9 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 12px;
                             for point in [
-                                { title: "Quick", text: root.is_mac ? "Made for the desktop, with no browser inside, so every click lands at once." : "Made for Windows, with no browser inside, so every click lands at once." },
+                                { title: "Quick", text: root.is-windows ? "Made for Windows, with no browser inside, so every click lands at once." : "Made for the desktop, with no browser inside, so every click lands at once." },
                                 { title: "Light", text: "Next to no memory or CPU while the music plays, and less when it's hidden." },
-                                { title: root.is_mac ? "At home on the Mac" : "At home in Windows", text: root.is_mac ? "Media keys, Now Playing and a mini player." : "Media keys, the lock screen, a mini player and taskbar buttons." },
+                                { title: root.is_mac ? "At home on the Mac" : root.is_linux ? "At home on Linux" : "At home in Windows", text: root.is_mac ? "Media keys, Now Playing and a mini player." : root.is_linux ? "Media keys, the desktop's media controls and a mini player." : "Media keys, the lock screen, a mini player and taskbar buttons." },
                             ] : HorizontalLayout {
                                 spacing: 12px;
                                 VerticalLayout {
@@ -6762,7 +6775,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if !root.is_mac : SettingToggle {
+                                if root.is-windows : SettingToggle {
                                     label: "Keep playing when closed";
                                     description: "The close button tucks Spotlight into the tray.";
                                     checked <=> root.close_to_tray;
@@ -6927,7 +6940,7 @@ export component AppWindow inherits Window {
             vertical-alignment: center;
         }
 
-        MiniWindowButton {
+        if root.can_keep_on_top : MiniWindowButton {
             x: parent.width - 96px;
             y: 8px;
             label: root.mini_on_top ? "Stop keeping on top" : "Keep on top";

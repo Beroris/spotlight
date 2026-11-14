@@ -93,6 +93,14 @@ objc2-foundation = "0.3"
 # Only the parts Now Playing uses. The rest would bring in the Mac's whole video player.
 objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
 
+# Linux's media controls and its light or dark look, over D-Bus. The same versions Slint's
+# window backend already builds, with nothing switched on that it doesn't use.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.14", default-features = false, features = ["async-io"] }
+futures-util = { version = "0.3", default-features = false }
+# Reads the names of the sound devices. The same version cpal already builds.
+alsa = "0.9"
+
 [dev-dependencies]
 # Only the latency test uses this, to record what a device really outputs.
 rodio = { version = "0.21", default-features = false, features = ["playback"] }

@@ -22,5 +22,9 @@ can reach it, but not shown. `keep_first_window_hidden` in `lib.rs` asks for tha
 `winitwindowadapter.rs`, `set_visibility` then skips `set_visible(true)` the first time the window
 is shown. Slint takes it as shown, as it does a window Spotlight hides in the tray itself.
 
+On Linux Spotlight has no clipboard of its own to copy a link to, where Windows and the Mac
+give it one. `copy_to_clipboard` in `lib.rs` hands the text to the clipboard Slint already keeps
+for its text boxes.
+
 The version stays 1.16.1, so the other Slint crates, which ask for exactly that version, still
 accept it.

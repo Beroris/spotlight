@@ -49,19 +49,25 @@ fn send(command: MediaCommand) {
 #[path = "media_controls_macos.rs"]
 mod imp;
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "linux")]
+#[path = "media_controls_linux.rs"]
+mod imp;
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub use imp::{install, show};
+#[cfg(target_os = "linux")]
+pub use imp::{ask_running, watch_desktop_look};
 
 /// Where presses on Windows' controls go. Call before the window exists.
 pub fn set_commands(commands: UnboundedSender<MediaCommand>) {
     let _ = COMMANDS.set(commands);
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn install(_window: isize) -> bool {
     false
 }
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn show(_song: Option<&Song>, _playing: bool, _position_ms: i32) {}
 
 #[cfg(target_os = "windows")]

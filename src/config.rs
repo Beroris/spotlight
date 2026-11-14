@@ -21,8 +21,15 @@ fn is_portable_exe(exe: &std::path::Path) -> bool {
 }
 
 /// The folder's name in the user's app data. A Mac has a Spotlight of its own, so there it goes
-/// by the app's full name, the one `scripts/package-macos.sh` gives the app.
-const DATA_FOLDER: &str = if cfg!(target_os = "macos") { "com.beroris.spotlight" } else { "Spotlight" };
+/// by the app's full name, the one `scripts/package-macos.sh` gives the app. Linux keeps such
+/// folders in small letters, under `~/.local/share`.
+const DATA_FOLDER: &str = if cfg!(target_os = "macos") {
+    "com.beroris.spotlight"
+} else if cfg!(target_os = "linux") {
+    "spotlight"
+} else {
+    "Spotlight"
+};
 
 /// Where settings, the login and the cover cache live: in "Spotlight settings" beside the
 /// portable copy, and in the user's local app data otherwise.

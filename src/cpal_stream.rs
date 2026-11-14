@@ -68,6 +68,13 @@ pub struct Device {
 }
 
 /// The output devices the system has.
+#[cfg(target_os = "linux")]
+pub fn devices() -> Vec<Device> {
+    crate::audio_devices_linux::devices()
+}
+
+/// The output devices the system has.
+#[cfg(not(target_os = "linux"))]
 pub fn devices() -> Vec<Device> {
     let Ok(found) = cpal::default_host().output_devices() else {
         return Vec::new();
@@ -81,6 +88,13 @@ pub fn default_device_id() -> Option<String> {
 }
 
 fn find_device(device_id: &str) -> Result<cpal::Device> {
+    // Looking through ALSA's list opens every device on it, so the default isn't looked for.
+    #[cfg(target_os = "linux")]
+    if let Some(device) = cpal::default_host().default_output_device() {
+        if device.name().is_ok_and(|name| name == device_id) {
+            return Ok(device);
+        }
+    }
     cpal::default_host()
         .output_devices()
         .context("could not list the audio devices")?
