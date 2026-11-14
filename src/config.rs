@@ -283,6 +283,9 @@ mod tests {
         assert!(is_portable_exe(Path::new(r"D:\Apps\Spotlight-1.0.0-Portable.exe")));
         assert!(is_portable_exe(Path::new(r"D:\Apps\spotlight portable.exe")));
         assert!(!is_portable_exe(Path::new(r"C:\Users\Me\AppData\Local\Programs\Spotlight\Spotlight.exe")));
+        #[cfg(target_os = "windows")]
         assert!(!is_portable_exe(Path::new(r"D:\Portable apps\Spotlight.exe")), "only the file's own name counts");
+        #[cfg(not(target_os = "windows"))]
+        assert!(!is_portable_exe(Path::new("/Portable apps/Spotlight.app/Contents/MacOS/Spotlight")), "only the file's own name counts");
     }
 }

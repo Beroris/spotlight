@@ -141,6 +141,8 @@ mod tests {
     use super::*;
     use std::{path::PathBuf, time::Duration};
 
+    // Windows paths, which only split into folders on Windows.
+    #[cfg(target_os = "windows")]
     #[test]
     fn only_builds_from_the_source_tree_stay_out_of_startup() {
         assert!(is_dev_build(&PathBuf::from(r"C:\Code\spotlight\target\release\Spotlight.exe")));
