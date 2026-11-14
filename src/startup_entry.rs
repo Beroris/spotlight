@@ -1,10 +1,14 @@
 //! Lists Spotlight under Startup apps in Task Manager, where it can be switched on to
-//! start with Windows.
+//! start with Windows. On Linux a switch in Settings does it, through the desktop's
+//! autostart folder.
 //!
 //! Task Manager lists what's in the Run key and keeps its on/off switch separately, in
 //! StartupApproved. So correcting the path after a move never overrides the owner's
 //! choice. The entry starts switched off: adding it shouldn't change what happens at
 //! the next sign-in by itself.
+
+// Most of this is only called on Windows.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use std::{
     path::Path,
@@ -130,14 +134,75 @@ pub fn register() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn register() {}
+
+/// On Linux the desktop opens whatever has an entry in the autostart folder as the user signs
+/// in. Spotlight's is only there while the switch in Settings is on, so all there is to do
+/// here is correct its path after the app has moved.
+#[cfg(target_os = "linux")]
+pub fn register() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    if !is_dev_build(&exe) && opens_at_sign_in() {
+        let _ = open_at_sign_in(true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_file() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("autostart").join("com.beroris.spotlight.desktop"))
+}
+
+/// The autostart entry that opens this copy. Its path is quoted the way such entries ask: a
+/// backslash before each of these four inside the quotes, and every backslash written twice
+/// because the file reads `\\` as one.
+#[cfg(any(target_os = "linux", test))]
+fn autostart_entry(exe: &Path) -> String {
+    let mut path = String::new();
+    for letter in exe.to_string_lossy().chars() {
+        match letter {
+            '"' | '`' | '$' => path.push_str("\\\\"),
+            '\\' => path.push_str("\\\\\\"),
+            _ => {}
+        }
+        path.push(letter);
+    }
+    format!("[Desktop Entry]\nType=Application\nName=Spotlight\nExec=\"{path}\" {AT_SIGN_IN_ARG}\nIcon=com.beroris.spotlight\n")
+}
+
+/// Whether Spotlight opens as the user signs in.
+#[cfg(target_os = "linux")]
+pub fn opens_at_sign_in() -> bool {
+    autostart_file().is_some_and(|file| file.exists())
+}
+
+/// Switches opening at sign-in on or off.
+#[cfg(target_os = "linux")]
+pub fn open_at_sign_in(on: bool) -> std::io::Result<()> {
+    let file = autostart_file().ok_or(std::io::ErrorKind::NotFound)?;
+    if !on {
+        return match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    let entry = autostart_entry(&std::env::current_exe()?);
+    if std::fs::read_to_string(&file).is_ok_and(|existing| existing == entry) {
+        return Ok(());
+    }
+    if let Some(folder) = file.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    std::fs::write(&file, entry)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{path::PathBuf, time::Duration};
 
+    // Windows paths, which only split into folders on Windows.
+    #[cfg(target_os = "windows")]
     #[test]
     fn only_builds_from_the_source_tree_stay_out_of_startup() {
         assert!(is_dev_build(&PathBuf::from(r"C:\Code\spotlight\target\release\Spotlight.exe")));
@@ -152,6 +217,15 @@ mod tests {
             command_for(&PathBuf::from(r"C:\Program Files\Spotlight\Spotlight.exe")),
             r#""C:\Program Files\Spotlight\Spotlight.exe" --at-sign-in"#
         );
+    }
+
+    #[test]
+    fn the_autostart_entry_survives_spaces_and_quotes_in_the_path() {
+        let entry = autostart_entry(&PathBuf::from("/home/me/My \"apps\"/Spotlight"));
+        assert!(entry.contains(r#"Exec="/home/me/My \\"apps\\"/Spotlight" --at-sign-in"#), "{entry}");
+        let entry = autostart_entry(&PathBuf::from(r"/home/me/a\b$c/Spotlight"));
+        assert!(entry.contains(r#"Exec="/home/me/a\\\\b\\$c/Spotlight" --at-sign-in"#), "{entry}");
+        assert!(entry.starts_with("[Desktop Entry]\nType=Application\n"));
     }
 
     #[test]

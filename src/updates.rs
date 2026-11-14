@@ -22,6 +22,9 @@ use std::{
 };
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Whether Spotlight looks for new versions by itself. Not on a Mac or on Linux yet: no release
+/// has a file for either, so word of a new version would lead nowhere.
+pub const OFFERED_HERE: bool = cfg!(target_os = "windows");
 const LATEST_RELEASE: &str = "https://api.github.com/repos/Beroris/spotlight/releases/latest";
 /// Where a release's files may come from.
 const DOWNLOADS_FROM: &str = "https://github.com/";
@@ -446,7 +449,13 @@ fn wait_for_exit(process_id: u32, timeout: Duration) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn wait_for_exit(_process_id: u32, _timeout: Duration) {}
+fn wait_for_exit(process_id: u32, timeout: Duration) {
+    // Sending no signal at all only asks whether the process is still there.
+    let until = std::time::Instant::now() + timeout;
+    while unsafe { libc::kill(process_id as libc::pid_t, 0) } == 0 && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 #[cfg(test)]
 mod tests {

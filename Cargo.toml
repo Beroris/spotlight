@@ -40,6 +40,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 urlencoding = "2.1"
 uuid = { version = "1", features = ["v4"] }
 webbrowser = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
 # The same version librespot's audio libraries already build.
 windows = { version = "0.54", features = [
     "Foundation",
@@ -76,14 +78,41 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+# Plays through the system's own audio engine. The same version librespot's output already builds.
+cpal = "0.16"
+# The time of day, for the log.
+libc = "0.2"
+
+# The Mac's window, clipboard and Now Playing. The same versions Slint's window backend already builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+# Only the parts Now Playing uses. The rest would bring in the Mac's whole video player.
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
+
+# Linux's media controls and its light or dark look, over D-Bus. The same versions Slint's
+# window backend already builds, with nothing switched on that it doesn't use.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.14", default-features = false, features = ["async-io"] }
+futures-util = { version = "0.3", default-features = false }
+# Reads the names of the sound devices. The same version cpal already builds.
+alsa = "0.9"
+
 [dev-dependencies]
 # Only the latency test uses this, to record what a device really outputs.
 rodio = { version = "0.21", default-features = false, features = ["playback"] }
 
 [build-dependencies]
+slint-build = "1.7"
+
+# The exe's icon, made from the logo. A build script's dependencies go by the computer that
+# builds, which is the one it runs on.
+[target.'cfg(target_os = "windows")'.build-dependencies]
 ico = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
-slint-build = "1.7"
 winres = "0.1"
 
 # Real-time audio DSP must be fast even in debug builds, or playback can stutter.

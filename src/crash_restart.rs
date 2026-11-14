@@ -208,7 +208,13 @@ mod imp {
 mod imp {
     use std::time::Duration;
 
-    pub fn wait_for_exit(_process_id: u32, _timeout: Duration) {}
+    pub fn wait_for_exit(process_id: u32, timeout: Duration) {
+        // Sending no signal at all only asks whether the process is still there.
+        let until = std::time::Instant::now() + timeout;
+        while unsafe { libc::kill(process_id as libc::pid_t, 0) } == 0 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     pub fn window_left() -> (bool, bool) {
         (false, false)
     }

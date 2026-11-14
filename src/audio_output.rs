@@ -24,7 +24,12 @@ use librespot_playback::{
     convert::Converter,
     decoder::AudioPacket,
 };
-use crate::wasapi;
+// The stream that plays on a device: Windows' audio engine there, the system's own elsewhere.
+#[cfg(not(target_os = "windows"))]
+use crate::cpal_stream as device_stream;
+#[cfg(target_os = "windows")]
+use crate::wasapi as device_stream;
+pub use device_stream::UNDERRUNS;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -70,7 +75,7 @@ fn wake_player() {
 /// The names of the output devices Windows has active. This can take a while,
 /// so keep it off the UI thread.
 pub fn device_names() -> Vec<String> {
-    let mut names: Vec<String> = crate::wasapi::devices().into_iter().map(|device| device.name).collect();
+    let mut names: Vec<String> = device_stream::devices().into_iter().map(|device| device.name).collect();
     names.sort();
     names.dedup();
     names
@@ -255,7 +260,7 @@ fn clock_ms() -> u64 {
 pub fn set_paused(paused: bool) {
     PAUSED.store(paused, Ordering::SeqCst);
     if !paused {
-        wasapi::wake_streams();
+        device_stream::wake_streams();
     }
     wake_player();
 }
@@ -417,7 +422,7 @@ impl Iterator for OutputFeed {
     }
 }
 
-impl wasapi::Feed for OutputFeed {
+impl device_stream::Feed for OutputFeed {
     fn fill(&mut self, buffer: &mut [f32]) -> bool {
         let playing_before = !self.has_nothing_to_play();
         let chunks_before = self.chunks_taken;
@@ -439,7 +444,7 @@ impl wasapi::Feed for OutputFeed {
 
 /// An open stream on one device.
 struct Output {
-    stream: wasapi::Stream,
+    stream: device_stream::Stream,
     /// Windows' id for the device.
     device_id: String,
     /// Playing somewhere other than the chosen device, because that wasn't there.
@@ -449,13 +454,13 @@ struct Output {
 /// Opens the chosen device. If `may_fall_back`, music keeps playing through the
 /// Windows default, or failing that any device, when the chosen one can't open.
 fn open_output(chosen: &str, may_fall_back: bool, sink: u64) -> Result<Output> {
-    let devices = wasapi::devices();
+    let devices = device_stream::devices();
     let names: Vec<String> = devices.iter().map(|device| device.name.clone()).collect();
     let wanted = if chosen.is_empty() { None } else { find_device(chosen, &names) };
 
     let mut candidates: Vec<String> = wanted.map(|index| devices[index].id.clone()).into_iter().collect();
     if may_fall_back {
-        candidates.extend(wasapi::default_device_id());
+        candidates.extend(device_stream::default_device_id());
         candidates.extend(devices.into_iter().map(|device| device.id));
     }
 
@@ -475,7 +480,7 @@ fn open_output(chosen: &str, may_fall_back: bool, sink: u64) -> Result<Output> {
 }
 
 fn open_on(device_id: String, on_fallback: bool, sink: u64) -> Result<Output> {
-    let stream = wasapi::Stream::open(device_id.clone(), move |rate| OutputFeed::for_sink(rate, sink))?;
+    let stream = device_stream::Stream::open(device_id.clone(), move |rate| OutputFeed::for_sink(rate, sink))?;
     Ok(Output { stream, device_id, on_fallback })
 }
 
@@ -609,7 +614,7 @@ impl HighQualitySink {
             // headphones that just connected.
             self.last_default_check = Instant::now();
             let playing_on = self.output.as_ref().map(|output| output.device_id.as_str());
-            let default = wasapi::default_device_id();
+            let default = device_stream::default_device_id();
             // Once Windows moves on from a default that failed, it gets a fresh try if it
             // comes back.
             if self.unopenable_default.as_ref().is_some_and(|(id, _)| default.as_ref() != Some(id)) {
@@ -674,7 +679,7 @@ impl HighQualitySink {
                     // newer player has the pause, it isn't this one's to change.
                     drop(lock);
                     if self.while_current(|_| PAUSED.store(false, Ordering::SeqCst)) {
-                        wasapi::wake_streams();
+                        device_stream::wake_streams();
                         wake_player();
                     }
                     continue;
@@ -706,7 +711,7 @@ impl HighQualitySink {
             queue.push_back(end);
         }
         drop(queue);
-        wasapi::wake_streams();
+        device_stream::wake_streams();
     }
 
     /// Waits while the end of the music is still playing out.
@@ -785,7 +790,7 @@ impl Sink for HighQualitySink {
                 queue.push_back(resampled);
             }
             drop(queue);
-            wasapi::wake_streams();
+            device_stream::wake_streams();
         }
         self.wait_for_room(rate as usize * CHANNELS * BUFFER_MS / 1000);
         Ok(())
@@ -1054,7 +1059,7 @@ mod tests {
 
     #[test]
     fn the_feed_has_nothing_to_play_when_paused_or_out_of_audio() {
-        use wasapi::Feed;
+        use device_stream::Feed;
         let _controls = fresh_controls();
         let mut feed = OutputFeed::new(48_000);
         assert!(feed.has_nothing_to_play(), "nothing queued");
@@ -1092,19 +1097,19 @@ mod tests {
         for _ in 0..10 {
             sink.write(silence(), &mut converter).unwrap();
         }
-        assert_eq!(wasapi::resting_streams(), 0, "rested while it had audio");
+        assert_eq!(device_stream::resting_streams(), 0, "rested while it had audio");
 
         set_paused(true);
         sink.stop().unwrap();
         thread::sleep(Duration::from_millis(5_600));
-        assert_eq!(wasapi::resting_streams(), 1, "didn't rest while paused");
+        assert_eq!(device_stream::resting_streams(), 1, "didn't rest while paused");
         let held = QUEUED_SAMPLES.load(Ordering::SeqCst);
         assert!(held > 0, "the paused audio should wait for the resume");
 
         let resumed_at = Instant::now();
         set_paused(false);
         sink.start().unwrap();
-        while wasapi::resting_streams() > 0 {
+        while device_stream::resting_streams() > 0 {
             assert!(resumed_at.elapsed() < Duration::from_millis(50), "didn't wake");
             std::hint::spin_loop();
         }
@@ -1118,11 +1123,11 @@ mod tests {
         // The end of the music: everything plays out, then it rests again.
         sink.stop().unwrap();
         thread::sleep(Duration::from_millis(5_600));
-        assert_eq!(wasapi::resting_streams(), 1, "didn't rest with nothing to play");
+        assert_eq!(device_stream::resting_streams(), 1, "didn't rest with nothing to play");
         drop(sink);
         // Dropping the player ends a resting stream too.
         let dropped_at = Instant::now();
-        while wasapi::resting_streams() > 0 {
+        while device_stream::resting_streams() > 0 {
             assert!(dropped_at.elapsed() < Duration::from_millis(200), "a resting stream outlived its player");
             thread::sleep(Duration::from_millis(1));
         }
@@ -1267,7 +1272,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         drop(loopback);
         choose_device("");
-        println!("underruns: {}", wasapi::UNDERRUNS.load(Ordering::Relaxed));
+        println!("underruns: {}", device_stream::UNDERRUNS.load(Ordering::Relaxed));
 
         let changes = changes.lock().unwrap();
         for kind in ["pause", "mute", "resume", "unmute"] {

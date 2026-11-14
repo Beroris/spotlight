@@ -127,6 +127,8 @@ struct Drawer {
     gl: glow::Context,
     program: glow::Program,
     corners: glow::Buffer,
+    /// What the corners are drawn from, where OpenGL only draws from one.
+    vertex_array: Option<glow::VertexArray>,
     uniforms: Uniforms,
     target: Option<Target>,
     cover: Option<Cover>,
@@ -163,15 +165,27 @@ impl Drawer {
     unsafe fn new(get_proc_address: &dyn Fn(&CStr) -> *const c_void) -> Result<Self, String> {
         unsafe {
             let gl = glow::Context::from_loader_function_cstr(|name| get_proc_address(name));
-            let header = if gl.version().is_embedded {
-                "#version 100\n#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
-            } else {
-                "#version 120\n"
+            let version = gl.version();
+            // A Mac gives only OpenGL's core profile. It has newer names for what the shaders
+            // use, which these headers give them, and draws only from a vertex array.
+            let core = !version.is_embedded
+                && (version.major, version.minor) >= (3, 2)
+                && gl.get_parameter_i32(glow::CONTEXT_PROFILE_MASK) & glow::CONTEXT_CORE_PROFILE_BIT as i32 != 0;
+            let header = |kind: u32| {
+                if version.is_embedded {
+                    "#version 100\n#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+                } else if !core {
+                    "#version 120\n"
+                } else if kind == glow::VERTEX_SHADER {
+                    "#version 150\n#define attribute in\n#define varying out\n"
+                } else {
+                    "#version 150\n#define varying in\n#define texture2D texture\nout vec4 tilt_color;\n#define gl_FragColor tilt_color\n"
+                }
             };
             let program = gl.create_program()?;
             for (kind, body) in [(glow::VERTEX_SHADER, VERTEX), (glow::FRAGMENT_SHADER, FRAGMENT)] {
                 let shader = gl.create_shader(kind)?;
-                gl.shader_source(shader, &format!("{header}{body}"));
+                gl.shader_source(shader, &format!("{}{body}", header(kind)));
                 gl.compile_shader(shader);
                 if !gl.get_shader_compile_status(shader) {
                     let log = gl.get_shader_info_log(shader);
@@ -202,6 +216,18 @@ impl Drawer {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(corners));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &corner_bytes, glow::STATIC_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            let vertex_array = if core {
+                match gl.create_vertex_array() {
+                    Ok(vertex_array) => Some(vertex_array),
+                    Err(error) => {
+                        gl.delete_buffer(corners);
+                        gl.delete_program(program);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
             let at = |name: &str| gl.get_uniform_location(program, name);
             let uniforms = Uniforms {
                 turn_sin: at("turn_sin"),
@@ -215,7 +241,7 @@ impl Drawer {
                 radius: at("radius"),
                 shade: at("shade"),
             };
-            Ok(Self { gl, program, corners, uniforms, target: None, cover: None })
+            Ok(Self { gl, program, corners, vertex_array, uniforms, target: None, cover: None })
         }
     }
 
@@ -303,12 +329,21 @@ impl Drawer {
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(cover.texture));
+            // femtovg has its own vertex array bound, which gets it back afterwards.
+            let theirs = self.vertex_array.map(|ours| {
+                let theirs = gl.get_parameter_i32(glow::VERTEX_ARRAY_BINDING);
+                gl.bind_vertex_array(Some(ours));
+                theirs
+            });
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.corners));
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             gl.disable_vertex_attrib_array(0);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            if let Some(theirs) = theirs {
+                gl.bind_vertex_array(NonZeroU32::new(theirs as u32).map(glow::NativeVertexArray));
+            }
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.use_program(None);
         }

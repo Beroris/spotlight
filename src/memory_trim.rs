@@ -14,6 +14,9 @@
 //! a frame then pays about 1.5 microseconds for each page it writes, under 0.1 ms in all.
 //! While an animation or a scroll runs, only memory nearing 70 MB is trimmed.
 
+// Most of this is only called on Windows.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;

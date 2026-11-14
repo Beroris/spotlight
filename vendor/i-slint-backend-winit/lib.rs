@@ -35,6 +35,19 @@ use winitwindowadapter::*;
 pub fn keep_first_window_hidden() {
     KEEP_FIRST_WINDOW_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Spotlight: puts text on the clipboard, for systems where the app has no other way to.
+/// Call on the UI thread. Returns false before the first window is made.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn copy_to_clipboard(text: &str) -> bool {
+    i_slint_core::context::with_global_context(
+        || Err(i_slint_core::platform::PlatformError::NoPlatform),
+        |context| {
+            context.platform().set_clipboard_text(text, i_slint_core::platform::Clipboard::DefaultClipboard)
+        },
+    )
+    .is_ok()
+}
 pub(crate) mod event_loop;
 mod frame_throttle;
 #[cfg(target_os = "ios")]

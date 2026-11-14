@@ -20,13 +20,24 @@ fn is_portable_exe(exe: &std::path::Path) -> bool {
     exe.file_stem().is_some_and(|stem| stem.to_string_lossy().to_ascii_lowercase().contains("portable"))
 }
 
+/// The folder's name in the user's app data. A Mac has a Spotlight of its own, so there it goes
+/// by the app's full name, the one `scripts/package-macos.sh` gives the app. Linux keeps such
+/// folders in small letters, under `~/.local/share`.
+const DATA_FOLDER: &str = if cfg!(target_os = "macos") {
+    "com.beroris.spotlight"
+} else if cfg!(target_os = "linux") {
+    "spotlight"
+} else {
+    "Spotlight"
+};
+
 /// Where settings, the login and the cover cache live: in "Spotlight settings" beside the
 /// portable copy, and in the user's local app data otherwise.
 pub fn config_dir() -> Result<PathBuf> {
     let portable = std::env::current_exe().ok().filter(|exe| is_portable_exe(exe));
     let path = match portable.as_deref().and_then(std::path::Path::parent) {
         Some(beside) => beside.join("Spotlight settings"),
-        None => dirs::data_local_dir().context("LocalAppData directory not found")?.join("Spotlight"),
+        None => dirs::data_local_dir().context("LocalAppData directory not found")?.join(DATA_FOLDER),
     };
     fs::create_dir_all(&path)?;
     Ok(path)
@@ -56,11 +67,32 @@ pub fn load_config() -> Result<AppConfig> {
     Ok(cfg)
 }
 
+/// What this computer is called among Spotify's devices, until it's given another name.
+const DEVICE_NAME: &str = if cfg!(target_os = "macos") { "Spotlight Mac" } else { "Spotlight PC" };
+
+/// On Linux the name carries the computer's own, as in "Spotlight Mia", so that it can't be
+/// taken for the "Spotlight PC" in the same account's list.
+fn device_name() -> String {
+    if cfg!(target_os = "linux") {
+        let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        return device_name_for(&host);
+    }
+    DEVICE_NAME.into()
+}
+
+/// "Spotlight" and the computer's name, without anything after its first dot.
+fn device_name_for(host: &str) -> String {
+    match host.trim().split('.').next().unwrap_or_default() {
+        "" | "localhost" => "Spotlight Linux".into(),
+        name => format!("Spotlight {name}"),
+    }
+}
+
 /// The settings Spotlight starts with, and goes back to when its data is reset.
 pub fn new_config() -> AppConfig {
     AppConfig {
         redirect_uri: "http://127.0.0.1:5543/callback/".into(),
-        device_name: "Spotlight PC".into(),
+        device_name: device_name(),
         artwork_enabled: true,
         show_artist_column: true,
         show_time_column: true,
@@ -101,8 +133,9 @@ fn tidy_config(cfg: &mut AppConfig) {
     if cfg.redirect_uri.is_empty() {
         cfg.redirect_uri = "http://127.0.0.1:5543/callback/".into();
     }
-    if cfg.device_name.is_empty() {
-        cfg.device_name = "Spotlight PC".into();
+    // "Spotlight PC" is what the first Linux builds saved, before the name carried the computer's.
+    if cfg.device_name.is_empty() || (cfg!(target_os = "linux") && cfg.device_name == DEVICE_NAME) {
+        cfg.device_name = device_name();
     }
     if !matches!(cfg.theme_mode.as_str(), "Dark" | "Light" | "System") {
         cfg.theme_mode = "Dark".into();
@@ -272,10 +305,21 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn a_linux_device_is_named_after_its_computer() {
+        assert_eq!(device_name_for("Mia\n"), "Spotlight Mia");
+        assert_eq!(device_name_for("desk.home.example"), "Spotlight desk");
+        assert_eq!(device_name_for(""), "Spotlight Linux");
+        assert_eq!(device_name_for("localhost"), "Spotlight Linux");
+    }
+
+    #[test]
     fn only_a_copy_named_portable_keeps_its_settings_beside_itself() {
         assert!(is_portable_exe(Path::new(r"D:\Apps\Spotlight-1.0.0-Portable.exe")));
         assert!(is_portable_exe(Path::new(r"D:\Apps\spotlight portable.exe")));
         assert!(!is_portable_exe(Path::new(r"C:\Users\Me\AppData\Local\Programs\Spotlight\Spotlight.exe")));
+        #[cfg(target_os = "windows")]
         assert!(!is_portable_exe(Path::new(r"D:\Portable apps\Spotlight.exe")), "only the file's own name counts");
+        #[cfg(not(target_os = "windows"))]
+        assert!(!is_portable_exe(Path::new("/Portable apps/Spotlight.app/Contents/MacOS/Spotlight")), "only the file's own name counts");
     }
 }
