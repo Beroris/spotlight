@@ -5,47 +5,44 @@
 //! the app. All of this reacts to window messages and nothing polls: a scroll
 //! takes one step per frame the monitor shows, and stops when it has settled.
 
+// Most of this is only called on Windows.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
+#[cfg(not(target_os = "macos"))]
 use slint::ComponentHandle;
 
+#[cfg(not(target_os = "macos"))]
 use crate::AppWindow;
 
-#[cfg(target_os = "windows")]
-pub use imp::*;
+#[cfg(target_os = "macos")]
+#[path = "window_chrome_macos.rs"]
+mod imp;
 
-#[cfg(not(target_os = "windows"))]
-pub fn install(_ui: &AppWindow) -> bool { true }
-#[cfg(not(target_os = "windows"))]
-pub fn set_smooth_scrolling(_enabled: bool) {}
-#[cfg(not(target_os = "windows"))]
-pub fn set_caption_layout(_search_left: f32, _search_right: f32, _back_visible: bool, _connect_visible: bool) {}
-#[cfg(not(target_os = "windows"))]
-pub fn minimize() {}
-#[cfg(not(target_os = "windows"))]
-pub fn close() {}
-#[cfg(not(target_os = "windows"))]
-pub fn install_frame_driver(_ui: &AppWindow) {}
-#[cfg(not(target_os = "windows"))]
-pub fn sync_hover_to_pointer(_ui: &AppWindow) {}
-#[cfg(not(target_os = "windows"))]
-pub fn listen_for_shortcut(_listen: bool) {}
-#[cfg(not(target_os = "windows"))]
-pub fn center_on_screen(_ui: &AppWindow) {}
-#[cfg(not(target_os = "windows"))]
-pub fn copy_text(_text: &str) -> bool { false }
-#[cfg(not(target_os = "windows"))]
-pub fn enter_mini(_on_top: bool, _saved: Option<(i32, i32)>) -> bool { false }
-#[cfg(not(target_os = "windows"))]
-pub fn leave_mini() -> Option<(i32, i32)> { None }
-#[cfg(not(target_os = "windows"))]
-pub fn set_mini_on_top(_on_top: bool) {}
-#[cfg(not(target_os = "windows"))]
-pub fn in_mini() -> bool { false }
-#[cfg(not(target_os = "windows"))]
-pub fn quit_running() {}
-#[cfg(not(target_os = "windows"))]
-pub fn show_running() {}
-#[cfg(not(target_os = "windows"))]
-pub fn handle() -> isize { 0 }
+/// Anywhere else the window keeps the frame its system gives it.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+mod imp {
+    use super::*;
+
+    pub fn install(_ui: &AppWindow) -> bool { true }
+    pub fn set_smooth_scrolling(_enabled: bool) {}
+    pub fn set_caption_layout(_search_left: f32, _search_right: f32, _back_visible: bool, _connect_visible: bool) {}
+    pub fn minimize() {}
+    pub fn close() {}
+    pub fn install_frame_driver(_ui: &AppWindow) {}
+    pub fn sync_hover_to_pointer(_ui: &AppWindow) {}
+    pub fn listen_for_shortcut(_listen: bool) {}
+    pub fn center_on_screen(_ui: &AppWindow) {}
+    pub fn copy_text(_text: &str) -> bool { false }
+    pub fn enter_mini(_on_top: bool, _saved: Option<(i32, i32)>) -> bool { false }
+    pub fn leave_mini() -> Option<(i32, i32)> { None }
+    pub fn set_mini_on_top(_on_top: bool) {}
+    pub fn in_mini() -> bool { false }
+    pub fn quit_running() {}
+    pub fn show_running() {}
+    pub fn handle() -> isize { 0 }
+}
+
+pub use imp::*;
 
 /// The mini player's size in logical px. `ui/app.slint` lays it out the same way.
 pub const MINI_WIDTH: f32 = 420.0;

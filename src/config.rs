@@ -20,13 +20,17 @@ fn is_portable_exe(exe: &std::path::Path) -> bool {
     exe.file_stem().is_some_and(|stem| stem.to_string_lossy().to_ascii_lowercase().contains("portable"))
 }
 
+/// The folder's name in the user's app data. A Mac has a Spotlight of its own, so there it goes
+/// by the app's full name, the one `scripts/package-macos.sh` gives the app.
+const DATA_FOLDER: &str = if cfg!(target_os = "macos") { "com.beroris.spotlight" } else { "Spotlight" };
+
 /// Where settings, the login and the cover cache live: in "Spotlight settings" beside the
 /// portable copy, and in the user's local app data otherwise.
 pub fn config_dir() -> Result<PathBuf> {
     let portable = std::env::current_exe().ok().filter(|exe| is_portable_exe(exe));
     let path = match portable.as_deref().and_then(std::path::Path::parent) {
         Some(beside) => beside.join("Spotlight settings"),
-        None => dirs::data_local_dir().context("LocalAppData directory not found")?.join("Spotlight"),
+        None => dirs::data_local_dir().context("LocalAppData directory not found")?.join(DATA_FOLDER),
     };
     fs::create_dir_all(&path)?;
     Ok(path)
@@ -56,11 +60,14 @@ pub fn load_config() -> Result<AppConfig> {
     Ok(cfg)
 }
 
+/// What this computer is called among Spotify's devices, until it's given another name.
+const DEVICE_NAME: &str = if cfg!(target_os = "macos") { "Spotlight Mac" } else { "Spotlight PC" };
+
 /// The settings Spotlight starts with, and goes back to when its data is reset.
 pub fn new_config() -> AppConfig {
     AppConfig {
         redirect_uri: "http://127.0.0.1:5543/callback/".into(),
-        device_name: "Spotlight PC".into(),
+        device_name: DEVICE_NAME.into(),
         artwork_enabled: true,
         show_artist_column: true,
         show_time_column: true,
@@ -102,7 +109,7 @@ fn tidy_config(cfg: &mut AppConfig) {
         cfg.redirect_uri = "http://127.0.0.1:5543/callback/".into();
     }
     if cfg.device_name.is_empty() {
-        cfg.device_name = "Spotlight PC".into();
+        cfg.device_name = DEVICE_NAME.into();
     }
     if !matches!(cfg.theme_mode.as_str(), "Dark" | "Light" | "System") {
         cfg.theme_mode = "Dark".into();

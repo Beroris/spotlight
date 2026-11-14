@@ -13,8 +13,11 @@ fn main() {
         .join()
         .expect("slint compiler thread panicked");
 
+    // This runs on the computer that builds, which could be building for another system.
     #[cfg(target_os = "windows")]
-    embed_windows_icon().expect("embed windows icon");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_windows_icon().expect("embed windows icon");
+    }
 }
 
 #[cfg(target_os = "windows")]

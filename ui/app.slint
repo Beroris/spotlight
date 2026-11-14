@@ -2802,6 +2802,18 @@ export component AppWindow inherits Window {
     in-out property <bool> toast_error: false;
     in-out property <bool> toast_visible: false;
     in-out property <bool> window_maximized: false;
+    // Running on a Mac, which draws the window's own three buttons at the left of the top bar,
+    // moves the window by the bar's empty parts, and has its own names for things.
+    in property <bool> is_mac: false;
+    // The Mac's full screen, which has none of those buttons.
+    in property <bool> mac_full_screen: false;
+    property <bool> mac-buttons-shown: root.is_mac && !root.mac_full_screen;
+    property <string> this-computer: root.is_mac ? "this Mac" : "this PC";
+    property <string> default-device-label: root.is_mac ? "System default" : "Windows default";
+    // The key that goes with a letter for a shortcut, as in "Ctrl+K".
+    property <string> command-key: root.is_mac ? "⌘" : "Ctrl+";
+    // A press on an empty part of the top bar or of the mini player, for the Mac to move the window by.
+    callback drag_window();
     // Minimized or in the tray. Slint still draws frames for such a window, so moving parts stop.
     in-out property <bool> window_hidden: false;
     in-out property <bool> caption_max_hover: false;
@@ -3067,7 +3079,7 @@ export component AppWindow inherits Window {
     // A list page opened from Home goes back there.
     property <bool> back-to-home: false;
     property <string> output-label: root.active_device_name == "" ? "No active device"
-        : (root.active_device_name == root.local_device_name ? "This PC" : root.active_device_name);
+        : (root.active_device_name == root.local_device_name ? (root.is_mac ? "This Mac" : "This PC") : root.active_device_name);
     property <length> row-height: 48px;
     property <bool> reset-armed: false;
     property <int> suggestion-count: root.search_suggestions.length + 1;
@@ -3556,10 +3568,18 @@ export component AppWindow inherits Window {
                 cache-rendering-hint: AppTheme.can-cache;
                 CacheAnchor { }
 
+                // The bar's own controls lie over this, so they take their presses first.
+                if root.is_mac : TouchArea {
+                    pointer-event(event) => {
+                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                            root.drag_window();
+                        }
+                    }
+                }
 
                 HorizontalLayout {
-                    padding-left: 12px;
-                    padding-right: 146px;
+                    padding-left: root.mac-buttons-shown ? 88px : 12px;
+                    padding-right: root.is_mac ? 12px : 146px;
                     padding-top: 8px;
                     padding-bottom: 8px;
                     spacing: 8px;
@@ -3677,7 +3697,7 @@ export component AppWindow inherits Window {
                                     if root.search_query == "" : Text {
                                         x: 0px;
                                         width: parent.width;
-                                        text: "Search songs or jump to a playlist   Ctrl+K";
+                                        text: "Search songs or jump to a playlist   " + root.command-key + "K";
                                         color: AppTheme.muted-text;
                                         font-size: 14px;
                                         horizontal-alignment: left;
@@ -3770,13 +3790,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                CaptionButton {
+                if !root.is_mac : CaptionButton {
                     x: parent.width - 138px;
                     y: 0px;
                     commands: "M1 6 L11 6";
                     clicked => { root.minimize_window(); }
                 }
-                CaptionButton {
+                if !root.is_mac : CaptionButton {
                     x: parent.width - 92px;
                     y: 0px;
                     commands: root.window_maximized
@@ -3786,7 +3806,7 @@ export component AppWindow inherits Window {
                     external-hover: root.caption_max_hover;
                     external-pressed: root.caption_max_pressed;
                 }
-                CaptionButton {
+                if !root.is_mac : CaptionButton {
                     x: parent.width - 46px;
                     y: 0px;
                     danger: true;
@@ -4537,7 +4557,7 @@ export component AppWindow inherits Window {
                                                     width: parent.width;
                                                     height: parent.height;
                                                     vertical-alignment: center;
-                                                    text: "Filter   Ctrl+F";
+                                                    text: "Filter   " + root.command-key + "F";
                                                     color: AppTheme.subtle-text;
                                                     font-size: 13px;
                                                     horizontal-alignment: left;
@@ -5961,7 +5981,7 @@ export component AppWindow inherits Window {
                                                     : root.update_note != "" ? root.update_note
                                                     : "New versions come from Spotlight's page on GitHub.";
                                                 control-width: 120px;
-                                                TextButton {
+                                                if !root.is_mac : TextButton {
                                                     x: 120px - self.width;
                                                     text: root.update_busy == "checking" ? "Checking…" : "Check now";
                                                     enabled: root.update_busy == "";
@@ -5969,16 +5989,16 @@ export component AppWindow inherits Window {
                                                     clicked => { root.check_for_update(); }
                                                 }
                                             }
-                                            SettingToggle { label: "Check for updates"; description: "Look for a new version when Spotlight opens, and once a day."; checked <=> root.check_for_updates; toggled => { root.save_settings(); } }
+                                            if !root.is_mac : SettingToggle { label: "Check for updates"; description: "Look for a new version when Spotlight opens, and once a day."; checked <=> root.check_for_updates; toggled => { root.save_settings(); } }
 
-                                            SettingToggle { label: "Minimize to tray"; description: "Keep running in the tray when minimized."; checked <=> root.minimize_to_tray; toggled => { root.save_settings(); } }
-                                            SettingToggle { label: "Close to tray"; description: "The close button hides the window instead of quitting."; checked <=> root.close_to_tray; toggled => { root.save_settings(); } }
+                                            if !root.is_mac : SettingToggle { label: "Minimize to tray"; description: "Keep running in the tray when minimized."; checked <=> root.minimize_to_tray; toggled => { root.save_settings(); } }
+                                            if !root.is_mac : SettingToggle { label: "Close to tray"; description: "The close button hides the window instead of quitting."; checked <=> root.close_to_tray; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Start minimized"; description: "Open quietly in the background."; checked <=> root.start_minimized; toggled => { root.save_settings(); } }
-                                            SettingToggle { label: "Start in the tray at sign-in"; description: "When Spotlight starts with Windows, it waits in the tray."; checked <=> root.tray_at_sign_in; toggled => { root.save_settings(); } }
+                                            if !root.is_mac : SettingToggle { label: "Start in the tray at sign-in"; description: "When Spotlight starts with Windows, it waits in the tray."; checked <=> root.tray_at_sign_in; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Save resources in the background"; description: "Check Spotify less often when Spotlight isn't in front."; checked <=> root.low_resource_mode; toggled => { root.save_settings(); } }
                                             SettingRow {
                                                 label: "Saved covers";
-                                                description: root.cover_cache_note != "" ? root.cover_cache_note : "Album covers kept on this PC, so they show at once.";
+                                                description: root.cover_cache_note != "" ? root.cover_cache_note : "Album covers kept on " + root.this-computer + ", so they show at once.";
                                                 control-width: 96px;
                                                 TextButton {
                                                     text: "Clear";
@@ -5997,7 +6017,7 @@ export component AppWindow inherits Window {
 
                                             SettingRow {
                                                 label: "Output device";
-                                                description: root.output_device_missing ? "Not connected right now, so Spotlight is using the Windows default." : "Where Spotlight plays, whatever Windows is set to.";
+                                                description: root.output_device_missing ? (root.is_mac ? "Not connected right now, so Spotlight is using the Mac's own choice." : "Not connected right now, so Spotlight is using the Windows default.") : (root.is_mac ? "Where Spotlight plays, whatever the Mac is set to." : "Where Spotlight plays, whatever Windows is set to.");
                                                 control-width: 290px;
                                                 clickable: true;
                                                 clicked => {
@@ -6013,7 +6033,7 @@ export component AppWindow inherits Window {
                                                     device-label := Text {
                                                         x: 14px;
                                                         width: parent.width - 42px;
-                                                        text: root.output_device == "" ? "Windows default" : root.output_device;
+                                                        text: root.output_device == "" ? root.default-device-label : root.output_device;
                                                         color: AppTheme.text;
                                                         font-size: 12px;
                                                         font-weight: 600;
@@ -6053,7 +6073,7 @@ export component AppWindow inherits Window {
                                                                 spacing: 2px;
                                                                 alignment: start;
                                                                 MenuItem {
-                                                                    text: "Windows default";
+                                                                    text: root.default-device-label;
                                                                     hint: root.output_device == "" ? "✓" : "";
                                                                     clicked => {
                                                                         // Last: closing destroys this row and its name.
@@ -6114,7 +6134,7 @@ export component AppWindow inherits Window {
 
                                             SettingSegments {
                                                 label: "Theme";
-                                                description: "Follow Windows, or stay dark or light.";
+                                                description: root.is_mac ? "Follow the Mac, or stay dark or light." : "Follow Windows, or stay dark or light.";
                                                 options: ["System", "Dark", "Light"];
                                                 selected: root.theme_mode == "System" ? 0 : (root.theme_mode == "Dark" ? 1 : 2);
                                                 chosen(index) => {
@@ -6156,9 +6176,9 @@ export component AppWindow inherits Window {
                                             scroll-y: settings-scroll.viewport-y;
                                             view-height: settings-scroll.visible-height;
 
-                                            SettingToggle { label: "Media keys"; description: "Show the song in Windows' media controls, so play and skip keys reach Spotlight when it played last."; checked <=> root.media_keys_enabled; toggled => { root.save_settings(); } }
-                                            SettingToggle { label: "Shortcuts in the background"; description: "The keys below work even when Spotlight isn't in front."; checked <=> root.global_hotkeys; toggled => { root.save_settings(); } }
-                                            SettingRow {
+                                            SettingToggle { label: "Media keys"; description: root.is_mac ? "Show the song in the Mac's Now Playing, so play and skip keys reach Spotlight when it played last." : "Show the song in Windows' media controls, so play and skip keys reach Spotlight when it played last."; checked <=> root.media_keys_enabled; toggled => { root.save_settings(); } }
+                                            if !root.is_mac : SettingToggle { label: "Shortcuts in the background"; description: "The keys below work even when Spotlight isn't in front."; checked <=> root.global_hotkeys; toggled => { root.save_settings(); } }
+                                            if !root.is_mac : SettingRow {
                                                 label: "Play or pause";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6170,7 +6190,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("play-pause"); }
                                                 }
                                             }
-                                            SettingRow {
+                                            if !root.is_mac : SettingRow {
                                                 label: "Next song";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6182,7 +6202,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("next"); }
                                                 }
                                             }
-                                            SettingRow {
+                                            if !root.is_mac : SettingRow {
                                                 label: "Previous song";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6194,7 +6214,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("previous"); }
                                                 }
                                             }
-                                            SettingRow {
+                                            if !root.is_mac : SettingRow {
                                                 label: "Shuffle";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6206,7 +6226,7 @@ export component AppWindow inherits Window {
                                                     clicked => { root.record_shortcut("shuffle"); }
                                                 }
                                             }
-                                            SettingRow {
+                                            if !root.is_mac : SettingRow {
                                                 label: "Repeat";
                                                 control-width: 170px;
                                                 ShortcutField {
@@ -6234,15 +6254,15 @@ export component AppWindow inherits Window {
                                                 height: 5 * 36px + 8px;
                                                 for hint[i] in [
                                                     { action: "Play or pause", keys: "Space" },
-                                                    { action: "Search", keys: "Ctrl+K" },
-                                                    { action: "Filter the list", keys: "Ctrl+F" },
+                                                    { action: "Search", keys: root.command-key + "K" },
+                                                    { action: "Filter the list", keys: root.command-key + "F" },
                                                     { action: "Move through songs", keys: "↑  ↓" },
                                                     { action: "Play the selected song", keys: "Enter" },
                                                     { action: "Play it next", keys: "Shift+Enter" },
-                                                    { action: "Next or previous song", keys: "Ctrl+→  Ctrl+←" },
-                                                    { action: "Volume", keys: "Ctrl+↑  Ctrl+↓" },
-                                                    { action: "Go back", keys: "Esc  Alt+←" },
-                                                    { action: "Open Settings", keys: "Ctrl+," },
+                                                    { action: "Next or previous song", keys: root.command-key + "→  " + root.command-key + "←" },
+                                                    { action: "Volume", keys: root.command-key + "↑  " + root.command-key + "↓" },
+                                                    { action: "Go back", keys: root.is_mac ? "Esc  ⌥←" : "Esc  Alt+←" },
+                                                    { action: "Open Settings", keys: root.command-key + "," },
                                                 ] : Rectangle {
                                                     x: mod(i, 2) * floor(keys-grid.width / 2 / 1phx) * 1phx;
                                                     y: 4px + floor(i / 2) * 36px;
@@ -6336,7 +6356,7 @@ export component AppWindow inherits Window {
                                             }
                                             SettingRow {
                                                 label: "Reset app data";
-                                                description: "Erases your settings and sign-in on this PC.";
+                                                description: "Erases your settings and sign-in on " + root.this-computer + ".";
                                                 control-width: 170px;
                                                 TextButton {
                                                     x: 170px - self.width;
@@ -6446,9 +6466,9 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 12px;
                             for point in [
-                                { title: "Quick", text: "Made for Windows, with no browser inside, so every click lands at once." },
+                                { title: "Quick", text: root.is_mac ? "Made for the desktop, with no browser inside, so every click lands at once." : "Made for Windows, with no browser inside, so every click lands at once." },
                                 { title: "Light", text: "Next to no memory or CPU while the music plays, and less when it's hidden." },
-                                { title: "At home in Windows", text: "Media keys, the lock screen, a mini player and taskbar buttons." },
+                                { title: root.is_mac ? "At home on the Mac" : "At home in Windows", text: root.is_mac ? "Media keys, Now Playing and a mini player." : "Media keys, the lock screen, a mini player and taskbar buttons." },
                             ] : HorizontalLayout {
                                 spacing: 12px;
                                 VerticalLayout {
@@ -6632,7 +6652,7 @@ export component AppWindow inherits Window {
                                     Text {
                                         text: root.signed_in && !root.connect-busy ? "You're connected."
                                             : root.connect_stage == "library" ? "Agree in your browser to let Spotlight in."
-                                            : root.connect_stage == "player" ? "One more: agree again so Spotlight can play music on this PC."
+                                            : root.connect_stage == "player" ? "One more: agree again so Spotlight can play music on " + root.this-computer + "."
                                             : "Couldn't connect.";
                                         color: AppTheme.text;
                                         font-size: 13px;
@@ -6640,7 +6660,7 @@ export component AppWindow inherits Window {
                                         wrap: word-wrap;
                                     }
                                     Text {
-                                        text: root.signed_in && !root.connect-busy ? (root.player_ready ? "Your library is here, and music plays on this PC." : "Your library is here. Playing on this PC is set up the first time you press play.")
+                                        text: root.signed_in && !root.connect-busy ? (root.player_ready ? "Your library is here, and music plays on " + root.this-computer + "." : "Your library is here. Playing on " + root.this-computer + " is set up the first time you press play.")
                                             : root.connect_stage == "library" ? "Seeing an error from Spotify instead? Check the Client ID, and that the Redirect URI matches exactly."
                                             : root.connect_stage == "player" ? "This second sign-in is Spotify's own, for its player."
                                             : root.connect_error;
@@ -6662,7 +6682,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         if !root.signed_in && root.connect_stage == "" : Text {
-                            text: "Your browser opens twice: once to let Spotlight see your music, and once to play it on this PC.";
+                            text: "Your browser opens twice: once to let Spotlight see your music, and once to play it on " + root.this-computer + ".";
                             color: AppTheme.muted-text;
                             font-size: 12px;
                             wrap: word-wrap;
@@ -6742,7 +6762,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                SettingToggle {
+                                if !root.is_mac : SettingToggle {
                                     label: "Keep playing when closed";
                                     description: "The close button tucks Spotlight into the tray.";
                                     checked <=> root.close_to_tray;
@@ -6758,7 +6778,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: 16px; }
                         if !root.player_ready : Text {
-                            text: "Playing on this PC isn't set up yet. Spotlight asks the first time you press play here.";
+                            text: "Playing on " + root.this-computer + " isn't set up yet. Spotlight asks the first time you press play here.";
                             color: AppTheme.muted-text;
                             font-size: 12px;
                             wrap: word-wrap;
@@ -6767,7 +6787,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 18px;
                             alignment: start;
-                            GuideTip { keys: ["Ctrl", "K"]; text: "Search"; }
+                            GuideTip { keys: [root.is_mac ? "⌘" : "Ctrl", "K"]; text: "Search"; }
                             GuideTip { keys: ["Space"]; text: "Play or pause"; }
                             GuideTip { keys: ["Right-click"]; text: "More for any song"; }
                         }
@@ -6818,6 +6838,15 @@ export component AppWindow inherits Window {
                 return accept;
             }
             return reject;
+        }
+
+        // Its buttons and the seek strip lie over this, so they take their presses first.
+        if root.is_mac : TouchArea {
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                    root.drag_window();
+                }
+            }
         }
 
         CrossfadeArt {

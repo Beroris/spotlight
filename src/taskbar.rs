@@ -2,6 +2,9 @@
 //! taskbar button. The icons are drawn here, at the size Windows asks for, so they are sharp
 //! at any scale and nothing extra ships with the app.
 
+// Most of this is only called on Windows.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 /// The shapes, in a 16 by 16 square.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Glyph {

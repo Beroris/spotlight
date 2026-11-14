@@ -14,6 +14,10 @@ use global_hotkey::{
 };
 use tokio::sync::mpsc;
 
+/// Whether the shortcuts from Settings are on offer. Not on a Mac yet, where a box in Settings
+/// has no way to hear a new one being pressed. Its media keys work through Now Playing.
+pub const OFFERED_HERE: bool = cfg!(not(target_os = "macos"));
+
 #[derive(Clone, Copy, Debug)]
 pub enum MediaCommand {
     PlayPause,

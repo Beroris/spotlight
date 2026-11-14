@@ -303,7 +303,13 @@ where
 {
 }
 
-#[cfg(not(target_os = "windows"))]
+/// A Mac has no tray to go to: the app hides, and its place in the Dock brings it back.
+#[cfg(target_os = "macos")]
+pub fn hide_spotlight_window() {
+    crate::window_chrome::hide_app();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn hide_spotlight_window() {}
 
 #[cfg(target_os = "windows")]

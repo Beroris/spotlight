@@ -6,6 +6,9 @@
 //! choice. The entry starts switched off: adding it shouldn't change what happens at
 //! the next sign-in by itself.
 
+// Most of this is only called on Windows.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},

@@ -7,6 +7,8 @@ mod art_tilt;
 mod audio_output;
 mod auth;
 mod config;
+#[cfg(not(target_os = "windows"))]
+mod cpal_stream;
 mod crash_restart;
 mod history;
 mod home;
@@ -22,6 +24,7 @@ mod startup_entry;
 mod taskbar;
 mod tray;
 mod updates;
+#[cfg(target_os = "windows")]
 mod wasapi;
 mod window_chrome;
 
@@ -368,7 +371,7 @@ fn main() -> Result<()> {
         startup_entry::register();
     }
     let at_sign_in = std::env::args().skip(1).any(|arg| arg == startup_entry::AT_SIGN_IN_ARG);
-    let instance = SingleInstance::new("SpotlightDesktopSingleton").context("single-instance init failed")?;
+    let instance = SingleInstance::new(&single_instance_name()).context("single-instance init failed")?;
     if !instance.is_single() {
         // Opening it again brings back the copy that's running, even from the tray. Windows
         // starting it at sign-in hasn't been asked to show anything.
@@ -487,9 +490,12 @@ fn main() -> Result<()> {
         account_asked_at: None,
     }));
 
+    #[cfg(target_os = "macos")]
+    window_chrome::prepare()?;
     let ui = AppWindow::new()?;
     #[cfg(target_os = "windows")]
     apply_runtime_window_icon();
+    ui.set_is_mac(cfg!(target_os = "macos"));
     {
         let guard = state.lock().unwrap();
         ui.set_client_id(guard.config.client_id.clone().into());
@@ -586,7 +592,7 @@ fn main() -> Result<()> {
         let guard = state.lock().unwrap();
         let bindings = hotkey_bindings(&guard.config);
         media_controls::set_enabled(guard.config.media_keys_enabled);
-        if guard.config.global_hotkeys {
+        if guard.config.global_hotkeys && media_keys::OFFERED_HERE {
             match MediaKeyGuard::install(media_tx.clone(), &bindings) {
                 Ok(installed) => {
                     ui.set_hotkey_warning(installed.warnings.join("\n").into());
@@ -633,7 +639,8 @@ fn main() -> Result<()> {
             let hide_to_tray = ui_wants_tray
                 .map(|enabled| enabled || config_wants_tray)
                 .unwrap_or(config_wants_tray);
-            if hide_to_tray {
+            // On a Mac the red button always only puts the window away. Quit is in the menu.
+            if hide_to_tray || cfg!(target_os = "macos") {
                 tray::ensure_started();
                 tray::hide_spotlight_window();
                 CloseRequestResponse::KeepWindowShown
@@ -651,7 +658,7 @@ fn main() -> Result<()> {
         media_tx,
         Arc::clone(&hotkeys_guard),
     );
-    bind_updates(&ui, &runtime, spotify_api.http().clone(), state.lock().unwrap().config.check_for_updates);
+    bind_updates(&ui, &runtime, spotify_api.http().clone(), state.lock().unwrap().config.check_for_updates && updates::OFFERED_HERE);
 
     {
         let ui_weak = ui.as_weak();
@@ -1048,6 +1055,8 @@ fn main() -> Result<()> {
         ui.on_caption_layout(window_chrome::set_caption_layout);
         ui.on_minimize_window(window_chrome::minimize);
         ui.on_close_window(window_chrome::close);
+        #[cfg(target_os = "macos")]
+        ui.on_drag_window(window_chrome::start_drag);
 
         let ui_weak = ui.as_weak();
         ui.on_stage_tilt_redraw(move || {
@@ -1259,7 +1268,11 @@ fn system_prefers_light() -> bool {
         };
         status == 0 && value == 1
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        window_chrome::system_is_light()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     false
 }
 
@@ -1338,7 +1351,7 @@ fn bind_callbacks(
                     guard.config.log_level = ui.get_log_level().to_string();
                     guard.config.developer_mode = ui.get_developer_mode();
                     guard.config.check_for_updates = ui.get_check_for_updates();
-                    UPDATE_AUTO_CHECK.store(guard.config.check_for_updates, Ordering::Relaxed);
+                    UPDATE_AUTO_CHECK.store(guard.config.check_for_updates && updates::OFFERED_HERE, Ordering::Relaxed);
                     config::save_config_background(&guard.config);
                     let settings_now = SettingsInEffect::of(&guard.config);
                     // The sidebar's rows are made again only when how they look changed.
@@ -1401,7 +1414,7 @@ fn bind_callbacks(
                     if media_controls::set_enabled(ui.get_media_keys_enabled()) {
                         now_playing_changed(&ui, &state);
                     }
-                    if ui.get_global_hotkeys() {
+                    if ui.get_global_hotkeys() && media_keys::OFFERED_HERE {
                         let bindings = hotkey_bindings(&state.lock().unwrap().config);
                         match MediaKeyGuard::install(media_tx.clone(), &bindings) {
                             Ok(guard) => {
@@ -8761,7 +8774,7 @@ fn watch_play(state: &Arc<Mutex<AppState>>, track_uri: &str, position_ms: u32) {
 /// gap. Each time, Windows is kept a little more ahead, so it shouldn't happen again soon.
 fn note_audio_dropouts(ui_weak: &slint::Weak<AppWindow>) {
     static NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let total = wasapi::UNDERRUNS.load(std::sync::atomic::Ordering::Relaxed);
+    let total = audio_output::UNDERRUNS.load(std::sync::atomic::Ordering::Relaxed);
     let new = total.saturating_sub(NOTED.swap(total, std::sync::atomic::Ordering::Relaxed));
     if new == 0 {
         return;
@@ -9291,10 +9304,32 @@ fn should_show_log(level: &str, message: &str) -> bool {
 }
 
 /// The time of day on this PC's clock, for the log.
+#[cfg(target_os = "windows")]
 fn chrono_like_time() -> String {
     let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
     format!("{:02}:{:02}:{:02}", now.wHour, now.wMinute, now.wSecond)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn chrono_like_time() -> String {
+    let mut now: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        let seconds = libc::time(std::ptr::null_mut());
+        libc::localtime_r(&seconds, &mut now);
+    }
+    format!("{:02}:{:02}:{:02}", now.tm_hour, now.tm_min, now.tm_sec)
+}
+
+/// What tells a second copy of Spotlight that one is already running. On Windows it's a name
+/// every copy knows. Anywhere else it's a file only one copy can hold, which goes with the
+/// settings, as the folder an app opens in isn't one it can write to.
+fn single_instance_name() -> String {
+    if cfg!(target_os = "windows") {
+        return "SpotlightDesktopSingleton".to_string();
+    }
+    let folder = config::config_dir().unwrap_or_else(|_| std::env::temp_dir());
+    folder.join("running.lock").to_string_lossy().into_owned()
 }
 
 #[cfg(target_os = "windows")]
@@ -9315,11 +9350,17 @@ fn spotlight_window_is_foreground() -> bool {
     foreground == hwnd
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn spotlight_window_is_foreground() -> bool {
+    window_chrome::is_front()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn spotlight_window_is_foreground() -> bool {
     true
 }
 
+#[cfg(target_os = "windows")]
 static SPOTLIGHT_WINDOW_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
@@ -9341,7 +9382,12 @@ fn toggle_spotlight_window_maximized() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn toggle_spotlight_window_maximized() {
+    window_chrome::toggle_full_screen();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn toggle_spotlight_window_maximized() {}
 
 #[cfg(target_os = "windows")]

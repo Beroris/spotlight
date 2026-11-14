@@ -4292,6 +4292,7 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.0",
  "block2 0.6.2",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
 ]
@@ -4327,6 +4328,20 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-media-player"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85f2a98483f6e76313cb85a5a185eaa3cda86a177b13a8852d56cbd0085bf635"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -6293,18 +6308,25 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "block2 0.6.2",
+ "cpal",
  "dirs",
  "global-hotkey",
  "glow",
  "i-slint-backend-winit",
  "ico",
  "image",
+ "libc",
  "librespot",
  "librespot-connect",
  "librespot-core",
  "librespot-oauth",
  "librespot-playback",
  "mimalloc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-media-player",
  "rand 0.8.6",
  "reqwest",
  "rodio",
