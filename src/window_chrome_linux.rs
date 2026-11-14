@@ -157,10 +157,20 @@ fn only_other_cards_have_screens(drivers: &[Option<String>]) -> bool {
     !drivers.is_empty() && drivers.iter().all(|driver| driver.as_deref().is_some_and(|driver| !driver.starts_with("nvidia")))
 }
 
+/// Mesa hands drawing to a second thread for some graphics cards. For a window this light
+/// the hand-over costs more than it saves: scrolling took about a tenth more processor time
+/// with it. A setting the user made themselves is left alone.
+fn draw_on_one_thread() {
+    if std::env::var_os("mesa_glthread").is_none() {
+        std::env::set_var("mesa_glthread", "false");
+    }
+}
+
 /// Asks for a window with no frame of the desktop's, known to it by Spotlight's name. Call
 /// before the window is made.
 pub fn prepare() -> Result<(), slint::PlatformError> {
     skip_an_unused_nvidia_library();
+    draw_on_one_thread();
     let backend = i_slint_backend_winit::Backend::builder()
         .with_window_attributes_hook(|attributes| attributes.with_decorations(false).with_name(APP_ID, APP_ID))
         .build()?;
