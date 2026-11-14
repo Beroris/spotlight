@@ -357,6 +357,9 @@ fn utc_timestamp(time: std::time::SystemTime) -> String {
 }
 
 fn main() -> Result<()> {
+    // Before anything starts a thread.
+    #[cfg(target_os = "linux")]
+    window_chrome::choose_graphics_setup();
     keep_crash_log();
     if std::env::args().skip(1).any(|arg| arg == "--quit") {
         // The installer asks a running Spotlight to quit before it replaces or removes it.

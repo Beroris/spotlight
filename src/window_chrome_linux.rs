@@ -166,11 +166,16 @@ fn draw_on_one_thread() {
     }
 }
 
+/// Settles how the graphics libraries will be loaded. Call first thing in `main`, while the
+/// app is still one thread: changing the environment while another thread reads it isn't safe.
+pub fn choose_graphics_setup() {
+    skip_an_unused_nvidia_library();
+    draw_on_one_thread();
+}
+
 /// Asks for a window with no frame of the desktop's, known to it by Spotlight's name. Call
 /// before the window is made.
 pub fn prepare() -> Result<(), slint::PlatformError> {
-    skip_an_unused_nvidia_library();
-    draw_on_one_thread();
     let backend = i_slint_backend_winit::Backend::builder()
         .with_window_attributes_hook(|attributes| attributes.with_decorations(false).with_name(APP_ID, APP_ID))
         .build()?;
