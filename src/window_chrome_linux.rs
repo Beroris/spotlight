@@ -114,9 +114,53 @@ fn with_window<T>(work: impl FnOnce(&Window) -> T) -> Option<T> {
     ui()?.window().with_winit_window(work)
 }
 
+/// A laptop with two graphics cards has two libraries that can draw, and the system asks
+/// NVIDIA's first. Where the screen is on the other card it loads only to say no, which here
+/// took about 20 ms of every launch and 29 MB of memory, most of it shared with other apps. So
+/// on Wayland, when no connected screen is on an NVIDIA card and nothing has been set to say
+/// which card to use, only Mesa is asked.
+fn skip_an_unused_nvidia_library() {
+    const VENDORS: &str = "/usr/share/glvnd/egl_vendor.d";
+    const CHOSEN_ALREADY: [&str; 5] = [
+        "__EGL_VENDOR_LIBRARY_FILENAMES",
+        "__EGL_VENDOR_LIBRARY_DIRS",
+        "__NV_PRIME_RENDER_OFFLOAD",
+        "__GLX_VENDOR_LIBRARY_NAME",
+        "DRI_PRIME",
+    ];
+    let mesa = format!("{VENDORS}/50_mesa.json");
+    if std::env::var_os("WAYLAND_DISPLAY").is_none()
+        || CHOSEN_ALREADY.iter().any(|name| std::env::var_os(name).is_some())
+        || !std::path::Path::new(&mesa).exists()
+        || !std::path::Path::new(&format!("{VENDORS}/10_nvidia.json")).exists()
+    {
+        return;
+    }
+    let Ok(outputs) = std::fs::read_dir("/sys/class/drm") else { return };
+    // The driver of every output with a screen on it, such as "amdgpu".
+    let drivers: Vec<Option<String>> = outputs
+        .flatten()
+        .filter(|output| std::fs::read_to_string(output.path().join("status")).is_ok_and(|status| status.trim() == "connected"))
+        .map(|output| {
+            let driver = std::fs::canonicalize(output.path().join("device/device/driver")).ok()?;
+            Some(driver.file_name()?.to_string_lossy().into_owned())
+        })
+        .collect();
+    if only_other_cards_have_screens(&drivers) {
+        // Nothing else reads or writes the environment this early.
+        std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", mesa);
+    }
+}
+
+/// Whether every connected screen is on a card that is known and isn't NVIDIA's.
+fn only_other_cards_have_screens(drivers: &[Option<String>]) -> bool {
+    !drivers.is_empty() && drivers.iter().all(|driver| driver.as_deref().is_some_and(|driver| !driver.starts_with("nvidia")))
+}
+
 /// Asks for a window with no frame of the desktop's, known to it by Spotlight's name. Call
 /// before the window is made.
 pub fn prepare() -> Result<(), slint::PlatformError> {
+    skip_an_unused_nvidia_library();
     let backend = i_slint_backend_winit::Backend::builder()
         .with_window_attributes_hook(|attributes| attributes.with_decorations(false).with_name(APP_ID, APP_ID))
         .build()?;
@@ -655,6 +699,17 @@ mod tests {
         assert_eq!(resize_edge(width - 2.0, 3.0, width, height), Some(ResizeDirection::NorthEast));
         assert_eq!(resize_edge(3.0, height - 2.0, width, height), Some(ResizeDirection::SouthWest));
         assert_eq!(resize_edge(width - 10.0, height - 2.0, width, height), Some(ResizeDirection::SouthEast));
+    }
+
+    #[test]
+    fn nvidia_is_only_skipped_when_every_screen_is_on_another_card() {
+        let on = |drivers: &[Option<&str>]| only_other_cards_have_screens(&drivers.iter().map(|d| d.map(str::to_string)).collect::<Vec<_>>());
+        assert!(on(&[Some("amdgpu")]));
+        assert!(on(&[Some("i915"), Some("i915")]));
+        assert!(!on(&[Some("amdgpu"), Some("nvidia")]), "an outside screen on the NVIDIA card");
+        assert!(!on(&[Some("nvidia-drm")]));
+        assert!(!on(&[None]), "a card that doesn't say what it is");
+        assert!(!on(&[]), "no screen found, so nothing is known");
     }
 
     #[test]
