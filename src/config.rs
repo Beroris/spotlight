@@ -70,11 +70,29 @@ pub fn load_config() -> Result<AppConfig> {
 /// What this computer is called among Spotify's devices, until it's given another name.
 const DEVICE_NAME: &str = if cfg!(target_os = "macos") { "Spotlight Mac" } else { "Spotlight PC" };
 
+/// On Linux the name carries the computer's own, as in "Spotlight Mia", so that it can't be
+/// taken for the "Spotlight PC" in the same account's list.
+fn device_name() -> String {
+    if cfg!(target_os = "linux") {
+        let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        return device_name_for(&host);
+    }
+    DEVICE_NAME.into()
+}
+
+/// "Spotlight" and the computer's name, without anything after its first dot.
+fn device_name_for(host: &str) -> String {
+    match host.trim().split('.').next().unwrap_or_default() {
+        "" | "localhost" => "Spotlight Linux".into(),
+        name => format!("Spotlight {name}"),
+    }
+}
+
 /// The settings Spotlight starts with, and goes back to when its data is reset.
 pub fn new_config() -> AppConfig {
     AppConfig {
         redirect_uri: "http://127.0.0.1:5543/callback/".into(),
-        device_name: DEVICE_NAME.into(),
+        device_name: device_name(),
         artwork_enabled: true,
         show_artist_column: true,
         show_time_column: true,
@@ -115,8 +133,9 @@ fn tidy_config(cfg: &mut AppConfig) {
     if cfg.redirect_uri.is_empty() {
         cfg.redirect_uri = "http://127.0.0.1:5543/callback/".into();
     }
-    if cfg.device_name.is_empty() {
-        cfg.device_name = DEVICE_NAME.into();
+    // "Spotlight PC" is what the first Linux builds saved, before the name carried the computer's.
+    if cfg.device_name.is_empty() || (cfg!(target_os = "linux") && cfg.device_name == DEVICE_NAME) {
+        cfg.device_name = device_name();
     }
     if !matches!(cfg.theme_mode.as_str(), "Dark" | "Light" | "System") {
         cfg.theme_mode = "Dark".into();
@@ -284,6 +303,14 @@ pub fn now_epoch() -> u64 {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_linux_device_is_named_after_its_computer() {
+        assert_eq!(device_name_for("Mia\n"), "Spotlight Mia");
+        assert_eq!(device_name_for("desk.home.example"), "Spotlight desk");
+        assert_eq!(device_name_for(""), "Spotlight Linux");
+        assert_eq!(device_name_for("localhost"), "Spotlight Linux");
+    }
 
     #[test]
     fn only_a_copy_named_portable_keeps_its_settings_beside_itself() {
