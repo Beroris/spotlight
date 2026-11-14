@@ -81,6 +81,21 @@ To build both release files into `dist/`, install [Inno Setup 6](https://jrsoftw
 pwsh scripts/package-windows.ps1
 ```
 
+### On Linux
+
+Spotlight also builds and runs on Linux, on X11 and Wayland, with the desktop's media controls
+(MPRIS) and sound through PipeWire, PulseAudio or ALSA. The tray, global shortcuts and the
+update check are Windows only for now. You need a Rust toolchain, a C compiler and the
+development files for ALSA, OpenSSL, fontconfig, Wayland and xkbcommon. Then, to build it and
+install it for your user, with a launcher entry and icon and without root:
+
+```sh
+scripts/package-linux.sh --install
+```
+
+Settings live in `~/.local/share/spotlight`. `scripts/package-linux.sh --uninstall` takes the
+install away again.
+
 ## Notes
 
 - Settings, the sign-in, saved covers, where the music was left and the last 50 songs played here live in
