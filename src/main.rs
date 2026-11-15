@@ -9291,7 +9291,8 @@ async fn start_local_playback(
 
     // The volume as it is now, which a new player carries on with. The saved one is only where
     // the app starts: a player restarted mid-run, as after the connection drops, jumped back
-    // to it, undoing a mute or a change made from a phone, and to full with nothing saved.
+    // to it, undoing a mute or a change made from a phone, and to full when volumes aren't
+    // remembered.
     let startup_volume = state.lock().unwrap().local_volume_percent.clamp(0, 100);
     let mut engine = match playback::PlaybackEngine::start(
         local_playback_token.access_token.clone(),

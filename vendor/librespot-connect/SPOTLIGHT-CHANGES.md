@@ -78,26 +78,48 @@ Run its tests with `cargo test -p librespot-connect handed_over` and
 
 ## Playing the songs a play command brings when its list can't be had
 
-A play command names a list, brings songs along, or both. One that named a list was always
-asked for from Spotify, also when the name was one Spotify has no list for, like the `-` a
-plain list of songs can come under. Asking failed, the command failed with "context is not
-available", and nothing started: Spotify answered the app with "Restriction violated".
+A play command names a list, brings songs along, or both. A list that was named and isn't
+the one already here was asked for from Spotify, also when the name was one Spotify has no
+list for. Asking failed, the command failed with "context is not available", and nothing
+started: Spotify answered the app with "Restriction violated". This was seen once in the
+app's log, for a start with a plain list of songs. The log doesn't show which name came; the
+`-` Spotify uses for a plain list is the likely one.
 
 In `src/spirc.rs`:
 
 - `named_or_brought` decides what a play command plays. A name Spotify can't be asked for
-  plays the songs brought along, as a command with no name always did. A search plays as
-  before.
-- `handle_load` takes the songs brought (`brought`). When Spotify can't give the list that
-  was named, for whatever reason, and no list is left to play from, those songs play and the
-  log says which name failed.
+  plays the songs brought along, as a command with no name always did, and the log says
+  which name came. A search plays as before, and so does a song picked in the list this
+  player already has.
+- `handle_load` takes the songs brought (`brought`), as they came. When the list that was
+  named was asked for and couldn't be had, and no list is left to play from, those songs
+  play and the log says which name failed. A command whose name and page are both unusable
+  still fails before that.
+- Songs brought are loaded as they came, with the ids Spotify knows them by. Before, a
+  command with no name was loaded from the songs' uris alone and the ids put back by song,
+  which gave the first of two alike the id of the second.
+- Starting a list of songs no longer leaves the list before it being asked for: its later
+  pages and the similar songs after it would have been added to the new list.
+- `load_context_from_uri` only plays from the list already here when there is one. A
+  handover names its playlist before it has it, so the same playlist asked for again after
+  that failed was not fetched at all.
 
-Run its tests with `cargo test -p librespot-connect a_play_command`: the two
-`a_play_command_*` tests at the end of the file.
+Not changed: a list Spotify couldn't give is never asked for again by that player.
+`ContextResolver::add` means to try again after an hour but measures the time backwards
+(`i.duration_since(Instant::now())`), so it never does. `gave_up_on` goes by the same rule.
 
-## Saying when the volume was set from elsewhere
+Run its tests with `cargo test -p librespot-connect spirc::tests`.
+
+## The volume: set while the music is elsewhere, and said when set from elsewhere
+
+`handle_command` dropped every command while this device wasn't the active one, a volume
+among them. A volume chosen in the app while the music was elsewhere or nowhere changed what
+was heard at once (the app sets its output itself) but never reached the player, which gave
+its old volume back when the music came. `SpircCommand::SetVolume` is now taken either way,
+as a volume Spotify passes on always was.
 
 A volume Spotify passes on (`hm://connect-state/v1/connect/volume`) comes from another device
 or app. `volume_asked_through_spotify` in `src/spirc.rs` notes that, and once the volume has
-settled the app's log says "Another device or app set this player's volume to N%". Spotify
-doesn't say which device asked.
+settled the app's log says "Another device or app set this player's volume to N%", unless
+one was chosen here in between. Spotify doesn't say which device asked, and a volume this
+app sends to its own player through Spotify's API counts as from elsewhere too.

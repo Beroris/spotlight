@@ -35,6 +35,7 @@ use crate::{
 };
 use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
+use librespot_protocol::context_track::ContextTrack;
 use protobuf::MessageField;
 use std::{
     future::Future,
@@ -171,12 +172,34 @@ fn log_carried_on(list: &HandedOver, why: &str) {
 /// Spotlight: what a play command asks for: the list it names, or the songs it brought when
 /// it names none. A name Spotify can't be asked for, like the "-" a list of songs can come
 /// under, also plays the songs brought. Asking for it failed, and nothing started.
-fn named_or_brought(named: Option<String>, brought: &[String]) -> Option<PlayContext> {
-    // A search plays as it did before: its name isn't asked for either, the first song is.
-    let asked_for = |uri: &str| HandedOver::can_be_asked_for(uri) || uri.starts_with("spotify:search");
+/// `playing` is the name of the list this player has now, if it has one.
+fn named_or_brought(
+    named: Option<String>,
+    brought: &[ContextTrack],
+    playing: Option<&str>,
+) -> Option<PlayContext> {
+    let asked_for = |uri: &str| {
+        HandedOver::can_be_asked_for(uri)
+            // A search plays as it did before: its name isn't asked for either, the first
+            // song is.
+            || uri.starts_with("spotify:search")
+            // The list this player already has is played from as it is, as before. Another
+            // app picking a song in it names it and may bring only the songs it knows of.
+            || (!uri.is_empty() && playing == Some(uri))
+    };
     match named {
         Some(uri) if brought.is_empty() || asked_for(&uri) => Some(PlayContext::Uri(uri)),
-        _ if !brought.is_empty() => Some(PlayContext::Tracks(brought.to_vec())),
+        named if !brought.is_empty() => {
+            if let Some(name) = named {
+                // Said so the log shows what Spotify calls a list of songs.
+                info!(
+                    target: "spotlight",
+                    "The music came as a list of songs under the name \"{name}\""
+                );
+            }
+            let songs = brought.iter().flat_map(|track| track.uri.clone());
+            Some(PlayContext::Tracks(songs.collect()))
+        }
         _ => None,
     }
 }
@@ -760,6 +783,13 @@ impl SpircTask {
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
                 warn!("SpircCommand::{cmd:?} will be ignored while already active")
             }
+            // Spotlight: the volume is this device's own, with the music here or not, as it
+            // is for one Spotify passes on. Before, one chosen here while the music was
+            // elsewhere or nowhere was dropped, and the old one came back with the music.
+            SpircCommand::SetVolume(volume) if !self.connect_state.is_active() => {
+                self.set_volume_chosen_here(volume);
+                return Ok(());
+            }
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
             }
@@ -780,7 +810,7 @@ impl SpircTask {
             SpircCommand::Repeat(repeat) => self.handle_repeat_context(repeat)?,
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
-            SpircCommand::SetVolume(volume) => self.set_volume(volume),
+            SpircCommand::SetVolume(volume) => self.set_volume_chosen_here(volume),
             SpircCommand::Load(command) => {
                 self.handle_load(command, None, None, Vec::new()).await?
             }
@@ -1161,17 +1191,23 @@ impl SpircTask {
                     self.handle_activate()
                 }
 
-                // Spotlight: the songs the command brought along.
-                let brought: Vec<String> = play
+                // Spotlight: the songs the command brought along, as they came: each with the
+                // id Spotify knows it by, which tells two of the same song apart.
+                let brought: Vec<ContextTrack> = play
                     .context
                     .pages
                     .iter()
-                    .flat_map(|page| page.tracks.iter())
-                    .flat_map(|track| track.uri.clone())
+                    .flat_map(|page| page.tracks.iter().cloned())
                     .collect();
+                let playing = self
+                    .connect_state
+                    .get_context(ContextType::Default)
+                    .is_ok()
+                    .then(|| self.connect_state.context_uri().clone());
 
-                let context = named_or_brought(play.context.uri.take(), &brought)
-                    .ok_or(SpircError::NoUri("context"))?;
+                let context =
+                    named_or_brought(play.context.uri.take(), &brought, playing.as_deref())
+                        .ok_or(SpircError::NoUri("context"))?;
 
                 let context_options = play
                     .options
@@ -1475,10 +1511,10 @@ impl SpircTask {
     async fn handle_load(
         &mut self,
         cmd: LoadRequest,
-        page: Option<ContextPage>,
+        mut page: Option<ContextPage>,
         fallback_index: Option<usize>,
         // Spotlight: the songs a play command brought along, if any.
-        brought: Vec<String>,
+        brought: Vec<ContextTrack>,
     ) -> Result<(), Error> {
         // Spotlight: new music replaces a handover still waiting on its playlist. Left in
         // place, it was finished by this music's list and moved it to the handover's song.
@@ -1514,9 +1550,23 @@ impl SpircTask {
                         "Spotify couldn't give the list this music named ({uri}), so the songs sent with it play"
                     );
                     self.load_context_from_tracks(brought)?;
+                    // They came whole, ids and all, so there is nothing to add from the page.
+                    page = None;
                 }
             }
-            PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
+            PlayContext::Tracks(tracks) => {
+                // Spotlight: more pages of the list before, or the similar songs after it,
+                // may still be asked for. Arriving later, they would be added to this one.
+                self.context_resolver.clear();
+                if brought.is_empty() {
+                    self.load_context_from_tracks(tracks)?
+                } else {
+                    // Spotlight: a play command's songs are loaded as they came. From their
+                    // uris alone, the ids were put back by song, on the first of two alike.
+                    self.load_context_from_tracks(brought)?;
+                    page = None;
+                }
+            }
         }
 
         let cmd_options = cmd.options;
@@ -1629,7 +1679,15 @@ impl SpircTask {
 
         let current_context_uri = self.connect_state.context_uri();
 
-        if current_context_uri == &context_uri && fallback == context_uri {
+        // Spotlight: only a list that is here can be played from as it is. A handover names
+        // its playlist before it has it, and when that never came there is nothing behind
+        // the name: the same playlist asked for again was then not fetched at all.
+        let have_it = self
+            .connect_state
+            .get_context(ContextType::Default)
+            .is_ok();
+
+        if have_it && current_context_uri == &context_uri && fallback == context_uri {
             debug!("context <{current_context_uri}> didn't change, no resolving required")
         } else {
             debug!("resolving context for load command");
@@ -1915,13 +1973,20 @@ impl SpircTask {
         let volume = (self.connect_state.device_info().volume as u16)
             .saturating_add(self.connect_state.volume_step_size);
 
-        self.set_volume(volume);
+        self.set_volume_chosen_here(volume);
     }
 
     fn handle_volume_down(&mut self) {
         let volume = (self.connect_state.device_info().volume as u16)
             .saturating_sub(self.connect_state.volume_step_size);
 
+        self.set_volume_chosen_here(volume);
+    }
+
+    /// Spotlight: a volume this app asked for. It is the latest word, so one Spotify passed
+    /// on just before is no longer what the log should speak of.
+    fn set_volume_chosen_here(&mut self, volume: u16) {
+        self.volume_asked_through_spotify = false;
         self.set_volume(volume);
     }
 
@@ -2085,22 +2150,34 @@ impl Drop for SpircTask {
 mod tests {
     use super::*;
 
-    fn songs(uris: &[&str]) -> Vec<String> {
-        uris.iter().map(|uri| uri.to_string()).collect()
+    fn songs(uris: &[&str]) -> Vec<ContextTrack> {
+        uris.iter()
+            .map(|uri| ContextTrack {
+                uri: Some(uri.to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn uris(tracks: &[ContextTrack]) -> Vec<String> {
+        tracks.iter().flat_map(|track| track.uri.clone()).collect()
     }
 
     #[test]
     fn a_play_command_that_names_no_real_list_plays_the_songs_it_brought() {
         let brought = songs(&["spotify:track:a", "spotify:track:b"]);
         for made_up in ["-", "", "spotify:web-api", "spotify:unknown"] {
-            let plays = named_or_brought(Some(made_up.to_string()), &brought);
+            let plays = named_or_brought(Some(made_up.to_string()), &brought, None);
             assert!(
-                matches!(plays, Some(PlayContext::Tracks(ref tracks)) if *tracks == brought),
+                matches!(plays, Some(PlayContext::Tracks(ref tracks)) if *tracks == uris(&brought)),
                 "{made_up:?} should play the songs brought, not be asked for: {plays:?}"
             );
         }
-        let unnamed = named_or_brought(None, &brought);
-        assert!(matches!(unnamed, Some(PlayContext::Tracks(ref tracks)) if *tracks == brought));
+        let unnamed = named_or_brought(None, &brought, None);
+        assert!(matches!(unnamed, Some(PlayContext::Tracks(ref tracks)) if *tracks == uris(&brought)));
+        // Another list playing under a made-up name is no reason to ask for this one.
+        let plays = named_or_brought(Some("-".to_string()), &brought, Some("spotify:web-api"));
+        assert!(matches!(plays, Some(PlayContext::Tracks(_))), "{plays:?}");
     }
 
     #[test]
@@ -2108,12 +2185,23 @@ mod tests {
         let brought = songs(&["spotify:track:a"]);
         for named in ["spotify:album:x", "spotify:playlist:y", "spotify:search:some+words"] {
             for brought in [&brought[..], &[]] {
-                let plays = named_or_brought(Some(named.to_string()), brought);
+                let plays = named_or_brought(Some(named.to_string()), brought, None);
                 assert!(matches!(plays, Some(PlayContext::Uri(ref uri)) if uri == named), "{named}: {plays:?}");
             }
         }
         // With no songs to fall back on, a made-up name is all there is to go on.
-        assert!(matches!(named_or_brought(Some("-".to_string()), &[]), Some(PlayContext::Uri(_))));
-        assert!(named_or_brought(None, &[]).is_none());
+        assert!(matches!(named_or_brought(Some("-".to_string()), &[], None), Some(PlayContext::Uri(_))));
+        assert!(named_or_brought(None, &[], None).is_none());
+    }
+
+    #[test]
+    fn a_song_picked_in_the_list_playing_here_is_played_from_that_list() {
+        // Another app names the list this player has and may bring only some of its songs.
+        let brought = songs(&["spotify:track:a"]);
+        let plays = named_or_brought(Some("spotify:web-api".to_string()), &brought, Some("spotify:web-api"));
+        assert!(matches!(plays, Some(PlayContext::Uri(ref uri)) if uri == "spotify:web-api"), "{plays:?}");
+        // An empty name is never the name of a list that is here.
+        let plays = named_or_brought(Some(String::new()), &brought, Some(""));
+        assert!(matches!(plays, Some(PlayContext::Tracks(_))), "{plays:?}");
     }
 }
