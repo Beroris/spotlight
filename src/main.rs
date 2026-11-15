@@ -9289,11 +9289,10 @@ async fn start_local_playback(
         }
     };
 
-    let startup_volume = if config_snapshot.remember_volume {
-        config_snapshot.last_volume_percent.clamp(0, 100)
-    } else {
-        100
-    };
+    // The volume as it is now, which a new player carries on with. The saved one is only where
+    // the app starts: a player restarted mid-run, as after the connection drops, jumped back
+    // to it, undoing a mute or a change made from a phone, and to full with nothing saved.
+    let startup_volume = state.lock().unwrap().local_volume_percent.clamp(0, 100);
     let mut engine = match playback::PlaybackEngine::start(
         local_playback_token.access_token.clone(),
         local_client_id,
@@ -9535,7 +9534,17 @@ async fn run_local_player_event_loop(
             }
             PlayerEvent::VolumeChanged { volume } => {
                 // Set from a phone or another Spotify app, or our own change coming back.
-                state.lock().unwrap().local_volume_percent = playback::spotify_volume_to_percent(volume);
+                let percent = playback::spotify_volume_to_percent(volume);
+                {
+                    let mut guard = state.lock().unwrap();
+                    guard.local_volume_percent = percent;
+                    // Kept for the next start however it was set, so the app doesn't come
+                    // back louder than it was left. A mute isn't kept, as with the slider.
+                    if volume_to_remember(&guard.config, percent) {
+                        guard.config.last_volume_percent = percent;
+                        config::save_config_background(&guard.config);
+                    }
+                }
                 let ui_weak = ui_weak.clone();
                 let state = Arc::clone(&state);
                 let _ = slint::invoke_from_event_loop(move || {
@@ -9547,6 +9556,12 @@ async fn run_local_player_event_loop(
             _ => {}
         }
     }
+}
+
+/// Whether a volume this PC's player reports is one to save for the next start: a new one,
+/// when volumes are remembered at all. Silence isn't saved, so the app never starts muted.
+fn volume_to_remember(config: &AppConfig, percent: i32) -> bool {
+    config.remember_volume && percent > 0 && config.last_volume_percent != percent
 }
 
 /// Puts this PC's own volume on the slider while it's the one the slider controls,
@@ -10563,6 +10578,25 @@ mod queue_edit_tests {
     fn editing_again_in_shuffle_keeps_the_list_already_held() {
         let shown = tracks(&["d", "b"]);
         assert_eq!(uris(&queue_to_edit(&shown, &tracks(&["d", "b", "n"]), &[], true)), ["d", "b", "n"]);
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::volume_to_remember;
+
+    #[test]
+    fn a_volume_set_from_another_device_is_kept_for_the_next_start() {
+        let mut config = crate::config::new_config();
+        config.remember_volume = true;
+        config.last_volume_percent = 100;
+        assert!(volume_to_remember(&config, 30));
+        // The player's echo of a volume already saved writes nothing.
+        assert!(!volume_to_remember(&config, 100));
+        // A mute isn't kept, so the app never starts silent.
+        assert!(!volume_to_remember(&config, 0));
+        config.remember_volume = false;
+        assert!(!volume_to_remember(&config, 30));
     }
 }
 

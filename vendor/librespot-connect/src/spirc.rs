@@ -113,6 +113,9 @@ struct SpircTask {
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
     update_volume: bool,
+    /// Spotlight: the volume waiting to be reported was asked for through Spotify, by another
+    /// device or app, not by this one. Said in the app's log once it settles.
+    volume_asked_through_spotify: bool,
 
     /// when set to true, it will update the volume after [UPDATE_STATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -163,6 +166,19 @@ fn log_carried_on(list: &HandedOver, why: &str) {
         list.queued.len(),
         list.read_from,
     );
+}
+
+/// Spotlight: what a play command asks for: the list it names, or the songs it brought when
+/// it names none. A name Spotify can't be asked for, like the "-" a list of songs can come
+/// under, also plays the songs brought. Asking for it failed, and nothing started.
+fn named_or_brought(named: Option<String>, brought: &[String]) -> Option<PlayContext> {
+    // A search plays as it did before: its name isn't asked for either, the first song is.
+    let asked_for = |uri: &str| HandedOver::can_be_asked_for(uri) || uri.starts_with("spotify:search");
+    match named {
+        Some(uri) if brought.is_empty() || asked_for(&uri) => Some(PlayContext::Uri(uri)),
+        _ if !brought.is_empty() => Some(PlayContext::Tracks(brought.to_vec())),
+        _ => None,
+    }
 }
 
 // delay to update volume after a certain amount of time, instead on each update request
@@ -283,6 +299,7 @@ impl Spirc {
             playing_elsewhere: None,
             handed_over: None,
             update_volume: false,
+            volume_asked_through_spotify: false,
             update_state: false,
 
             spirc_id,
@@ -519,7 +536,14 @@ impl SpircTask {
                 volume_update = self.connect_state_volume_update.next() => unwrap! {
                     volume_update,
                     match |volume_update| match volume_update.volume.try_into() {
-                        Ok(volume) => self.set_volume(volume),
+                        Ok(volume) => {
+                            // Spotlight: a volume no one chose here is otherwise a riddle.
+                            let before = self.connect_state.device_info().volume;
+                            self.set_volume(volume);
+                            if self.connect_state.device_info().volume != before {
+                                self.volume_asked_through_spotify = true;
+                            }
+                        }
                         Err(why) => error!("can't update volume, failed to parse i32 to u16: {why}")
                     }
                 },
@@ -572,6 +596,13 @@ impl SpircTask {
                 },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;
+                    if std::mem::take(&mut self.volume_asked_through_spotify) {
+                        info!(
+                            target: "spotlight",
+                            "Another device or app set this player's volume to {}%",
+                            (self.connect_state.device_info().volume * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)
+                        );
+                    }
 
                     info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
                     if let Err(why) = self.connect_state.notify_volume_changed(&self.session).await {
@@ -750,7 +781,9 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::Load(command) => {
+                self.handle_load(command, None, None, Vec::new()).await?
+            }
             SpircCommand::SetUpcoming {
                 rows_before,
                 rows_after,
@@ -1128,19 +1161,17 @@ impl SpircTask {
                     self.handle_activate()
                 }
 
-                let context = match play.context.uri {
-                    Some(s) => PlayContext::Uri(s),
-                    None if !play.context.pages.is_empty() => PlayContext::Tracks(
-                        play.context
-                            .pages
-                            .iter()
-                            .cloned()
-                            .flat_map(|p| p.tracks)
-                            .flat_map(|t| t.uri)
-                            .collect(),
-                    ),
-                    None => Err(SpircError::NoUri("context"))?,
-                };
+                // Spotlight: the songs the command brought along.
+                let brought: Vec<String> = play
+                    .context
+                    .pages
+                    .iter()
+                    .flat_map(|page| page.tracks.iter())
+                    .flat_map(|track| track.uri.clone())
+                    .collect();
+
+                let context = named_or_brought(play.context.uri.take(), &brought)
+                    .ok_or(SpircError::NoUri("context"))?;
 
                 let context_options = play
                     .options
@@ -1167,6 +1198,7 @@ impl SpircTask {
                     },
                     play.context.pages.pop(),
                     fallback_index,
+                    brought,
                 )
                 .await?;
 
@@ -1445,6 +1477,8 @@ impl SpircTask {
         cmd: LoadRequest,
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
+        // Spotlight: the songs a play command brought along, if any.
+        brought: Vec<String>,
     ) -> Result<(), Error> {
         // Spotlight: new music replaces a handover still waiting on its playlist. Left in
         // place, it was finished by this music's list and moved it to the handover's song.
@@ -1466,8 +1500,21 @@ impl SpircTask {
         let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
         match cmd.context {
             PlayContext::Uri(uri) => {
-                self.load_context_from_uri(uri, page.as_ref(), autoplay)
-                    .await?
+                self.load_context_from_uri(uri.clone(), page.as_ref(), autoplay)
+                    .await?;
+                // Spotlight: Spotify couldn't give the list the command named, so the songs
+                // it brought play. Before, the command failed here and nothing started.
+                let nothing_to_play = self
+                    .connect_state
+                    .get_context(ContextType::Default)
+                    .is_err();
+                if nothing_to_play && !brought.is_empty() {
+                    warn!(
+                        target: "spotlight",
+                        "Spotify couldn't give the list this music named ({uri}), so the songs sent with it play"
+                    );
+                    self.load_context_from_tracks(brought)?;
+                }
             }
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
         }
@@ -2031,5 +2078,42 @@ impl SpircTask {
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn songs(uris: &[&str]) -> Vec<String> {
+        uris.iter().map(|uri| uri.to_string()).collect()
+    }
+
+    #[test]
+    fn a_play_command_that_names_no_real_list_plays_the_songs_it_brought() {
+        let brought = songs(&["spotify:track:a", "spotify:track:b"]);
+        for made_up in ["-", "", "spotify:web-api", "spotify:unknown"] {
+            let plays = named_or_brought(Some(made_up.to_string()), &brought);
+            assert!(
+                matches!(plays, Some(PlayContext::Tracks(ref tracks)) if *tracks == brought),
+                "{made_up:?} should play the songs brought, not be asked for: {plays:?}"
+            );
+        }
+        let unnamed = named_or_brought(None, &brought);
+        assert!(matches!(unnamed, Some(PlayContext::Tracks(ref tracks)) if *tracks == brought));
+    }
+
+    #[test]
+    fn a_play_command_that_names_a_list_still_asks_for_it() {
+        let brought = songs(&["spotify:track:a"]);
+        for named in ["spotify:album:x", "spotify:playlist:y", "spotify:search:some+words"] {
+            for brought in [&brought[..], &[]] {
+                let plays = named_or_brought(Some(named.to_string()), brought);
+                assert!(matches!(plays, Some(PlayContext::Uri(ref uri)) if uri == named), "{named}: {plays:?}");
+            }
+        }
+        // With no songs to fall back on, a made-up name is all there is to go on.
+        assert!(matches!(named_or_brought(Some("-".to_string()), &[]), Some(PlayContext::Uri(_))));
+        assert!(named_or_brought(None, &[]).is_none());
     }
 }

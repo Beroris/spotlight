@@ -75,3 +75,29 @@ up (about 50 in the handover alone), so a longer plain list arrives without its 
 
 Run its tests with `cargo test -p librespot-connect handed_over` and
 `cargo test -p librespot-connect context_resolver`.
+
+## Playing the songs a play command brings when its list can't be had
+
+A play command names a list, brings songs along, or both. One that named a list was always
+asked for from Spotify, also when the name was one Spotify has no list for, like the `-` a
+plain list of songs can come under. Asking failed, the command failed with "context is not
+available", and nothing started: Spotify answered the app with "Restriction violated".
+
+In `src/spirc.rs`:
+
+- `named_or_brought` decides what a play command plays. A name Spotify can't be asked for
+  plays the songs brought along, as a command with no name always did. A search plays as
+  before.
+- `handle_load` takes the songs brought (`brought`). When Spotify can't give the list that
+  was named, for whatever reason, and no list is left to play from, those songs play and the
+  log says which name failed.
+
+Run its tests with `cargo test -p librespot-connect a_play_command`: the two
+`a_play_command_*` tests at the end of the file.
+
+## Saying when the volume was set from elsewhere
+
+A volume Spotify passes on (`hm://connect-state/v1/connect/volume`) comes from another device
+or app. `volume_asked_through_spotify` in `src/spirc.rs` notes that, and once the volume has
+settled the app's log says "Another device or app set this player's volume to N%". Spotify
+doesn't say which device asked.
