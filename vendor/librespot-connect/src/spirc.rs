@@ -984,8 +984,11 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
-                self.handle_disconnect().await?;
+                // Spotlight: stops playing even when telling Spotify fails. Another device has
+                // the music now, and two shouldn't be heard at once.
+                let disconnected = self.handle_disconnect().await;
                 self.handle_stop();
+                disconnected?;
             } else if self.connect_state.is_active() {
                 // fixme: workaround fix, because of missing information why it behaves like it does
                 //  background: when another device sends a connect-state update, some player's position de-syncs
@@ -993,7 +996,15 @@ impl SpircTask {
                 self.update_state = true;
             }
         } else if self.connect_state.is_active() {
-            self.connect_state.became_inactive(&self.session).await?;
+            // Spotlight: says so here too, as `handle_disconnect` does, and whether or not
+            // Spotify could be told. The app sends its commands straight to this player only
+            // while it's the active device.
+            let told = self.connect_state.became_inactive(&self.session).await;
+            self.player.emit_session_disconnected_event(
+                self.session.connection_id(),
+                self.session.username(),
+            );
+            told?;
         }
 
         Ok(())
@@ -1272,11 +1283,15 @@ impl SpircTask {
             .update_position_in_relation(self.now_ms());
         self.notify().await?;
 
-        self.connect_state.became_inactive(&self.session).await?;
+        // Spotlight: the state is inactive from here on, even when telling Spotify fails, so
+        // the event goes out either way. Before, a failed request left the app believing
+        // this player still took commands.
+        let told = self.connect_state.became_inactive(&self.session).await;
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
 
+        told?;
         Ok(())
     }
 

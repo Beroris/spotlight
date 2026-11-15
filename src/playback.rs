@@ -144,14 +144,15 @@ impl PlaybackEngine {
         self.finished.take()
     }
 
-    pub fn play_pause(&self) -> Result<()> {
-        self._spirc.play_pause()?;
-        Ok(())
-    }
-
     /// Resumes if paused. Does nothing if already playing.
     pub fn play(&self) -> Result<()> {
         self._spirc.play()?;
+        Ok(())
+    }
+
+    /// Pauses if playing. Does nothing if already paused.
+    pub fn pause(&self) -> Result<()> {
+        self._spirc.pause()?;
         Ok(())
     }
 

@@ -91,7 +91,7 @@ struct AppState {
     /// Devices that didn't answer when music was sent to them, and when. Spotify can go on
     /// listing, even as active, a device that has closed or gone to sleep. New music skips
     /// these for a while and plays on this PC, unless one is picked again.
-    unanswered_devices: HashMap<String, Instant>,
+    unanswered_devices: HashMap<String, Unanswered>,
     available_device_ids: Vec<String>,
     available_device_names: Vec<String>,
     playlist_uris: Vec<String>,
@@ -174,6 +174,10 @@ struct AppState {
     /// Whether this PC's player is playing right now, from its own events. Spotify's
     /// report of the active device lags behind, and can still name the one before.
     local_playing: bool,
+    /// Whether this PC's player is the active Spotify device, by its own word. Commands sent
+    /// straight to it are dropped without an error while it isn't, and Spotify's report of the
+    /// active device can lag behind or name a device that has gone.
+    local_connect_active: bool,
     track_view_generation: u64,
     /// Goes up at each sign-out, so what was asked for the account that left can tell when it
     /// comes back.
@@ -232,9 +236,7 @@ impl AppState {
     }
 
     fn local_is_active(&self) -> bool {
-        self.local_device_id.is_some()
-            && self.active_device_id == self.local_device_id
-            && self.playback_engine.as_ref().is_some_and(|engine| !engine.is_finished())
+        self.local_connect_active && self.playback_engine.as_ref().is_some_and(|engine| !engine.is_finished())
     }
 
     /// True when the selected target is this PC (active or idle).
@@ -245,13 +247,14 @@ impl AppState {
     /// The device new music goes to, leaving out one that didn't answer a moment ago.
     fn start_device(&self) -> Option<String> {
         pick_start_device(self.active_device_id.as_ref(), self.preferred_device_id.as_ref(), &self.available_device_ids)
-            .filter(|id| !self.unanswered_devices.get(id).is_some_and(|at| at.elapsed() < UNANSWERED_DEVICE_SKIP))
+            .filter(|id| !self.unanswered_devices.get(id).is_some_and(Unanswered::still_left_out))
     }
 
     /// `device_id` didn't take the music sent to it, so the next music plays on this PC.
-    fn forget_unanswered_device(&mut self, device_id: &str) {
-        self.unanswered_devices.retain(|_, at| at.elapsed() < UNANSWERED_DEVICE_SKIP);
-        self.unanswered_devices.insert(device_id.to_string(), Instant::now());
+    /// `had_on` is the song Spotify had it on, when that's known.
+    fn forget_unanswered_device(&mut self, device_id: &str, had_on: Option<Option<String>>) {
+        self.unanswered_devices.retain(|_, left_out| left_out.still_left_out());
+        self.unanswered_devices.insert(device_id.to_string(), Unanswered { at: Instant::now(), had_on });
         if self.active_device_id.as_deref() == Some(device_id) {
             self.active_device_id = None;
         }
@@ -264,9 +267,37 @@ impl AppState {
     }
 }
 
+/// A device left out of new music because it didn't answer.
+#[derive(Clone, Debug)]
+struct Unanswered {
+    at: Instant,
+    /// The song Spotify had it on then: `Some(None)` for none, `None` when that isn't known.
+    had_on: Option<Option<String>>,
+}
+
+impl Unanswered {
+    fn still_left_out(&self) -> bool {
+        self.at.elapsed() < UNANSWERED_DEVICE_SKIP
+    }
+
+    /// Whether Spotify's report of the device as the one playing shows it's back. A device
+    /// that has gone can go on being reported as playing what it had on, and for a moment
+    /// after it's left out Spotify may still describe things as they were. After that, another
+    /// song on it, or its taking the music from another device, is something only a device
+    /// that's there can do.
+    fn answers_again(&self, song_now: Option<&str>, took_over: bool) -> bool {
+        if self.at.elapsed() <= UNANSWERED_DEVICE_SETTLE {
+            return false;
+        }
+        took_over || self.had_on.as_ref().is_some_and(|had_on| had_on.as_deref() != song_now)
+    }
+}
+
 /// How long new music leaves out a device that didn't answer. Picking it from the list again
 /// sends music to it at once.
 const UNANSWERED_DEVICE_SKIP: Duration = Duration::from_secs(10 * 60);
+/// How long after a device was left out Spotify may still report it as it was before.
+const UNANSWERED_DEVICE_SETTLE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 struct PlaybackClock {
@@ -278,7 +309,8 @@ struct PlaybackClock {
 
 #[derive(Clone, Copy)]
 enum LocalPlayerAction {
-    PlayPause,
+    Play,
+    Pause,
     Next,
     /// Next, playing even if it was paused. Sent together so nothing can come between.
     NextAndPlay,
@@ -295,7 +327,8 @@ enum NowPlayingUpdate {
 impl LocalPlayerAction {
     fn run(self, engine: &playback::PlaybackEngine) -> Result<()> {
         match self {
-            Self::PlayPause => engine.play_pause(),
+            Self::Play => engine.play(),
+            Self::Pause => engine.pause(),
             Self::Next => engine.next(),
             Self::NextAndPlay => engine.next().and_then(|()| engine.play()),
             Self::Previous => engine.previous(),
@@ -518,6 +551,7 @@ fn main() -> Result<()> {
         last_volume_change: None,
         local_volume_percent,
         local_playing: false,
+        local_connect_active: false,
         track_view_generation: 0,
         session: 0,
         loaded: loaded_liked.into_iter().map(|loaded| (LIKED_SONGS_PLAYLIST_URI.to_string(), loaded)).collect(),
@@ -3086,10 +3120,10 @@ fn bind_playback_callbacks(
                 pick_up_left_off(&ui_weak, &runtime, &state, PickUp::WhereItWas);
                 return;
             }
-            let mut should_start_when_empty = false;
+            let mut want_playing = false;
             if let Some(ui) = ui_weak.upgrade() {
                 let next_is_playing = !ui.get_is_playing();
-                should_start_when_empty = next_is_playing;
+                want_playing = next_is_playing;
                 ui.set_is_playing(next_is_playing);
                 ui.set_connection_status(if next_is_playing {
                     "Connected - Playing".into()
@@ -3111,32 +3145,11 @@ fn bind_playback_callbacks(
             let state_inner = Arc::clone(&state);
             let spotify_api_inner = spotify_api.clone();
             runtime.spawn(async move {
-                let (token, device, use_local) = {
-                    let guard = state_inner.lock().unwrap();
-                    (
-                        guard.token.clone(),
-                        guard.device_id.clone(),
-                        guard.local_is_active(),
-                    )
-                };
-
-                let command_result = if use_local {
-                    run_local_player_action_with_recovery(
-                        Arc::clone(&state_inner),
-                        ui_weak_inner.clone(),
-                        spotify_api_inner.clone(),
-                        LocalPlayerAction::PlayPause,
-                    )
-                    .await
-                } else if let Some(token) = token {
-                    toggle_playback(&spotify_api_inner, &token, device.as_deref()).await
-                } else {
-                    Err(anyhow!("not connected to Spotify"))
-                };
+                let command_result = set_playing(ui_weak_inner.clone(), Arc::clone(&state_inner), spotify_api_inner.clone(), want_playing).await;
 
                 let result = match command_result {
                     Err(error)
-                        if should_start_when_empty
+                        if want_playing
                             && (error.to_string().contains("nothing is currently queued to resume")
                                 || error.to_string().contains("no local Spotify device ready")) =>
                     {
@@ -3159,14 +3172,11 @@ fn bind_playback_callbacks(
                             false,
                         )
                         .await;
-                        start_current_visible_tracks(Arc::clone(&state_inner), spotify_api_inner.clone()).await
-                    }
-                    // Spotify still names a device that has closed or gone to sleep: carry on here.
-                    Err(error) if should_start_when_empty && device_may_be_gone(&error) => {
-                        play_current_here(ui_weak_inner.clone(), Arc::clone(&state_inner), spotify_api_inner.clone(), device.clone(), &error).await
+                        // The song in the player bar if there is one, else the list on screen.
+                        play_current_here(ui_weak_inner.clone(), Arc::clone(&state_inner), spotify_api_inner.clone(), None, None, &error).await
                     }
                     // Nothing that answers is playing it, so it's as good as paused.
-                    Err(error) if !should_start_when_empty && error.to_string().to_ascii_lowercase().contains("no active device") => Ok(()),
+                    Err(error) if !want_playing && error.to_string().to_ascii_lowercase().contains("no active device") => Ok(()),
                     other => other,
                 };
                 if result.is_ok() {
@@ -5934,7 +5944,10 @@ fn play_search_result_next(
         // A song only on show, like the last one from before a restart, isn't playing or
         // paused part way, so there's nothing to go back to.
         let has_song = guard.current_track_uri.is_some() && (!was_paused || guard.playback_clock.displayed_progress_ms() > 0);
-        (track, has_song, guard.local_is_active(), guard.active_device_id.is_some())
+        // Spotify can name this PC as the active device when its player isn't. The song then
+        // starts here by itself, below.
+        let elsewhere = guard.active_device_id.is_some() && guard.active_device_id != guard.local_device_id;
+        (track, has_song, guard.local_is_active(), elsewhere)
     };
     let Some(track) = track else { return false };
     if !has_song {
@@ -5961,8 +5974,18 @@ fn play_search_result_next(
     // Spotify takes a moment to show it. Skipping before this song is next would play another.
     let track_uri = track.uri;
     let ui_weak = ui.as_weak();
+    let state_for_command = Arc::clone(state);
     spawn_device_command(ui.as_weak(), Arc::clone(runtime), Arc::clone(state), spotify_api.clone(), move |api, token, device| async move {
-        api.add_to_queue(&token, device.as_deref(), &track_uri).await?;
+        if let Err(error) = within(REMOTE_COMMAND_LIMIT, api.add_to_queue(&token, device.as_deref(), &track_uri)).await {
+            // The device with the music has closed or gone to sleep: the song plays here.
+            let Some(gone) = device.filter(|_| device_is_gone(&error)) else { return Err(error) };
+            let had_on = state_for_command.lock().unwrap().current_track_uri.clone();
+            let name = forget_unanswered_device(&state_for_command, &gone, Some(had_on));
+            file_log(&format!("Play from search: {name} didn't answer ({error}), so it starts on this computer"));
+            start_track_uris_with_recovery(ui_weak.clone(), Arc::clone(&state_for_command), api, vec![track_uri]).await?;
+            tell_playing_here(ui_weak, name, error.to_string());
+            return Ok(());
+        }
         let mut queued_behind_others = false;
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -6551,24 +6574,108 @@ where
 {
     let device_id = resolve_start_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await?;
     let token = current_token(&state).await?;
-    let result = start(spotify_api.clone(), token, device_id.clone()).await;
-    let Err(error) = &result else { return result };
     let elsewhere = state.lock().unwrap().local_device_id.as_deref() != Some(device_id.as_str());
-    if !elsewhere || !device_may_be_gone(error) {
+    if !elsewhere {
+        file_log("Start: on this computer");
+        let result = start(spotify_api, token, device_id).await;
+        if let Err(error) = &result {
+            file_log(&format!("Start: this computer didn't take it ({error})"));
+        }
         return result;
     }
-    let name = forget_unanswered_device(&state, &device_id);
+    file_log(&format!("Start: on {}", device_label(&state, &device_id)));
+    // What Spotify says of the device as the command goes, to tell new music from what it had
+    // on. Asked alongside, so the music isn't held up: an answer from just after still reads
+    // right, as new music is then no further in than the time since.
+    let sent = Instant::now();
+    let (before, started) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(3), spotify_api.current_playback(&token)),
+        within(REMOTE_COMMAND_LIMIT, start(spotify_api.clone(), token.clone(), device_id.clone())),
+    );
+    // The song it had on, when Spotify said how things stood.
+    let had_on = match &before {
+        Ok(Ok(playback)) => Some(
+            playback
+                .as_ref()
+                .filter(|playback| playback.device.as_ref().and_then(|device| device.id.as_deref()) == Some(device_id.as_str()))
+                .and_then(|playback| playback.item.as_ref())
+                .map(|track| track.uri.clone()),
+        ),
+        _ => None,
+    };
+    let before = match before {
+        Ok(Ok(playback)) => playback,
+        _ => None,
+    };
+    let error = match started {
+        Ok(()) if remote_start_confirmed(&spotify_api, &token, &device_id, before.as_ref(), sent).await => return Ok(()),
+        Ok(()) => anyhow!("it took the command but didn't start playing"),
+        Err(error) if device_may_be_gone(&error) => error,
+        Err(error) => {
+            file_log(&format!("Start: failed ({error})"));
+            return Err(error);
+        }
+    };
+    let name = forget_unanswered_device(&state, &device_id, had_on);
+    file_log(&format!("Start: {name} didn't answer ({error}), so it starts on this computer"));
     let here = resolve_start_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await?;
     let token = current_token(&state).await?;
     let result = start(spotify_api, token, here).await;
-    if result.is_ok() {
-        tell_playing_here(ui_weak, name, error.to_string());
+    match &result {
+        Ok(()) => tell_playing_here(ui_weak, name, error.to_string()),
+        Err(error) => file_log(&format!("Start: this computer didn't take it either ({error})")),
     }
     result
 }
 
+/// Whether `device_id` began the music it was just sent. Spotify can accept a command for a
+/// device that has closed or gone to sleep, and nothing ever plays. An answer that can't be
+/// read counts as yes: it's no reason to take the music away from the device.
+async fn remote_start_confirmed(
+    spotify_api: &spotify::SpotifyApi,
+    token: &TokenStore,
+    device_id: &str,
+    before: Option<&PlaybackState>,
+    sent: Instant,
+) -> bool {
+    // Speakers can take a few seconds to wake.
+    for wait_ms in [400, 600, 1000, 1500, 2500] {
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        match spotify_api.current_playback(token).await {
+            Ok(Some(now)) => {
+                if remote_start_shows(before, &now, device_id, sent.elapsed().as_millis() as i64) {
+                    return true;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Whether Spotify's report `now` shows `device_id` playing music begun in the last `since_ms`.
+/// A device that has gone can go on being reported as playing what it had on, further and
+/// further into the song, so playing alone doesn't show it.
+fn remote_start_shows(before: Option<&PlaybackState>, now: &PlaybackState, device_id: &str, since_ms: i64) -> bool {
+    let on_device = |playback: &PlaybackState| playback.device.as_ref().and_then(|device| device.id.as_deref()) == Some(device_id);
+    if !on_device(now) || !now.is_playing {
+        return false;
+    }
+    // It wasn't playing there before, and is now.
+    let Some(before) = before.filter(|before| before.is_playing && on_device(before)) else { return true };
+    let song = |playback: &PlaybackState| playback.item.as_ref().map(|track| track.uri.clone());
+    if song(before) != song(now) {
+        return true;
+    }
+    // The same song again: it began anew if it's nearer its start than it was, or no further
+    // in than the time since.
+    let progress = i64::from(now.progress_ms.unwrap_or(0));
+    progress < i64::from(before.progress_ms.unwrap_or(0)) || progress <= since_ms + 1_500
+}
+
 /// Leaves `device_id` out of new music for a while, and gives its name.
-fn forget_unanswered_device(state: &Arc<Mutex<AppState>>, device_id: &str) -> String {
+fn forget_unanswered_device(state: &Arc<Mutex<AppState>>, device_id: &str, had_on: Option<Option<String>>) -> String {
     let mut guard = state.lock().unwrap();
     let name = guard
         .available_device_ids
@@ -6576,8 +6683,19 @@ fn forget_unanswered_device(state: &Arc<Mutex<AppState>>, device_id: &str) -> St
         .position(|id| id == device_id)
         .and_then(|at| guard.available_device_names.get(at).cloned())
         .unwrap_or_else(|| "The other device".to_string());
-    guard.forget_unanswered_device(device_id);
+    guard.forget_unanswered_device(device_id, had_on);
     name
+}
+
+/// True only when a failure says the device itself isn't there: it didn't answer in time, or
+/// Spotify doesn't know it. Anything else, like a passing fault at Spotify or a song that
+/// can't be queued, says nothing about the device.
+fn device_is_gone(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<reqwest::Error>().is_some_and(|error| error.is_timeout()) {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    ["didn't answer in time", "no active device", "device not found"].iter().any(|sign| message.contains(sign))
 }
 
 fn tell_playing_here(ui_weak: slint::Weak<AppWindow>, name: String, error: String) {
@@ -6596,6 +6714,9 @@ async fn play_current_here(
     state: Arc<Mutex<AppState>>,
     spotify_api: spotify::SpotifyApi,
     tried: Option<String>,
+    // Where Spotify has the song, when it was just asked. The player bar's own clock has been
+    // running since play was pressed, however long the device was waited on.
+    paused_at: Option<i32>,
     error: &anyhow::Error,
 ) -> Result<()> {
     let (gone, track, position) = {
@@ -6604,9 +6725,10 @@ async fn play_current_here(
         let mut gone = vec![tried, guard.active_device_id.clone()];
         gone.retain(|id| id.is_some() && *id != local);
         gone.dedup();
-        (gone.into_iter().flatten().collect::<Vec<_>>(), guard.current_track_uri.clone(), guard.playback_clock.displayed_progress_ms())
+        let position = paused_at.unwrap_or_else(|| guard.playback_clock.displayed_progress_ms());
+        (gone.into_iter().flatten().collect::<Vec<_>>(), guard.current_track_uri.clone(), position)
     };
-    let names = gone.iter().map(|id| forget_unanswered_device(&state, id)).collect::<Vec<_>>();
+    let names = gone.iter().map(|id| forget_unanswered_device(&state, id, Some(track.clone()))).collect::<Vec<_>>();
     let Some(track) = track else {
         return start_current_visible_tracks(state, spotify_api).await;
     };
@@ -6677,7 +6799,7 @@ async fn resolve_start_device(
                     .device
                     .filter(|device| device.is_active)
                     .and_then(|device| device.id)
-                    .filter(|id| !unanswered.get(id).is_some_and(|at| at.elapsed() < UNANSWERED_DEVICE_SKIP));
+                    .filter(|id| !unanswered.get(id).is_some_and(Unanswered::still_left_out));
             }
         }
     }
@@ -7196,16 +7318,44 @@ async fn refresh_playback_only(
 
     // Do not collapse a request/parse failure into Spotify's real 204/no-playback
     // state. An error keeps the last confirmed snapshot and the next tick retries.
-    let playback = spotify_api.current_playback(&token).await?;
+    let mut playback = spotify_api.current_playback(&token).await?;
+    let mut notes = Vec::new();
     let remote_volume = {
         let mut guard = state.lock().unwrap();
         // Signed out while Spotify answered: the answer was about the account that left.
         ensure_same_session(&guard, session)?;
+        // Spotify can go on saying this PC plays after its player stopped being the active
+        // device. The player knows best, and nothing can be heard, so it counts as paused.
+        let own_id = guard.playback_engine.as_ref().map(|engine| engine.session().device_id().to_string());
+        if let Some(playback) = playback.as_mut().filter(|playback| playback.is_playing) {
+            let here = own_id.is_some() && playback.device.as_ref().and_then(|device| device.id.clone()) == own_id;
+            if here && !guard.local_is_active() {
+                playback.is_playing = false;
+            }
+        }
         let reported_active = playback
             .as_ref()
             .and_then(|p| p.device.as_ref())
             .filter(|d| d.is_active)
             .and_then(|d| d.id.clone());
+        let changed = guard.active_device_id != reported_active;
+        let is_playing = playback.as_ref().is_some_and(|playback| playback.is_playing);
+        if changed {
+            let name = match reported_active.as_deref() {
+                Some(id) => device_label_in(&guard, id),
+                None => "none".to_string(),
+            };
+            notes.push(format!("Spotify's active device is now: {name} ({})", if is_playing { "playing" } else { "not playing" }));
+        }
+        // A device left out for not answering is let back in once it shows it's there.
+        if let Some(id) = reported_active.as_ref().filter(|_| is_playing) {
+            let took_over = changed && guard.active_device_id.is_some();
+            let song_now = playback.as_ref().and_then(|playback| playback.item.as_ref()).map(|track| track.uri.as_str());
+            if guard.unanswered_devices.get(id).is_some_and(|left_out| left_out.answers_again(song_now, took_over)) {
+                guard.unanswered_devices.remove(id);
+                notes.push(format!("{} answers again, so new music can go to it", device_label_in(&guard, id)));
+            }
+        }
         guard.active_device_id = reported_active.clone();
         if let Some(active) = reported_active {
             guard.preferred_device_id = Some(active.clone());
@@ -7228,6 +7378,9 @@ async fn refresh_playback_only(
                 .and_then(|d| d.volume_percent)
         }
     };
+    for note in notes {
+        file_log(&note);
+    }
     if let Some(volume) = remote_volume {
         let ui_weak = ui_weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -8227,34 +8380,130 @@ fn embedded_asset_path(name: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-async fn toggle_playback(
-    spotify_api: &spotify::SpotifyApi,
-    token: &TokenStore,
-    device_id: Option<&str>,
+/// Plays or pauses, whichever was asked for, on whatever holds the music. It's asked for by
+/// name, not as "the other one": Spotify's word on what's playing lags, so a toggle could pause
+/// a song that had only just started when play was pressed.
+async fn set_playing(
+    ui_weak: slint::Weak<AppWindow>,
+    state: Arc<Mutex<AppState>>,
+    spotify_api: spotify::SpotifyApi,
+    want_playing: bool,
 ) -> Result<()> {
-    let playback = spotify_api.current_playback(token).await?;
-    let is_playing = playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
-    // Always address the device that actually holds the session.
-    let session_device = playback
-        .as_ref()
-        .and_then(|p| p.device.as_ref())
-        .and_then(|d| d.id.clone());
-    let has_context = playback.and_then(|p| p.item).is_some();
-    let target = session_device.as_deref().or(device_id);
-
-    if is_playing {
-        spotify_api.pause(token, target).await
-    } else if has_context {
-        spotify_api.resume(token, target).await
-    } else if let Some(device_id) = device_id {
-        // No active session anywhere: ask Spotify to resume the last one here.
-        spotify_api
-            .transfer(token, device_id, true)
-            .await
-            .map_err(|_| anyhow::anyhow!("nothing is currently queued to resume; start a playlist or liked song first"))
-    } else {
-        Err(anyhow::anyhow!("nothing is currently queued to resume; start a playlist or liked song first"))
+    let (use_local, device, local, own_id, has_bar_song) = {
+        let guard = state.lock().unwrap();
+        let own_id = guard.playback_engine.as_ref().map(|engine| engine.session().device_id().to_string());
+        (guard.local_is_active(), guard.device_id.clone(), guard.local_device_id.clone(), own_id, guard.current_track_uri.is_some())
+    };
+    if use_local {
+        let action = if want_playing { LocalPlayerAction::Play } else { LocalPlayerAction::Pause };
+        return run_local_player_action_with_recovery(state, ui_weak, spotify_api, action).await;
     }
+    let token = current_token(&state).await?;
+    let playback = spotify_api.current_playback(&token).await?;
+    // The device that holds the music, which is the one to tell.
+    let holder = playback.as_ref().and_then(|playback| playback.device.as_ref()).and_then(|device| device.id.clone());
+    // Spotify names this PC, whose player isn't the active device: nothing holds the music.
+    let held_here = holder.is_some() && (holder == local || holder == own_id);
+    let is_playing = !held_here && playback.as_ref().is_some_and(|playback| playback.is_playing);
+    // Where the player bar's song is, if that's the song Spotify has.
+    let paused_at = {
+        let guard = state.lock().unwrap();
+        playback
+            .as_ref()
+            .filter(|playback| playback.item.as_ref().map(|track| &track.uri) == guard.current_track_uri.as_ref())
+            .and_then(|playback| playback.progress_ms)
+    };
+    if !want_playing {
+        if !is_playing {
+            return Ok(());
+        }
+        return spotify_api.pause(&token, holder.as_deref().or(device.as_deref())).await;
+    }
+    if is_playing {
+        return Ok(());
+    }
+    if let Some(holder) = holder.filter(|_| !held_here) {
+        // Another device has it, paused. One that was closed or has gone to sleep stays in
+        // Spotify's list a while, and may even take the command, yet never plays.
+        file_log(&format!("Play: resuming on {}", device_label(&state, &holder)));
+        {
+            // The bar goes on showing play while the device is given its time to answer.
+            let mut guard = state.lock().unwrap();
+            guard.optimistic_is_playing = Some(true);
+            guard.optimistic_playback_until = Some(Instant::now() + REMOTE_COMMAND_LIMIT + Duration::from_secs(4));
+        }
+        let failure = match within(REMOTE_COMMAND_LIMIT, spotify_api.resume(&token, Some(holder.as_str()))).await {
+            Ok(()) if remote_resumed(&spotify_api, &token, &holder).await => return Ok(()),
+            Ok(()) => anyhow!("it took the command but didn't start playing"),
+            Err(error) if device_may_be_gone(&error) => error,
+            Err(error) => return Err(error),
+        };
+        return play_current_here(ui_weak, state, spotify_api, Some(holder), paused_at, &failure).await;
+    }
+    // Nothing else holds the music, so it plays here. This PC's player isn't the active
+    // device, so it has to be told what to play: it can't resume what it doesn't hold.
+    if has_bar_song {
+        file_log("Play: nothing else holds the music, so the song in the player bar starts here");
+        return play_current_here(ui_weak, state, spotify_api, None, paused_at, &anyhow!("no device holds the music")).await;
+    }
+    let nothing_queued = || anyhow!("nothing is currently queued to resume; start a playlist or liked song first");
+    match device {
+        // Nothing in the player bar either: ask Spotify to resume the last session here.
+        Some(device_id) => spotify_api.transfer(&token, &device_id, true).await.map_err(|_| nothing_queued()),
+        None => Err(nothing_queued()),
+    }
+}
+
+/// How long a command to another device may take. Spotify waits on the device, and one that
+/// has gone holds the request until it gives up.
+const REMOTE_COMMAND_LIMIT: Duration = Duration::from_secs(5);
+
+/// `command`, given up on after `limit`.
+async fn within<F>(limit: Duration, command: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(limit, command).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("it didn't answer in time")),
+    }
+}
+
+/// Whether `device_id` is playing a moment after being told to carry on. An answer that can't
+/// be read counts as yes: it's no reason to take the music away from the device.
+async fn remote_resumed(spotify_api: &spotify::SpotifyApi, token: &TokenStore, device_id: &str) -> bool {
+    // A phone's app may have to wake first.
+    for wait_ms in [500, 800, 1200, 2000] {
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        match spotify_api.current_playback(token).await {
+            Ok(Some(playback)) => {
+                let there = playback.device.as_ref().and_then(|device| device.id.as_deref()) == Some(device_id);
+                if there && playback.is_playing {
+                    return true;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// A device's name for the log, or its id when the list doesn't have it.
+fn device_label(state: &Arc<Mutex<AppState>>, device_id: &str) -> String {
+    device_label_in(&state.lock().unwrap(), device_id)
+}
+
+fn device_label_in(guard: &AppState, device_id: &str) -> String {
+    if guard.local_device_id.as_deref() == Some(device_id) {
+        return "this computer".to_string();
+    }
+    guard
+        .available_device_ids
+        .iter()
+        .position(|id| id == device_id)
+        .and_then(|at| guard.available_device_names.get(at).cloned())
+        .unwrap_or_else(|| format!("device {device_id}"))
 }
 
 async fn start_current_visible_tracks(
@@ -8311,6 +8560,11 @@ async fn switch_playback_device(
 ) -> Result<String> {
     let playback_before = spotify_api.current_playback(&token).await?;
     let was_playing = playback_before.as_ref().map(|p| p.is_playing).unwrap_or(false);
+    file_log(&format!(
+        "Device picked: {} (music was {})",
+        if is_local_device { "this computer".to_string() } else { device_label(&state, &device_id) },
+        if was_playing { "playing" } else { "not playing" },
+    ));
     let current_track_uri = playback_before
         .as_ref()
         .and_then(|p| p.item.as_ref())
@@ -8563,6 +8817,7 @@ fn clear_local_playback_engine(state: &Arc<Mutex<AppState>>) {
         engine.shutdown();
     }
     guard.playback_engine = None;
+    guard.local_connect_active = false;
     guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
     // The old player's events stop here, its Paused included, so the song stops counting.
     guard.play_watch.stopped();
@@ -8688,6 +8943,7 @@ async fn start_local_playback(
         }
         let old_local_device_id = guard.local_device_id.clone();
         guard.playback_engine = None;
+        guard.local_connect_active = false;
         guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
         guard.local_device_id = None;
         if old_local_device_id.is_some() && guard.device_id == old_local_device_id {
@@ -8764,6 +9020,8 @@ async fn start_local_playback(
         guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
         let generation = guard.playback_engine_generation;
         guard.playback_engine = Some(engine);
+        // A new player registers as a device without becoming the active one.
+        guard.local_connect_active = false;
         generation
     };
     if let Some(events) = events {
@@ -8950,7 +9208,22 @@ async fn run_local_player_event_loop(
                 }
                 note_audio_dropouts(&ui_weak);
             }
-            PlayerEvent::SessionDisconnected { .. } => begin_fast_playback_refresh(&state, Duration::from_secs(4)),
+            PlayerEvent::SessionConnected { .. } => {
+                state.lock().unwrap().local_connect_active = true;
+                file_log("This computer's player is now the active device");
+            }
+            PlayerEvent::SessionDisconnected { .. } => {
+                {
+                    let mut guard = state.lock().unwrap();
+                    guard.local_connect_active = false;
+                    guard.local_playing = false;
+                    guard.play_watch.stopped();
+                }
+                crash_restart::note_playing_here(false);
+                file_log("This computer's player is no longer the active device");
+                // Another device took over, which is then shown at once.
+                begin_fast_playback_refresh(&state, Duration::from_secs(4));
+            }
             PlayerEvent::VolumeChanged { volume } => {
                 // Set from a phone or another Spotify app, or our own change coming back.
                 state.lock().unwrap().local_volume_percent = playback::spotify_volume_to_percent(volume);
@@ -9515,6 +9788,7 @@ fn append_log(ui: &AppWindow, message: &str) {
 /// Adds a line to the log in Settings, with no toast: for failures already shown where they
 /// happened, or not worth interrupting anyone for.
 fn write_log(ui: &AppWindow, message: &str) {
+    file_log(message);
     if !should_show_log(ui.get_log_level().as_str(), message) {
         return;
     }
@@ -9529,6 +9803,30 @@ fn write_log(ui: &AppWindow, message: &str) {
     ui.set_status_log(next.into());
 }
 
+/// Adds a line to `spotlight.log` in the settings folder. The log in Settings is gone once
+/// Spotlight closes, and what led up to a problem is most wanted after it. Everything goes
+/// in, whatever level Settings shows, along with what happens between devices.
+fn file_log(message: &str) {
+    /// The log starts afresh past this size, with the one before kept beside it.
+    const LIMIT: u64 = 512 * 1024;
+    static WRITING: Mutex<()> = Mutex::new(());
+    if cfg!(test) {
+        return;
+    }
+    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(dir) = FOLDER.get_or_init(|| config::config_dir().ok()) else { return };
+    let _writing = WRITING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = dir.join("spotlight.log");
+    if std::fs::metadata(&path).is_ok_and(|file| file.len() > LIMIT) {
+        let _ = std::fs::rename(&path, dir.join("spotlight.old.log"));
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let (year, month, day, hour, minute, second) = local_now();
+        let _ = writeln!(file, "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {message}");
+    }
+}
+
 fn should_show_log(level: &str, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     let is_error = lower.contains("failed") || lower.contains("error") || lower.contains("expired");
@@ -9541,21 +9839,27 @@ fn should_show_log(level: &str, message: &str) -> bool {
 }
 
 /// The time of day on this PC's clock, for the log.
-#[cfg(target_os = "windows")]
 fn chrono_like_time() -> String {
+    let (_, _, _, hour, minute, second) = local_now();
+    format!("{hour:02}:{minute:02}:{second:02}")
+}
+
+/// The date and time on this PC's clock: year, month, day, hour, minute, second.
+#[cfg(target_os = "windows")]
+fn local_now() -> (i32, u32, u32, u32, u32, u32) {
     let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
-    format!("{:02}:{:02}:{:02}", now.wHour, now.wMinute, now.wSecond)
+    (now.wYear.into(), now.wMonth.into(), now.wDay.into(), now.wHour.into(), now.wMinute.into(), now.wSecond.into())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn chrono_like_time() -> String {
+fn local_now() -> (i32, u32, u32, u32, u32, u32) {
     let mut now: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         let seconds = libc::time(std::ptr::null_mut());
         libc::localtime_r(&seconds, &mut now);
     }
-    format!("{:02}:{:02}:{:02}", now.tm_hour, now.tm_min, now.tm_sec)
+    (now.tm_year + 1900, (now.tm_mon + 1) as u32, now.tm_mday as u32, now.tm_hour as u32, now.tm_min as u32, now.tm_sec as u32)
 }
 
 /// What tells a second copy of Spotlight that one is already running. On Windows it's a name
@@ -9805,10 +10109,62 @@ mod queue_edit_tests {
 
 #[cfg(test)]
 mod device_and_queue_tests {
-    use super::{pick_start_device, picker_matches, queue_tail_start, uris_from_queue_click};
+    use super::{pick_start_device, picker_matches, queue_tail_start, remote_start_shows, uris_from_queue_click, PlaybackState, Unanswered, UNANSWERED_DEVICE_SETTLE};
+    use std::time::{Duration, Instant};
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// Spotify's report of `song` on `device`, `progress_ms` in.
+    fn report(device: &str, song: &str, progress_ms: i32, is_playing: bool) -> PlaybackState {
+        serde_json::from_value(serde_json::json!({
+            "is_playing": is_playing,
+            "progress_ms": progress_ms,
+            "item": { "name": song, "uri": song, "duration_ms": 200_000, "album": { "name": "", "images": [] }, "artists": [] },
+            "device": { "id": device, "is_active": true, "name": device },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_device_that_took_the_music_shows_it_starting() {
+        let before = report("phone", "old", 60_000, true);
+        assert!(remote_start_shows(Some(&before), &report("phone", "new", 300, true), "phone", 900), "another song");
+        assert!(remote_start_shows(Some(&before), &report("phone", "old", 400, true), "phone", 900), "the same song from its start");
+        assert!(remote_start_shows(None, &report("phone", "new", 300, true), "phone", 900), "nothing was playing");
+        let paused = report("phone", "old", 60_000, false);
+        assert!(remote_start_shows(Some(&paused), &report("phone", "old", 61_000, true), "phone", 900), "it was paused there");
+        let elsewhere = report("speaker", "old", 60_000, true);
+        assert!(remote_start_shows(Some(&elsewhere), &report("phone", "old", 61_000, true), "phone", 900), "it played somewhere else");
+        // Asked as the command went, the report from before can already be the new music.
+        let already = report("phone", "new", 100, true);
+        assert!(remote_start_shows(Some(&already), &report("phone", "new", 1_500, true), "phone", 1_600));
+    }
+
+    #[test]
+    fn a_device_left_out_comes_back_once_it_shows_it_s_there() {
+        let old = Some(Some("old".to_string()));
+        let a_while_ago = Instant::now() - UNANSWERED_DEVICE_SETTLE - Duration::from_secs(1);
+        let left_out = Unanswered { at: a_while_ago, had_on: old.clone() };
+        assert!(!left_out.answers_again(Some("old"), false), "still reported as playing what it had on");
+        assert!(left_out.answers_again(Some("new"), false), "another song");
+        assert!(left_out.answers_again(Some("old"), true), "it took the music from another device");
+        let idle = Unanswered { at: a_while_ago, had_on: Some(None) };
+        assert!(idle.answers_again(Some("new"), false), "it had nothing on, and plays now");
+        let unknown = Unanswered { at: a_while_ago, had_on: None };
+        assert!(!unknown.answers_again(Some("new"), false), "what it had on isn't known");
+        let just_now = Unanswered { at: Instant::now(), had_on: old };
+        assert!(!just_now.answers_again(Some("new"), true), "Spotify may still describe things as they were");
+    }
+
+    #[test]
+    fn a_device_that_has_gone_doesn_t_show_the_music_starting() {
+        let before = report("phone", "old", 60_000, true);
+        assert!(!remote_start_shows(Some(&before), &report("phone", "old", 61_000, true), "phone", 900), "still reported as playing what it had on");
+        assert!(!remote_start_shows(Some(&before), &report("phone", "old", 66_000, true), "phone", 6_000), "and further in later");
+        assert!(!remote_start_shows(Some(&before), &report("phone", "new", 0, false), "phone", 900), "loaded but not playing");
+        assert!(!remote_start_shows(Some(&before), &report("speaker", "new", 300, true), "phone", 900), "something else is playing");
     }
 
     #[test]

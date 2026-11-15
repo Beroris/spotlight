@@ -22,3 +22,10 @@ Two changes in `src/spirc.rs` make sure a player that is told to stop really sto
   until the session ended.
 
 Both are marked with a `Spotlight:` comment.
+
+## Saying when it stops being the active device
+
+`handle_cluster_update` in `src/spirc.rs` has two ways of going inactive. One went through
+`handle_disconnect`, which sends `SessionDisconnected`. The other, for an update with no cluster
+in it, said nothing. It now sends the same event, so the app always knows whether this player is
+the active device. Commands sent to it while it isn't are dropped without an error.

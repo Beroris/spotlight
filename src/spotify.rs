@@ -37,6 +37,11 @@ pub fn rate_limit_wait() -> Option<Duration> {
     (left > 0).then(|| Duration::from_millis(left).min(LONGEST_RATE_LIMIT_WAIT))
 }
 
+/// Where the player's state and its commands are.
+const PLAYER_URL: &str = "https://api.spotify.com/v1/me/player";
+/// How long one of them may take. Other requests get the client's longer limit.
+const PLAYER_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// How many songs a long list shows at first, and how many more each time more are asked for.
 pub const SONGS_PER_PART: usize = 500;
 /// The same for the playlists in the library.
@@ -213,6 +218,9 @@ impl SpotifyApi {
         match self.request(token, Method::PUT, &url, Some(body.clone())).await {
             Ok(_) => Ok(()),
             Err(error) if error.downcast_ref::<RateLimitError>().is_some() => Err(error),
+            // A device that doesn't answer won't answer a transfer either. Trying only makes
+            // the wait three times as long before the music can start somewhere else.
+            Err(error) if error.downcast_ref::<reqwest::Error>().is_some_and(|error| error.is_timeout()) => Err(error),
             Err(_) => {
                 self.transfer(token, device_id, false).await?;
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -581,6 +589,11 @@ impl SpotifyApi {
     async fn request(&self, token: &TokenStore, method: Method, url: &str, body: Option<Value>) -> Result<reqwest::Response> {
         let requires_empty_body = body.is_none() && (method == Method::POST || method == Method::PUT);
         let mut builder = self.http.request(method, url).bearer_auth(&token.access_token);
+        // Spotify holds a player command until the device answers. One that has closed or
+        // gone to sleep never does, and the button pressed shouldn't hang on it for long.
+        if url.starts_with(PLAYER_URL) {
+            builder = builder.timeout(PLAYER_TIMEOUT);
+        }
         if let Some(body) = body {
             builder = builder.json(&body);
         } else if requires_empty_body {
