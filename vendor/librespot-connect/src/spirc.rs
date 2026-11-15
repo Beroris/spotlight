@@ -38,6 +38,7 @@ use librespot_protocol::context_page::ContextPage;
 use librespot_protocol::context_track::ContextTrack;
 use protobuf::MessageField;
 use std::{
+    collections::HashSet,
     future::Future,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
@@ -172,7 +173,8 @@ fn log_carried_on(list: &HandedOver, why: &str) {
 /// Spotlight: what a play command asks for: the list it names, or the songs it brought when
 /// it names none. A name Spotify can't be asked for, like the "-" a list of songs can come
 /// under, also plays the songs brought. Asking for it failed, and nothing started.
-/// `playing` is the name of the list this player has now, if it has one.
+/// `playing` is the name of the list this player has now, if it has one and every song
+/// brought is in it.
 fn named_or_brought(
     named: Option<String>,
     brought: &[ContextTrack],
@@ -185,6 +187,7 @@ fn named_or_brought(
             || uri.starts_with("spotify:search")
             // The list this player already has is played from as it is, as before. Another
             // app picking a song in it names it and may bring only the songs it knows of.
+            // Other songs under that name are a new list: made-up names are shared.
             || (!uri.is_empty() && playing == Some(uri))
     };
     match named {
@@ -202,6 +205,15 @@ fn named_or_brought(
         }
         _ => None,
     }
+}
+
+/// Spotlight: whether every song a play command brought is in `list`, the songs this player
+/// has. Only then does a command naming that list mean "play from it".
+fn all_in_list<'a>(brought: &[ContextTrack], list: impl Iterator<Item = &'a str>) -> bool {
+    let list: HashSet<&str> = list.collect();
+    brought
+        .iter()
+        .all(|song| song.uri.as_deref().is_some_and(|uri| list.contains(uri)))
 }
 
 // delay to update volume after a certain amount of time, instead on each update request
@@ -1202,7 +1214,9 @@ impl SpircTask {
                 let playing = self
                     .connect_state
                     .get_context(ContextType::Default)
-                    .is_ok()
+                    .is_ok_and(|list| {
+                        all_in_list(&brought, list.tracks.iter().map(|song| song.uri.as_str()))
+                    })
                     .then(|| self.connect_state.context_uri().clone());
 
                 let context =
@@ -2133,9 +2147,9 @@ impl SpircTask {
             if let Some(cache) = self.session.cache() {
                 cache.save_volume(volume)
             }
-            if self.connect_state.is_active() {
-                self.player.emit_volume_changed_event(volume);
-            }
+            // Said whether or not the music is here. An app that keeps the volume for the
+            // player's next start would otherwise never hear of one set while it's elsewhere.
+            self.player.emit_volume_changed_event(volume);
         }
     }
 }
@@ -2203,5 +2217,15 @@ mod tests {
         // An empty name is never the name of a list that is here.
         let plays = named_or_brought(Some(String::new()), &brought, Some(""));
         assert!(matches!(plays, Some(PlayContext::Tracks(_))), "{plays:?}");
+    }
+
+    #[test]
+    fn other_songs_under_the_name_of_the_list_here_are_a_new_list() {
+        let here = ["spotify:track:a", "spotify:track:b"];
+        assert!(all_in_list(&songs(&["spotify:track:b"]), here.into_iter()));
+        assert!(all_in_list(&songs(&["spotify:track:b", "spotify:track:a"]), here.into_iter()));
+        assert!(!all_in_list(&songs(&["spotify:track:a", "spotify:track:c"]), here.into_iter()));
+        // A song that came without its uri can't be found in the list, so it is loaded.
+        assert!(!all_in_list(&[ContextTrack::default()], here.into_iter()));
     }
 }

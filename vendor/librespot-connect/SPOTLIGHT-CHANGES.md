@@ -90,7 +90,8 @@ In `src/spirc.rs`:
 - `named_or_brought` decides what a play command plays. A name Spotify can't be asked for
   plays the songs brought along, as a command with no name always did, and the log says
   which name came. A search plays as before, and so does a song picked in the list this
-  player already has.
+  player already has. A command that names the list here but brings songs that aren't all
+  in it (`all_in_list`) is a new list under the same made-up name, and its songs play.
 - `handle_load` takes the songs brought (`brought`), as they came. When the list that was
   named was asked for and couldn't be had, and no list is left to play from, those songs
   play and the log says which name failed. A command whose name and page are both unusable
@@ -117,6 +118,10 @@ among them. A volume chosen in the app while the music was elsewhere or nowhere 
 was heard at once (the app sets its output itself) but never reached the player, which gave
 its old volume back when the music came. `SpircCommand::SetVolume` is now taken either way,
 as a volume Spotify passes on always was.
+
+`set_volume` says the new volume (`VolumeChanged`) whether or not the music is here. Before,
+one set while the music was elsewhere was only said once the music came. An app that keeps
+the volume for the player's next start missed it when the player started again first.
 
 A volume Spotify passes on (`hm://connect-state/v1/connect/volume`) comes from another device
 or app. `volume_asked_through_spotify` in `src/spirc.rs` notes that, and once the volume has
