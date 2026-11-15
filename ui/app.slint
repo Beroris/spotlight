@@ -3737,11 +3737,11 @@ export component AppWindow inherits Window {
                         width: 40px;
                         height: 40px;
                         border-radius: 20px;
-                        background: root.show_settings || settings-touch.has-hover ? AppTheme.selected-bg : AppTheme.hover-bg;
+                        background: settings-touch.has-hover ? AppTheme.hover-bg : transparent;
                         animate background { duration: AppTheme.motion-duration; easing: ease-out; }
                         Image {
                             source: root.settings_icon;
-                            colorize: root.show_settings || settings-touch.has-hover ? AppTheme.text : AppTheme.subtle-text;
+                            colorize: root.show_settings || settings-touch.has-hover ? AppTheme.text : AppTheme.secondary-text;
                             width: 18px;
                             height: 18px;
                             image-fit: contain;
