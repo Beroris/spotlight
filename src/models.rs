@@ -101,6 +101,59 @@ pub struct AppConfig {
     pub library_snapshot: LibrarySnapshot,
     #[serde(default)]
     pub startup_snapshot: StartupSnapshot,
+    /// The shuffle and repeat last used, overall and with each playlist.
+    #[serde(default)]
+    pub play_modes: PlayModes,
+}
+
+/// Shuffle and repeat as they were last used.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Modes {
+    pub shuffle: bool,
+    /// "off", "context" or "track", as Spotify names them.
+    pub repeat: String,
+}
+
+/// The shuffle and repeat last used with each playlist, and with any list at all. A list
+/// that hasn't been played with Spotlight yet starts the way the last one was left.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct PlayModes {
+    #[serde(default)]
+    pub last: Option<Modes>,
+    /// Newest first, as (list address, modes).
+    #[serde(default)]
+    pub lists: Vec<(String, Modes)>,
+}
+
+impl PlayModes {
+    /// How many lists are remembered. The one left alone longest goes first.
+    const MOST_LISTS: usize = 300;
+
+    /// What `list_uri` should start with, if anything has been used yet.
+    pub fn for_list(&self, list_uri: &str) -> Option<&Modes> {
+        self.lists
+            .iter()
+            .find(|(uri, _)| uri == list_uri)
+            .map(|(_, modes)| modes)
+            .or(self.last.as_ref())
+    }
+
+    /// Notes `modes` as the last used, and as `list_uri`'s when there is one. True when that
+    /// changed anything.
+    pub fn remember(&mut self, list_uri: Option<&str>, modes: Modes) -> bool {
+        let mut changed = self.last.as_ref() != Some(&modes);
+        self.last = Some(modes.clone());
+        if let Some(list_uri) = list_uri.filter(|uri| !uri.is_empty()) {
+            let at = self.lists.iter().position(|(uri, _)| uri == list_uri);
+            changed |= at.is_none_or(|at| at != 0 || self.lists[at].1 != modes);
+            if let Some(at) = at {
+                self.lists.remove(at);
+            }
+            self.lists.insert(0, (list_uri.to_string(), modes));
+            self.lists.truncate(Self::MOST_LISTS);
+        }
+        changed
+    }
 }
 
 fn default_artwork_enabled() -> bool {
@@ -366,4 +419,53 @@ pub struct StartupSnapshot {
     pub last_track_uri: Option<String>,
     pub last_playlist_uri: Option<String>,
     pub last_played_at_epoch: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn modes(shuffle: bool, repeat: &str) -> Modes {
+        Modes { shuffle, repeat: repeat.into() }
+    }
+
+    #[test]
+    fn a_list_starts_the_way_it_was_last_left() {
+        let mut play_modes = PlayModes::default();
+        assert_eq!(play_modes.for_list("spotify:playlist:a"), None);
+        play_modes.remember(Some("spotify:playlist:a"), modes(true, "context"));
+        play_modes.remember(Some("spotify:playlist:b"), modes(false, "off"));
+        assert_eq!(play_modes.for_list("spotify:playlist:a"), Some(&modes(true, "context")));
+        assert_eq!(play_modes.for_list("spotify:playlist:b"), Some(&modes(false, "off")));
+    }
+
+    #[test]
+    fn a_new_list_starts_the_way_the_last_was_left() {
+        let mut play_modes = PlayModes::default();
+        play_modes.remember(Some("spotify:playlist:a"), modes(true, "track"));
+        assert_eq!(play_modes.for_list("spotify:playlist:new"), Some(&modes(true, "track")));
+        play_modes.remember(None, modes(false, "context"));
+        assert_eq!(play_modes.for_list("spotify:playlist:new"), Some(&modes(false, "context")));
+        assert_eq!(play_modes.for_list("spotify:playlist:a"), Some(&modes(true, "track")));
+    }
+
+    #[test]
+    fn remembering_the_same_again_changes_nothing() {
+        let mut play_modes = PlayModes::default();
+        assert!(play_modes.remember(Some("a"), modes(true, "off")));
+        assert!(!play_modes.remember(Some("a"), modes(true, "off")));
+        assert!(play_modes.remember(Some("b"), modes(true, "off")));
+        assert!(play_modes.remember(Some("a"), modes(true, "off")));
+        assert_eq!(play_modes.lists.len(), 2);
+    }
+
+    #[test]
+    fn only_so_many_lists_are_kept() {
+        let mut play_modes = PlayModes::default();
+        for n in 0..PlayModes::MOST_LISTS + 5 {
+            play_modes.remember(Some(&format!("list {n}")), modes(false, "off"));
+        }
+        assert_eq!(play_modes.lists.len(), PlayModes::MOST_LISTS);
+        assert_eq!(play_modes.lists[0].0, format!("list {}", PlayModes::MOST_LISTS + 4));
+    }
 }

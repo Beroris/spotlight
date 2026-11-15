@@ -34,7 +34,8 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::{ato
 
 use anyhow::{anyhow, Context, Result};
 use media_keys::{MediaCommand, MediaKeyGuard};
-use models::{AppConfig, CachedLikedSong, CachedPlaylist, FullTrack, LIKED_SONGS_PLAYLIST_URI, PlaybackState, TokenStore};
+use models::{AppConfig, CachedLikedSong, CachedPlaylist, FullTrack, LIKED_SONGS_PLAYLIST_URI, Modes, PlaybackState, TokenStore};
+use rand::Rng;
 use single_instance::SingleInstance;
 use slint::{CloseRequestResponse, Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::{runtime::Runtime, sync::mpsc};
@@ -87,6 +88,10 @@ struct AppState {
     /// Device Spotify currently reports as active (may be another app).
     active_device_id: Option<String>,
     preferred_device_id: Option<String>,
+    /// Devices that didn't answer when music was sent to them, and when. Spotify can go on
+    /// listing, even as active, a device that has closed or gone to sleep. New music skips
+    /// these for a while and plays on this PC, unless one is picked again.
+    unanswered_devices: HashMap<String, Instant>,
     available_device_ids: Vec<String>,
     available_device_names: Vec<String>,
     playlist_uris: Vec<String>,
@@ -236,7 +241,32 @@ impl AppState {
     fn local_is_selected(&self) -> bool {
         self.device_id.is_some() && self.device_id == self.local_device_id
     }
+
+    /// The device new music goes to, leaving out one that didn't answer a moment ago.
+    fn start_device(&self) -> Option<String> {
+        pick_start_device(self.active_device_id.as_ref(), self.preferred_device_id.as_ref(), &self.available_device_ids)
+            .filter(|id| !self.unanswered_devices.get(id).is_some_and(|at| at.elapsed() < UNANSWERED_DEVICE_SKIP))
+    }
+
+    /// `device_id` didn't take the music sent to it, so the next music plays on this PC.
+    fn forget_unanswered_device(&mut self, device_id: &str) {
+        self.unanswered_devices.retain(|_, at| at.elapsed() < UNANSWERED_DEVICE_SKIP);
+        self.unanswered_devices.insert(device_id.to_string(), Instant::now());
+        if self.active_device_id.as_deref() == Some(device_id) {
+            self.active_device_id = None;
+        }
+        if self.preferred_device_id.as_deref() == Some(device_id) {
+            self.preferred_device_id = None;
+        }
+        if self.device_id.as_deref() == Some(device_id) {
+            self.device_id = self.local_device_id.clone();
+        }
+    }
 }
+
+/// How long new music leaves out a device that didn't answer. Picking it from the list again
+/// sends music to it at once.
+const UNANSWERED_DEVICE_SKIP: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug)]
 struct PlaybackClock {
@@ -431,6 +461,7 @@ fn main() -> Result<()> {
         local_device_id: None,
         active_device_id: None,
         preferred_device_id: None,
+        unanswered_devices: HashMap::new(),
         available_device_ids: Vec::new(),
         available_device_names: Vec::new(),
         playlist_uris: cached_playlist_uris,
@@ -2206,6 +2237,7 @@ fn bind_callbacks(
                     } else {
                         match &result {
                             Ok(actual_device_id) => {
+                                guard.unanswered_devices.remove(actual_device_id);
                                 guard.preferred_device_id = Some(actual_device_id.clone());
                                 guard.device_id = Some(actual_device_id.clone());
                             }
@@ -2750,7 +2782,13 @@ fn bind_callbacks(
                     }
                     match (loaded, library_index) {
                         (Ok(()), Some(index)) => ui.invoke_activate_playlist(index),
-                        (Ok(()), None) => play_from_list(&ui_weak, &player_runtime, &state, &spotify_api, chosen.uri, 0, false),
+                        (Ok(()), None) => {
+                            // In shuffle it starts anywhere, as Spotify's own apps do.
+                            let shuffled = state.lock().unwrap().config.play_modes.for_list(&chosen.uri).is_some_and(|modes| modes.shuffle);
+                            let songs = state.lock().unwrap().playlist_track_cache.get(&chosen.uri).map_or(0, Vec::len);
+                            let first = if shuffled && songs > 0 { rand::thread_rng().gen_range(0..songs) } else { 0 };
+                            play_from_list(&ui_weak, &player_runtime, &state, &spotify_api, chosen.uri, first, false)
+                        }
                         (Err(error), _) => {
                             append_log(&ui, &format!("Couldn't play {}: {error}", chosen.title));
                             show_toast(&ui, "Couldn't play that", true);
@@ -2997,6 +3035,7 @@ fn bind_callbacks(
                 selected.uri.clone(),
                 uris,
                 generation,
+                None,
             );
         }
     });
@@ -3122,6 +3161,12 @@ fn bind_playback_callbacks(
                         .await;
                         start_current_visible_tracks(Arc::clone(&state_inner), spotify_api_inner.clone()).await
                     }
+                    // Spotify still names a device that has closed or gone to sleep: carry on here.
+                    Err(error) if should_start_when_empty && device_may_be_gone(&error) => {
+                        play_current_here(ui_weak_inner.clone(), Arc::clone(&state_inner), spotify_api_inner.clone(), device.clone(), &error).await
+                    }
+                    // Nothing that answers is playing it, so it's as good as paused.
+                    Err(error) if !should_start_when_empty && error.to_string().to_ascii_lowercase().contains("no active device") => Ok(()),
                     other => other,
                 };
                 if result.is_ok() {
@@ -3252,6 +3297,7 @@ fn bind_playback_callbacks(
             let enabled = if let Some(ui) = ui_weak.upgrade() {
                 let next = !ui.get_shuffle_enabled();
                 ui.set_shuffle_enabled(next);
+                remember_play_modes(&ui, &state);
                 let mut guard = state.lock().unwrap();
                 if guard.parked.is_some() {
                     // Nothing is playing to tell. It plays this way when it starts.
@@ -3302,6 +3348,7 @@ fn bind_playback_callbacks(
                                 guard.optimistic_shuffle_until = None;
                             }
                             ui.set_shuffle_enabled(!enabled);
+                            remember_play_modes(&ui, &state_inner);
                             append_log(&ui, &format!("Playback command failed: {error}"));
                         }
                     }
@@ -3320,6 +3367,7 @@ fn bind_playback_callbacks(
                 let previous = ui.get_repeat_mode().to_string();
                 let next = cycle_repeat_mode(&previous);
                 ui.set_repeat_mode(next.clone().into());
+                remember_play_modes(&ui, &state);
                 let mut guard = state.lock().unwrap();
                 if guard.parked.is_some() {
                     drop(guard);
@@ -3360,6 +3408,7 @@ fn bind_playback_callbacks(
                                 guard.optimistic_repeat_until = None;
                             }
                             ui.set_repeat_mode(previous_mode.into());
+                            remember_play_modes(&ui, &state_inner);
                             append_log(&ui, &format!("Playback command failed: {error}"));
                         }
                     }
@@ -3405,10 +3454,17 @@ fn bind_playback_callbacks(
                           guard.queue_override_tracks = liked_tracks.into_iter().skip(1).take(MAX_LOCAL_QUEUE_TRACKS).collect();
                           guard.queue_override_active = true;
                       }
-                      if let Some(track_uris) = liked_track_uris.filter(|tracks| !tracks.is_empty()) {
-                          spawn_start_command(ui_weak.clone(), Arc::clone(&runtime), Arc::clone(&state), spotify_api.clone(), move |api, token, device_id| async move {
-                              api.play_tracks(&token, &device_id, &track_uris).await
-                        });
+                      if let Some(mut track_uris) = liked_track_uris.filter(|tracks| !tracks.is_empty()) {
+                          let modes = start_play_modes(&ui_weak, &state, &context_uri);
+                          if modes.as_ref().is_some_and(|modes| modes.shuffle) {
+                              // In shuffle it starts anywhere, as Spotify's own apps do.
+                              let first = rand::thread_rng().gen_range(0..track_uris.len());
+                              track_uris.swap(0, first);
+                          }
+                          spawn_start_command(ui_weak.clone(), Arc::clone(&runtime), Arc::clone(&state), spotify_api.clone(), modes, move |api, token, device_id| {
+                              let track_uris = track_uris.clone();
+                              async move { api.play_tracks(&token, &device_id, &track_uris).await }
+                          });
                     }
                     return;
                   }
@@ -3426,8 +3482,21 @@ fn bind_playback_callbacks(
                       guard.queue_override_tracks = playlist_tracks.into_iter().skip(1).take(MAX_LOCAL_QUEUE_TRACKS).collect();
                       guard.queue_override_active = true;
                   }
-                  spawn_start_command(ui_weak.clone(), Arc::clone(&runtime), Arc::clone(&state), spotify_api.clone(), move |api, token, device_id| async move {
-                      api.play_playlist(&token, &device_id, &context_uri).await
+                  let modes = start_play_modes(&ui_weak, &state, &context_uri);
+                  // In shuffle it starts anywhere, as Spotify's own apps do.
+                  let first_track = modes.as_ref().filter(|modes| modes.shuffle).and_then(|_| {
+                      let guard = state.lock().unwrap();
+                      let tracks = guard.playlist_track_cache.get(&context_uri)?;
+                      (!tracks.is_empty()).then(|| tracks[rand::thread_rng().gen_range(0..tracks.len())].uri.clone())
+                  });
+                  spawn_start_command(ui_weak.clone(), Arc::clone(&runtime), Arc::clone(&state), spotify_api.clone(), modes, move |api, token, device_id| {
+                      let (context_uri, first_track) = (context_uri.clone(), first_track.clone());
+                      async move {
+                          match first_track {
+                              Some(track_uri) => api.play_context_from_track(&token, &device_id, &context_uri, &track_uri).await,
+                              None => api.play_playlist(&token, &device_id, &context_uri).await,
+                          }
+                      }
                   });
             }
         }
@@ -5963,6 +6032,9 @@ fn play_from_list(
     index: usize,
     remember: bool,
 ) {
+    // A song from the list that's already playing carries on as it is.
+    let starts_list = state.lock().unwrap().active_queue_playlist_uri != list_uri;
+    let modes = if starts_list { start_play_modes(ui_weak, state, &list_uri) } else { None };
     let (selected_track, track_start_generation) = {
         let mut guard = state.lock().unwrap();
         let selected_track = guard
@@ -6077,6 +6149,7 @@ fn play_from_list(
                 track_uri.clone(),
                 queue_tracks,
                 track_start_generation,
+                modes.clone(),
             );
         } else {
             let autoplay = state.lock().unwrap().config.autoplay_similar;
@@ -6106,6 +6179,7 @@ fn play_from_list(
                 track_uri.clone(),
                 queue_tracks,
                 track_start_generation,
+                modes,
             );
         }
     }
@@ -6285,6 +6359,7 @@ fn spawn_track_start_command(
     expected_track_uri: String,
     track_uris: Vec<String>,
     generation: u64,
+    modes: Option<Modes>,
 ) {
     runtime.spawn(async move {
         let start_lock = state.lock().unwrap().track_start_lock.clone();
@@ -6305,6 +6380,10 @@ fn spawn_track_start_command(
             return;
         }
         if result.is_ok() {
+            if let Some(modes) = modes {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                apply_play_modes(&state, &spotify_api, &modes).await;
+            }
             let mut matched_confirmed_track = false;
             for _ in 0..6 {
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -6383,8 +6462,7 @@ async fn start_track_uris_with_recovery(
     }
     let targets_other_device = {
         let guard = state.lock().unwrap();
-        pick_start_device(guard.active_device_id.as_ref(), guard.preferred_device_id.as_ref(), &guard.available_device_ids)
-            .is_some_and(|id| Some(&id) != guard.local_device_id.as_ref())
+        guard.start_device().is_some_and(|id| Some(&id) != guard.local_device_id.as_ref())
     };
     if targets_other_device {
         return result;
@@ -6402,14 +6480,155 @@ async fn start_track_uris_once(
     spotify_api: spotify::SpotifyApi,
     track_uris: &[String],
 ) -> Result<()> {
-    let device_id = resolve_start_device(ui_weak, Arc::clone(&state), spotify_api.clone()).await?;
-    let token = current_token(&state).await?;
+    start_on_best_device(ui_weak, state, spotify_api, |spotify_api, token, device_id| async move {
+        if track_uris.len() == 1 {
+            spotify_api.play_track(&token, &device_id, &track_uris[0]).await
+        } else {
+            spotify_api.play_tracks(&token, &device_id, track_uris).await
+        }
+    })
+    .await
+}
 
-    if track_uris.len() == 1 {
-        spotify_api.play_track(&token, &device_id, &track_uris[0]).await
-    } else {
-        spotify_api.play_tracks(&token, &device_id, track_uris).await
+/// Notes the player bar's shuffle and repeat as the last used, and as the playing list's.
+fn remember_play_modes(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
+    let modes = Modes { shuffle: ui.get_shuffle_enabled(), repeat: ui.get_repeat_mode().to_string() };
+    let mut guard = state.lock().unwrap();
+    let list = guard.active_queue_playlist_uri.clone();
+    let list = Some(list.as_str()).filter(|uri| !uri.is_empty() && *uri != SEARCH_RESULTS_URI);
+    if guard.config.play_modes.remember(list, modes) {
+        config::save_config_background(&guard.config);
     }
+}
+
+/// The shuffle and repeat `list_uri` starts with: as it was last left, or as the last list
+/// was. The player bar shows them at once, while the music starts.
+fn start_play_modes(ui_weak: &slint::Weak<AppWindow>, state: &Arc<Mutex<AppState>>, list_uri: &str) -> Option<Modes> {
+    if list_uri.is_empty() || list_uri == SEARCH_RESULTS_URI {
+        return None;
+    }
+    let modes = state.lock().unwrap().config.play_modes.for_list(list_uri).cloned()?;
+    if let Some(ui) = ui_weak.upgrade() {
+        ui.set_shuffle_enabled(modes.shuffle);
+        ui.set_repeat_mode(modes.repeat.clone().into());
+    }
+    let mut guard = state.lock().unwrap();
+    let until = Some(Instant::now() + Duration::from_secs(5));
+    guard.optimistic_shuffle_enabled = Some(modes.shuffle);
+    guard.optimistic_shuffle_until = until;
+    guard.optimistic_repeat_mode = Some(modes.repeat.clone());
+    guard.optimistic_repeat_until = until;
+    Some(modes)
+}
+
+/// Sets shuffle and repeat as `modes` has them, once a list has started. Only what differs is
+/// sent: turning shuffle on again would shuffle the order anew.
+async fn apply_play_modes(state: &Arc<Mutex<AppState>>, spotify_api: &spotify::SpotifyApi, modes: &Modes) {
+    let Ok(token) = current_token(state).await else { return };
+    let Ok(Some(playback)) = spotify_api.current_playback(&token).await else { return };
+    let device = playback.device.and_then(|device| device.id);
+    if playback.shuffle_state != modes.shuffle {
+        let _ = spotify_api.shuffle(&token, device.as_deref(), modes.shuffle).await;
+    }
+    if playback.repeat_state != modes.repeat {
+        let _ = spotify_api.repeat(&token, device.as_deref(), &modes.repeat).await;
+    }
+}
+
+/// Starts music with `start` on the device new music goes to. Spotify can go on listing a
+/// device that has closed, gone to sleep or lost its connection, even as the active one. When
+/// a device other than this PC doesn't take the music, it's left out for a while and the music
+/// starts here instead, rather than not at all.
+async fn start_on_best_device<F, Fut>(
+    ui_weak: slint::Weak<AppWindow>,
+    state: Arc<Mutex<AppState>>,
+    spotify_api: spotify::SpotifyApi,
+    start: F,
+) -> Result<()>
+where
+    F: Fn(spotify::SpotifyApi, TokenStore, String) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let device_id = resolve_start_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await?;
+    let token = current_token(&state).await?;
+    let result = start(spotify_api.clone(), token, device_id.clone()).await;
+    let Err(error) = &result else { return result };
+    let elsewhere = state.lock().unwrap().local_device_id.as_deref() != Some(device_id.as_str());
+    if !elsewhere || !device_may_be_gone(error) {
+        return result;
+    }
+    let name = forget_unanswered_device(&state, &device_id);
+    let here = resolve_start_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await?;
+    let token = current_token(&state).await?;
+    let result = start(spotify_api, token, here).await;
+    if result.is_ok() {
+        tell_playing_here(ui_weak, name, error.to_string());
+    }
+    result
+}
+
+/// Leaves `device_id` out of new music for a while, and gives its name.
+fn forget_unanswered_device(state: &Arc<Mutex<AppState>>, device_id: &str) -> String {
+    let mut guard = state.lock().unwrap();
+    let name = guard
+        .available_device_ids
+        .iter()
+        .position(|id| id == device_id)
+        .and_then(|at| guard.available_device_names.get(at).cloned())
+        .unwrap_or_else(|| "The other device".to_string());
+    guard.forget_unanswered_device(device_id);
+    name
+}
+
+fn tell_playing_here(ui_weak: slint::Weak<AppWindow>, name: String, error: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            write_log(&ui, &format!("{name} didn't answer ({error}), so it's playing on this computer"));
+            show_toast(&ui, &format!("{name} didn't answer, so it's playing here"), false);
+        }
+    });
+}
+
+/// Play was pressed but the device holding the music didn't answer: the song in the player bar
+/// carries on here from where it was, with Next up after it.
+async fn play_current_here(
+    ui_weak: slint::Weak<AppWindow>,
+    state: Arc<Mutex<AppState>>,
+    spotify_api: spotify::SpotifyApi,
+    tried: Option<String>,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let (gone, track, position) = {
+        let guard = state.lock().unwrap();
+        let local = guard.local_device_id.clone();
+        let mut gone = vec![tried, guard.active_device_id.clone()];
+        gone.retain(|id| id.is_some() && *id != local);
+        gone.dedup();
+        (gone.into_iter().flatten().collect::<Vec<_>>(), guard.current_track_uri.clone(), guard.playback_clock.displayed_progress_ms())
+    };
+    let names = gone.iter().map(|id| forget_unanswered_device(&state, id)).collect::<Vec<_>>();
+    let Some(track) = track else {
+        return start_current_visible_tracks(state, spotify_api).await;
+    };
+    let mut uris = vec![track];
+    uris.extend(current_queue_tracks(&state).into_iter().map(|track| track.uri));
+    let device_id = resolve_start_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await?;
+    let token = current_token(&state).await?;
+    spotify_api.play_tracks_at(&token, &device_id, &uris, position).await?;
+    if let Some(name) = names.into_iter().next() {
+        tell_playing_here(ui_weak, name, error.to_string());
+    }
+    Ok(())
+}
+
+/// False for the failures that playing somewhere else wouldn't get past: Spotify asking to
+/// slow down, a missing permission or Premium.
+fn device_may_be_gone(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<spotify::RateLimitError>().is_some() {
+        return false;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    !["premium", "denied", "scope", "not connected", "signed out"].iter().any(|word| message.contains(word))
 }
 
 /// The device new music goes to: whatever is current, else the last one in use.
@@ -6447,16 +6666,18 @@ async fn resolve_start_device(
 ) -> Result<String> {
     let (mut target, local) = {
         let guard = state.lock().unwrap();
-        (
-            pick_start_device(guard.active_device_id.as_ref(), guard.preferred_device_id.as_ref(), &guard.available_device_ids),
-            guard.local_device_id.clone(),
-        )
+        (guard.start_device(), guard.local_device_id.clone())
     };
     if target.is_none() {
         // Not refreshed yet, e.g. just after launch: ask rather than take over.
         if let Ok(token) = current_token(&state).await {
             if let Ok(Some(playback)) = spotify_api.current_playback(&token).await {
-                target = playback.device.filter(|device| device.is_active).and_then(|device| device.id);
+                let unanswered = state.lock().unwrap().unanswered_devices.clone();
+                target = playback
+                    .device
+                    .filter(|device| device.is_active)
+                    .and_then(|device| device.id)
+                    .filter(|id| !unanswered.get(id).is_some_and(|at| at.elapsed() < UNANSWERED_DEVICE_SKIP));
             }
         }
     }
@@ -6490,21 +6711,20 @@ fn spawn_start_command<F, Fut>(
     runtime: Arc<Runtime>,
     state: Arc<Mutex<AppState>>,
     spotify_api: spotify::SpotifyApi,
+    modes: Option<Modes>,
     f: F,
 ) where
-    F: FnOnce(spotify::SpotifyApi, TokenStore, String) -> Fut + Send + 'static,
+    F: Fn(spotify::SpotifyApi, TokenStore, String) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     runtime.spawn(async move {
-        let result = async {
-            let device_id = resolve_start_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone()).await?;
-            let token = current_token(&state).await?;
-            f(spotify_api.clone(), token, device_id).await
-        }
-        .await;
+        let result = start_on_best_device(ui_weak.clone(), Arc::clone(&state), spotify_api.clone(), f).await;
         if result.is_ok() {
             begin_fast_playback_refresh(&state, Duration::from_secs(4));
             tokio::time::sleep(Duration::from_millis(400)).await;
+            if let Some(modes) = modes {
+                apply_play_modes(&state, &spotify_api, &modes).await;
+            }
             let _ = refresh_playback_only(ui_weak.clone(), Arc::clone(&state), spotify_api).await;
         }
         let _ = slint::invoke_from_event_loop(move || {
