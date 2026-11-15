@@ -22,6 +22,8 @@ librespot-connect = "0.8"
 librespot-core = "0.8"
 librespot-oauth = "0.8"
 librespot-playback = { version = "0.8", default-features = true }
+# What the player logs. The same version librespot already builds.
+log = "0.4"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rubato = "0.16"

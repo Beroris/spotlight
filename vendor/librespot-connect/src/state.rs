@@ -6,6 +6,8 @@ pub(super) mod provider;
 mod restrictions;
 mod tracks;
 mod transfer;
+// Spotlight: reads the list another device hands over. See SPOTLIGHT-CHANGES.md.
+pub(super) mod handed_over;
 
 use crate::{
     core::{

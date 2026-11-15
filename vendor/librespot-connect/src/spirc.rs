@@ -20,6 +20,7 @@ use crate::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
+        player::PlayerState,
         playlist4_external::PlaylistModificationInfo,
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
@@ -27,6 +28,7 @@ use crate::{
     },
     state::{
         context::{ContextType, ResetContext},
+        handed_over::HandedOver,
         provider::IsProvider,
         {ConnectConfig, ConnectState},
     },
@@ -100,6 +102,14 @@ struct SpircTask {
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
 
+    /// Spotlight: what the device that has the music is playing, from Spotify's last update
+    /// about it. A handover reads the list to carry on with from here. See
+    /// `state/handed_over.rs`.
+    playing_elsewhere: Option<PlayerState>,
+    /// Spotlight: the songs a handover brought, kept while the playlist it names is asked
+    /// for, in case that fails.
+    handed_over: Option<HandedOver>,
+
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
     update_volume: bool,
@@ -139,6 +149,21 @@ enum SpircCommand {
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
+
+/// What a list of songs plays under, having no playlist or album of its own.
+const WEB_API_URI: &str = "spotify:web-api";
+
+/// Spotlight: says what came over with the music, for the app's log.
+fn log_carried_on(list: &HandedOver, why: &str) {
+    info!(
+        target: "spotlight",
+        "The music moved here with its list: {} played, {} coming up, {} queued (read from {}){why}",
+        list.current.unwrap_or(list.resume_at),
+        list.tracks.len().saturating_sub(list.resume_at),
+        list.queued.len(),
+        list.read_from,
+    );
+}
 
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
@@ -255,6 +280,8 @@ impl Spirc {
             session,
 
             transfer_state: None,
+            playing_elsewhere: None,
+            handed_over: None,
             update_volume: false,
             update_state: false,
 
@@ -604,12 +631,21 @@ impl SpircTask {
     }
 
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
+        // Spotlight: whether a handover waits on this one, the playlist it named.
+        let for_handover =
+            self.transfer_state.is_some() && self.context_resolver.next_is_the_list_itself();
+
         let next_context = match next_context {
             Err(why) => {
                 self.context_resolver.mark_next_unavailable();
                 self.context_resolver.remove_used_and_invalid();
                 error!("{why}");
-                return false;
+                // Spotlight: a handover is finished by the last answer about its playlist. When
+                // that is a later page, or the similar songs after it, and it fails, this was
+                // the last answer and nothing else would finish it.
+                let nothing_more_comes =
+                    self.transfer_state.is_some() && !self.context_resolver.has_next();
+                return (for_handover || nothing_more_comes) && self.carry_on_with_what_came();
             }
             Ok(ctx) => ctx,
         };
@@ -626,7 +662,12 @@ impl SpircTask {
                 }
             }
             Err(why) => {
-                error!("{why}")
+                error!("{why}");
+                // Spotlight: a playlist that came back unusable, with no songs in it say.
+                if for_handover {
+                    self.context_resolver.remove_used_and_invalid();
+                    return self.carry_on_with_what_came();
+                }
             }
         }
 
@@ -641,6 +682,10 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
+        // Spotlight: the handover is done, so its songs aren't needed as a fallback.
+        if self.transfer_state.is_none() {
+            self.handed_over = None;
+        }
         update_state
     }
 
@@ -873,7 +918,7 @@ impl SpircTask {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
 
-        let cluster = match self
+        let mut cluster = match self
             .connect_state
             .notify_new_device_appeared(&self.session)
             .await
@@ -900,6 +945,11 @@ impl SpircTask {
                 "active device is <{}> with session <{}>",
                 cluster.active_device_id, cluster.player_state.session_id
             );
+            // Spotlight: what it plays is kept from the start, for a handover that comes
+            // before its next update does.
+            if cluster.active_device_id != self.session.device_id() {
+                self.playing_elsewhere = cluster.player_state.take();
+            }
             return Ok(());
         } else if cluster.transfer_data.is_empty() {
             debug!("got empty transfer state, do nothing");
@@ -912,6 +962,9 @@ impl SpircTask {
         }
 
         use protobuf::Message;
+
+        // Spotlight: the session being picked up, as its last device reported it.
+        self.playing_elsewhere = cluster.player_state.take();
 
         match TransferState::parse_from_bytes(&cluster.transfer_data) {
             Ok(transfer_state) => self.handle_transfer(transfer_state)?,
@@ -979,7 +1032,12 @@ impl SpircTask {
             cluster_update.cluster.active_device_id
         );
 
-        if let Some(cluster) = cluster_update.cluster.take() {
+        if let Some(mut cluster) = cluster_update.cluster.take() {
+            // Spotlight: what another device plays is kept, to carry on from if the music
+            // moves here. While this device has the music the update is about itself.
+            if cluster.active_device_id != self.session.device_id() {
+                self.playing_elsewhere = cluster.player_state.take();
+            }
             let became_inactive = self.connect_state.is_active()
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
@@ -1157,8 +1215,26 @@ impl SpircTask {
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
-            Some(ref uri) if uri == "-" || uri.is_empty() => None,
+            // Spotlight: the same goes for every name that isn't a list Spotify can be asked
+            // for, "spotify:web-api" above all: what a list of songs started on a librespot
+            // device plays under, and so most of what Spotlight plays. Asking for it failed,
+            // and the songs coming up were gone after the switch.
+            Some(ref uri) if !HandedOver::can_be_asked_for(uri) => None,
             Some(ref uri) => Some(uri.clone()),
+        };
+
+        // Spotlight: a handover still waiting on its playlist is replaced by this one, and
+        // that playlist is no longer waited for: arriving late, it would replace this music.
+        if self.transfer_state.take().is_some() {
+            self.context_resolver.clear();
+        }
+        self.handed_over = None;
+        // The music can also be handed to the device that has it, by picking it again. What
+        // it plays is then what this player has, and the handover holds less of it.
+        // Anything kept of another device is from before the music came here.
+        let elsewhere = match self.playing_elsewhere.take() {
+            _ if self.connect_state.is_active() => Some(self.connect_state.player().clone()),
+            elsewhere => elsewhere,
         };
 
         self.connect_state.reset_context(
@@ -1182,43 +1258,54 @@ impl SpircTask {
         }
 
         let fallback = self.connect_state.current_track(|t| &t.uri).clone();
+
+        // Spotlight: the songs that came over, read before the handover is taken apart below.
+        let mut list = HandedOver::of(&transfer, elsewhere.as_ref(), &fallback);
+
+        // Spotlight: a playlist Spotify couldn't give before isn't asked for again, so
+        // waiting on it would never end. The songs that came over are used at once.
+        let playlist = ctx_uri.as_ref().map(|uri| {
+            ResolveContext::from_uri(
+                uri.clone(),
+                &fallback,
+                ContextType::Default,
+                ContextAction::Replace,
+            )
+        });
+        if list.is_some() && playlist.as_ref().is_some_and(|playlist| self.context_resolver.gave_up_on(playlist)) {
+            ctx_uri = None;
+        }
         let load_from_context_uri = ctx_uri.is_some();
 
-        match ctx_uri {
-            Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
-                    uri.clone(),
-                    &fallback,
-                    ContextType::Default,
-                    ContextAction::Replace,
-                ));
+        match (ctx_uri.is_some(), playlist) {
+            (true, Some(playlist)) => {
+                self.context_resolver.add(playlist);
+                // Spotlight: kept in case the playlist can't be had.
+                self.handed_over = list.take();
             }
-            None => {
-                let all_tracks = transfer
-                    .current_session
-                    .context
-                    .pages
-                    .iter()
-                    .cloned()
-                    .flat_map(|p| p.tracks)
-                    .collect::<Vec<_>>();
-
-                if !all_tracks.is_empty() {
-                    self.load_context_from_tracks(all_tracks)?;
-                } else {
+            // Spotlight: this used the handover's pages as they came, and so lost the songs
+            // already played and any queued ones.
+            _ => match list.as_ref() {
+                Some(list) => self.load_context_from_tracks(list.tracks.clone())?,
+                None => {
                     warn!(
                         "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
                     );
                     ctx_uri = Some(fallback.clone())
                 }
-            }
+            },
         };
 
         self.handle_activate();
 
         let timestamp = self.now_ms();
         let state = &mut self.connect_state;
-        state.handle_initial_transfer(&mut transfer, ctx_uri.clone());
+        // Spotlight: a list that was handed over goes by the name a list started here has.
+        let named = match list {
+            Some(_) => Some(WEB_API_URI.to_string()),
+            None => ctx_uri.clone(),
+        };
+        state.handle_initial_transfer(&mut transfer, named);
 
         // adjust active context, so resolve knows for which context it should set up the state
         state.active_context = if autoplay {
@@ -1255,9 +1342,25 @@ impl SpircTask {
             }
         }
 
+        // Spotlight: the list that came over is carried on from. If that fails the song still
+        // plays, set up below as it was before.
+        let carried_on = !load_from_context_uri
+            && list.as_ref().is_some_and(|list| {
+                match self.connect_state.carry_on_from(list) {
+                    Ok(()) => {
+                        log_carried_on(list, "");
+                        true
+                    }
+                    Err(why) => {
+                        warn!(target: "spotlight", "The songs coming up didn't come over: {why}");
+                        false
+                    }
+                }
+            });
+
         if load_from_context_uri {
             self.transfer_state = Some(transfer);
-        } else {
+        } else if !carried_on {
             match self.connect_state.get_context(ContextType::Default) {
                 Err(why) => {
                     warn!("continuing transfer in an unknown state. {why}");
@@ -1277,6 +1380,9 @@ impl SpircTask {
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
+        // Spotlight: a handover still waiting on its playlist ends with the music leaving.
+        self.transfer_state = None;
+        self.handed_over = None;
 
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
@@ -1340,6 +1446,14 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        // Spotlight: new music replaces a handover still waiting on its playlist. Left in
+        // place, it was finished by this music's list and moved it to the handover's song.
+        // The playlist isn't waited for either: arriving late, it would replace this music.
+        if self.transfer_state.take().is_some() {
+            self.context_resolver.clear();
+        }
+        self.handed_over = None;
+
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1486,8 +1600,32 @@ impl SpircTask {
         Ok(())
     }
 
+    /// Spotlight: the playlist a handover named couldn't be had from Spotify, so the music
+    /// carries on with the songs the handover brought. Before, only the song playing was
+    /// left, and the handover stayed waiting, to be finished by whatever list was asked for
+    /// next. Returns whether anything changed.
+    fn carry_on_with_what_came(&mut self) -> bool {
+        self.transfer_state = None;
+        let Some(list) = self.handed_over.take() else {
+            return false;
+        };
+        let carried_on = self
+            .load_context_from_tracks(list.tracks.clone())
+            .and_then(|()| self.connect_state.carry_on_from(&list));
+        match carried_on {
+            Ok(()) => {
+                log_carried_on(&list, ", as its playlist couldn't be had from Spotify");
+                self.add_autoplay_resolving_when_required();
+                true
+            }
+            Err(why) => {
+                warn!(target: "spotlight", "The songs coming up didn't come over: {why}");
+                false
+            }
+        }
+    }
+
     fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
-        const WEB_API_URI: &str = "spotify:web-api";
         let ctx = Context {
             // by providing values for uri/url the player in the official client's isn't frozen
             uri: Some(WEB_API_URI.into()),

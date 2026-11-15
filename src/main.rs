@@ -34,7 +34,7 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::{ato
 
 use anyhow::{anyhow, Context, Result};
 use media_keys::{MediaCommand, MediaKeyGuard};
-use models::{AppConfig, CachedLikedSong, CachedPlaylist, FullTrack, LIKED_SONGS_PLAYLIST_URI, Modes, PlaybackState, TokenStore};
+use models::{AppConfig, CachedLikedSong, CachedPlaylist, FullTrack, LIKED_SONGS_PLAYLIST_URI, Modes, PlaybackState, QueueResponse, TokenStore};
 use rand::Rng;
 use single_instance::SingleInstance;
 use slint::{CloseRequestResponse, Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -158,11 +158,16 @@ struct AppState {
     /// The rows on screen, which is what a drag or a remove refers to.
     queue_painted_uris: Vec<String>,
     queue_edited_at: Option<Instant>,
+    /// The last change made by hand to the songs coming up.
+    queue_edit: Option<QueueEdit>,
     spotify_queue_tracks: Option<Vec<FullTrack>>,
     playback_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     spotify_queue_current_uri: Option<String>,
     last_spotify_queue_refresh: Option<Instant>,
     device_switch_generation: u64,
+    /// Counts the times play, pause, next or previous was pressed, so that work begun before
+    /// one can tell.
+    pressed_generation: u64,
     current_album_art_url: Option<String>,
     current_album_art_path: Option<PathBuf>,
     last_album_art_ui_path: Option<PathBuf>,
@@ -429,6 +434,9 @@ fn main() -> Result<()> {
         window_chrome::quit_running();
         return Ok(());
     }
+    // Nothing else listens to the player, so this can't fail.
+    let _ = log::set_logger(&PlayerLog);
+    log::set_max_level(log::LevelFilter::Info);
     let args = std::env::args().collect::<Vec<_>>();
     // After a crash, the new copy waits here for the old one to be gone.
     let after_crash = crash_restart::start(&args);
@@ -538,11 +546,13 @@ fn main() -> Result<()> {
         queue_override_active: false,
         queue_painted_uris: Vec::new(),
         queue_edited_at: None,
+        queue_edit: None,
         spotify_queue_tracks: None,
         playback_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         spotify_queue_current_uri: None,
         last_spotify_queue_refresh: None,
         device_switch_generation: 0,
+        pressed_generation: 0,
         current_album_art_url: None,
         current_album_art_path: None,
         last_album_art_ui_path: None,
@@ -3132,6 +3142,7 @@ fn bind_playback_callbacks(
                 });
 
                 let mut guard = state.lock().unwrap();
+                guard.pressed_generation = guard.pressed_generation.wrapping_add(1);
                 if guard.local_is_active() {
                     audio_output::set_paused(!next_is_playing);
                 }
@@ -3234,7 +3245,8 @@ fn bind_playback_callbacks(
                 optimistic_previous(&ui, &state);
             }
             let use_local = {
-                let guard = state.lock().unwrap();
+                let mut guard = state.lock().unwrap();
+                guard.pressed_generation = guard.pressed_generation.wrapping_add(1);
                 guard.local_is_active()
             };
             if use_local {
@@ -3285,7 +3297,8 @@ fn bind_playback_callbacks(
                 return;
             }
             let use_local = {
-                let guard = state.lock().unwrap();
+                let mut guard = state.lock().unwrap();
+                guard.pressed_generation = guard.pressed_generation.wrapping_add(1);
                 guard.local_is_active()
             };
             if use_local {
@@ -5811,6 +5824,25 @@ fn remove_painted_track(tracks: &mut Vec<FullTrack>, painted: &[String], index: 
     }
 }
 
+/// A change made by hand to the songs coming up.
+struct QueueEdit {
+    /// The rows as the change left them. `queue_override_tracks` is these, less the songs
+    /// that have played since, until other music replaces it.
+    rows: Vec<String>,
+    /// The last row before any change. The player keeps the playlist's songs after that one
+    /// behind the rows, whatever is done to the rows. Empty if there were no rows or they
+    /// were all taken off since, which ends the list: nothing is behind the rows then.
+    ended_with: String,
+}
+
+impl QueueEdit {
+    /// Whether `rows` are what is left of the rows this change made: they go off the front
+    /// as they play.
+    fn left_these(&self, rows: &[String]) -> bool {
+        !rows.is_empty() && self.rows.ends_with(rows)
+    }
+}
+
 /// Applies a change to the queue as it stands on screen, then shows it and passes it to the
 /// player, whose list changes without the song being touched.
 fn edit_queue(
@@ -5828,6 +5860,14 @@ fn edit_queue(
         let before = track_uris(&tracks);
         edit(&mut tracks, &guard.queue_painted_uris);
         let after = track_uris(&tracks);
+        // Rows changed before still end where they did before the first change. Emptying
+        // them ends the list in the player, so nothing follows them from then on.
+        let ended_with = match guard.queue_edit.take() {
+            _ if after.is_empty() => String::new(),
+            Some(earlier) if earlier.left_these(&before) => earlier.ended_with,
+            _ => before.last().cloned().unwrap_or_default(),
+        };
+        guard.queue_edit = Some(QueueEdit { rows: after.clone(), ended_with });
         guard.queue_override_tracks = tracks;
         guard.queue_override_active = true;
         guard.queue_edited_at = Some(Instant::now());
@@ -8558,17 +8598,22 @@ async fn switch_playback_device(
     _device_name: String,
     is_local_device: bool,
 ) -> Result<String> {
-    let playback_before = spotify_api.current_playback(&token).await?;
+    let this_move = DeviceMove::starting(&state);
+    // Whether this PC plays the music as the device is picked. It stops being the player part
+    // way through the move.
+    let played_here = state.lock().unwrap().local_is_active();
+    // What plays and what follows it, as Spotify has them now. The songs coming up are what
+    // has to arrive on the other device too.
+    let (playback_before, queue_before) = tokio::join!(spotify_api.current_playback(&token), spotify_api.queue(&token));
+    let playback_before = playback_before?;
     let was_playing = playback_before.as_ref().map(|p| p.is_playing).unwrap_or(false);
+    let list = playback_before.as_ref().and_then(|playback| moving_list(&state, playback, queue_before.ok(), played_here));
     file_log(&format!(
-        "Device picked: {} (music was {})",
+        "Device picked: {} (music was {}, {} coming up)",
         if is_local_device { "this computer".to_string() } else { device_label(&state, &device_id) },
         if was_playing { "playing" } else { "not playing" },
+        list.as_ref().map_or(0, |list| list.uris.len().saturating_sub(1)),
     ));
-    let current_track_uri = playback_before
-        .as_ref()
-        .and_then(|p| p.item.as_ref())
-        .map(|track| track.uri.clone());
     let current_progress_ms = playback_before
         .as_ref()
         .and_then(|p| p.progress_ms)
@@ -8589,32 +8634,37 @@ async fn switch_playback_device(
     spotify_api.transfer(&token, &device_id, false).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    if was_playing {
-        let resume_result = spotify_api.resume(&token, Some(device_id.as_str())).await;
-        let needs_explicit_start = match resume_result {
-            Ok(()) => {
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                match spotify_api.current_playback(&token).await? {
-                    Some(playback) => !playback.is_playing,
-                    None => true,
+    // Pause pressed, other music started or another device picked while the music was on its
+    // way: it is then no longer this pick's to start.
+    if was_playing && this_move.nothing_pressed_since(&state) {
+        // The device carries on by itself when it takes the music. Asking as well covers one
+        // that took it paused.
+        let _ = spotify_api.resume(&token, Some(device_id.as_str())).await;
+        if !remote_resumed(&spotify_api, &token, &device_id).await {
+            // It has the music but isn't playing it, so it's told what to play: the song from
+            // where it was, with the songs that were coming up. This used to send the song
+            // alone unless it was in the playlist last started here, which emptied the queue.
+            // Not if other music was started meanwhile: that is what should play.
+            if this_move.nothing_pressed_since(&state) {
+                // A queue changed by hand while the music was on its way goes as it now
+                // stands on screen. The music still has to start.
+                let list = match &playback_before {
+                    Some(playback) if this_move.queue_changed_since(&state) => moving_list(&state, playback, None, played_here),
+                    _ => list,
+                };
+                match &list {
+                    Some(list) => {
+                        file_log(&format!("Device picked: it didn't carry on by itself, so it's sent the song and the {} after it", list.uris.len() - 1));
+                        spotify_api.play_tracks_at(&token, &device_id, &list.uris, current_progress_ms).await?;
+                    }
+                    None => start_current_visible_tracks(Arc::clone(&state), spotify_api.clone()).await?,
                 }
             }
-            Err(_) => true,
-        };
-        if needs_explicit_start {
-            if let Some(track_uri) = current_track_uri.clone() {
-                let queue_uris = queue_uris_from_current_track(&state, &track_uri);
-                if queue_uris.len() > 1 {
-                    spotify_api.play_tracks(&token, &device_id, &queue_uris).await?;
-                } else {
-                    spotify_api.play_track(&token, &device_id, &track_uri).await?;
-                }
-                if current_progress_ms > 0 {
-                    let _ = spotify_api.seek(&token, Some(device_id.as_str()), current_progress_ms).await;
-                }
-            } else {
-                start_current_visible_tracks(Arc::clone(&state), spotify_api.clone()).await?;
-            }
+        } else if let Some(list) = list.filter(|list| !list.from_a_playlist && list.uris.len() > 1) {
+            // A playlist or album the device asks Spotify for itself. A plain list of songs
+            // has to come over whole, which is checked once the music has settled there. It
+            // isn't waited for: the device shows as picked meanwhile.
+            tokio::spawn(keep_list_after_switch(Arc::clone(&state), spotify_api.clone(), device_id.clone(), list, this_move));
         }
     }
 
@@ -8622,19 +8672,278 @@ async fn switch_playback_device(
     Ok(device_id)
 }
 
-fn queue_uris_from_current_track(state: &Arc<Mutex<AppState>>, current_track_uri: &str) -> Vec<String> {
+/// One pick of a device, told apart from whatever the user does next.
+struct DeviceMove {
+    switch_generation: u64,
+    start_generation: u64,
+    pressed_generation: u64,
+    picked_at: Instant,
+}
+
+impl DeviceMove {
+    fn starting(state: &Arc<Mutex<AppState>>) -> Self {
+        let guard = state.lock().unwrap();
+        Self {
+            switch_generation: guard.device_switch_generation,
+            start_generation: guard.track_start_generation,
+            pressed_generation: guard.pressed_generation,
+            picked_at: Instant::now(),
+        }
+    }
+
+    /// Whether the music is still what this pick moved. Another device picked, other music
+    /// started, play or pause pressed or the queue changed by hand since: the music from
+    /// before the pick is then no longer the music to put back.
+    fn still_stands(&self, state: &Arc<Mutex<AppState>>) -> bool {
+        let guard = state.lock().unwrap();
+        self.nothing_pressed(&guard) && guard.queue_edited_at.is_none_or(|at| at <= self.picked_at)
+    }
+
+    /// Whether the music is still meant to play as it did when the device was picked: no
+    /// other device picked, no other music started and none of play, pause, next and
+    /// previous pressed since.
+    fn nothing_pressed_since(&self, state: &Arc<Mutex<AppState>>) -> bool {
+        self.nothing_pressed(&state.lock().unwrap())
+    }
+
+    /// Whether the songs coming up were changed by hand since the device was picked.
+    fn queue_changed_since(&self, state: &Arc<Mutex<AppState>>) -> bool {
+        state.lock().unwrap().queue_edited_at.is_some_and(|at| at > self.picked_at)
+    }
+
+    fn nothing_pressed(&self, state: &AppState) -> bool {
+        self.pressed_as_at(state.device_switch_generation, state.track_start_generation, state.pressed_generation)
+    }
+
+    /// Whether the counts of devices picked, music started and buttons pressed (play, pause,
+    /// next, previous) are those of this pick.
+    fn pressed_as_at(&self, switch_generation: u64, start_generation: u64, pressed_generation: u64) -> bool {
+        switch_generation == self.switch_generation
+            && start_generation == self.start_generation
+            && pressed_generation == self.pressed_generation
+    }
+}
+
+/// The music as it stands when a device is picked: the song playing, then the songs after it.
+struct MovingList {
+    uris: Vec<String>,
+    /// Whether it plays from a playlist or album, which the device taking over can ask
+    /// Spotify for. A plain list of songs, as most music started in Spotlight is, exists only
+    /// on the device playing it.
+    from_a_playlist: bool,
+}
+
+/// What `playback` is playing and what follows it. `played_here` is whether this PC's own
+/// player had the music when the device was picked.
+fn moving_list(state: &Arc<Mutex<AppState>>, playback: &PlaybackState, queue: Option<QueueResponse>, played_here: bool) -> Option<MovingList> {
+    let song = playback.item.as_ref()?.uri.clone();
+    let reported = queue
+        .filter(|queue| queue.currently_playing.as_ref().is_some_and(|playing| playing.uri == song))
+        .map(|queue| queue.queue);
+    let on_screen = current_queue_tracks(state);
     let guard = state.lock().unwrap();
-    let Some(tracks) = guard.playlist_track_cache.get(&guard.active_queue_playlist_uri) else {
-        return vec![current_track_uri.to_string()];
+    // The queue on screen, if it is of this song.
+    let on_screen = (guard.current_track_uri.as_deref() == Some(song.as_str())).then_some(on_screen);
+    let just_edited = guard.queue_override_active && guard.queue_edited_at.is_some_and(|at| at.elapsed() < QUEUE_EDIT_SETTLE);
+    let held = if guard.queue_override_active { guard.queue_override_tracks.as_slice() } else { &[] };
+    let playlist = guard.playlist_track_cache.get(&guard.active_queue_playlist_uri).map_or(&[][..], Vec::as_slice);
+    let shown = songs_shown_coming_up(reported, on_screen, just_edited);
+    // Where the list held ended before it was changed by hand, if it was. Only this PC's own
+    // player takes such changes: on another device they are on screen and no more.
+    let held_ended_with = guard
+        .queue_edit
+        .as_ref()
+        .filter(|edit| played_here && edit.left_these(&track_uris(held)))
+        .map(|edit| edit.ended_with.as_str());
+    let upcoming = with_the_songs_behind(&song, shown, held, playlist, playback.shuffle_state, held_ended_with);
+    let mut uris = vec![song];
+    uris.extend(upcoming.into_iter().map(|track| track.uri));
+    let from_a_playlist = spotify_has_the_list(playback.context.as_ref().and_then(|context| context.uri.as_deref()));
+    Some(MovingList { uris, from_a_playlist })
+}
+
+/// The songs known to follow the one playing when a device is picked. Spotify's own word
+/// (`reported`) counts when it has one for this song, unless the queue was changed here too
+/// recently for Spotify to have heard (`just_edited`): then, and when Spotify has no word, it
+/// is the queue `on_screen`, which is given when it is of this song.
+fn songs_shown_coming_up(reported: Option<Vec<FullTrack>>, on_screen: Option<Vec<FullTrack>>, just_edited: bool) -> Vec<FullTrack> {
+    match (reported, on_screen) {
+        (Some(_), Some(on_screen)) if just_edited => on_screen,
+        (Some(reported), _) => reported,
+        (None, on_screen) => on_screen.unwrap_or_default(),
+    }
+}
+
+/// `shown`, the songs seen to follow `song`, with those behind them. Spotify reports only the
+/// next few, and a device that takes the music without its list is sent this one, so a list
+/// cut short there would end the music early. More follows them:
+/// - the list `held` here, if they are the start of it;
+/// - then the rest of the `playlist` last started here, but only if the music is from it
+///   (`playlist_after`). It may have nothing to do with what plays: music started on another
+///   device, there or brought here since.
+///
+/// A list held that was changed by hand while this PC plays is different. The player keeps
+/// the playlist's songs after the one the list ended with before (`held_ended_with`), so a
+/// song taken off its end or moved up must not come back behind it. Nothing follows a list
+/// that was emptied (an empty `held_ended_with`).
+///
+/// In shuffle the playlist's order says nothing about what follows.
+fn with_the_songs_behind(
+    song: &str,
+    shown: Vec<FullTrack>,
+    held: &[FullTrack],
+    playlist: &[FullTrack],
+    shuffled: bool,
+    held_ended_with: Option<&str>,
+) -> Vec<FullTrack> {
+    if shown.is_empty() {
+        // Nothing follows it, as far as can be told.
+        return shown;
+    }
+    let held_follows = starts_with_tracks(held, &shown);
+    let mut songs = if held_follows { held.to_vec() } else { shown };
+    if shuffled {
+        return songs;
+    }
+    // Where in the playlist the songs behind them start.
+    let from = match held_ended_with.filter(|_| held_follows) {
+        Some(ended_with) => playlist.iter().position(|track| track.uri == ended_with).map(|at| at + 1),
+        None => playlist_after(playlist, song, &songs),
     };
-    let Some(position) = tracks.iter().position(|track| track.uri == current_track_uri) else {
-        return vec![current_track_uri.to_string()];
+    // With repeat on, the songs seen can have come round to the start of the playlist already.
+    // They then lead up to a place before the song playing, and what is between has been seen.
+    let song_at = playlist.iter().position(|track| track.uri == song);
+    if let Some(from) = from.filter(|&from| song_at.is_none_or(|at| from > at)) {
+        songs.extend_from_slice(&playlist[from..]);
+    }
+    songs
+}
+
+/// Where in `playlist` the songs start that follow `song` and those `coming_up` after it, if
+/// the music is from that playlist: the last few of them are then in it side by side. One song
+/// in common says nothing, and that this PC plays the music doesn't either, as it can have
+/// come from another device.
+fn playlist_after(playlist: &[FullTrack], song: &str, coming_up: &[FullTrack]) -> Option<usize> {
+    if coming_up.is_empty() {
+        return None;
+    }
+    let heard: Vec<&str> = std::iter::once(song).chain(coming_up.iter().map(|track| track.uri.as_str())).collect();
+    let last_few = &heard[heard.len().saturating_sub(4)..];
+    playlist
+        .windows(last_few.len())
+        .position(|run| run.iter().map(|track| track.uri.as_str()).eq(last_few.iter().copied()))
+        .map(|at| at + last_few.len())
+}
+
+/// Whether music said to play from `context` is a list Spotify keeps, which any device can ask
+/// it for. Anything else is treated as a plain list of songs: checking one that did arrive
+/// costs nothing.
+fn spotify_has_the_list(context: Option<&str>) -> bool {
+    context.is_some_and(|uri| {
+        ["spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:show:"].iter().any(|kind| uri.starts_with(kind))
+            || (uri.starts_with("spotify:user:") && uri.ends_with(":collection"))
+    })
+}
+
+/// How the songs coming up fared in a move to another device.
+#[derive(Debug, PartialEq)]
+enum ListAfterSwitch {
+    /// Spotify doesn't describe the music on that device yet.
+    NotYet,
+    Kept,
+    /// Something else plays there now.
+    Replaced,
+    /// The song plays there with none of the songs that followed it. It is at `from` in the
+    /// list.
+    Lost { from: usize },
+}
+
+/// Reads Spotify's reports from after a move to `device_id` against `list`, the song that
+/// was playing and those after it. A song may have ended since, so the song now playing is
+/// looked up in the list. Spotify reports only the next few songs, and they are enough to tell.
+///
+/// Sending the list again starts the song again, so the list counts as lost only when that is
+/// plain: nothing follows the song, or nothing that was in the list. A queue that has some of
+/// the list's songs next was kept, and anything else different about it (a song queued on the
+/// device since, a shuffle dealt again) is the device's own doing.
+fn list_after_switch(list: &[String], playback: &PlaybackState, queue: &QueueResponse, device_id: &str) -> ListAfterSwitch {
+    let on_device = playback.device.as_ref().and_then(|device| device.id.as_deref()) == Some(device_id);
+    let Some(song) = playback.item.as_ref().map(|track| track.uri.as_str()).filter(|_| on_device && playback.is_playing) else {
+        return ListAfterSwitch::NotYet;
     };
-    tracks
-        .iter()
-        .skip(position)
-        .map(|track| track.uri.clone())
-        .collect()
+    // The songs coming up are reported apart from the song playing, and can be from before.
+    if queue.currently_playing.as_ref().map(|track| track.uri.as_str()) != Some(song) {
+        return ListAfterSwitch::NotYet;
+    }
+    // A song can be in a list twice.
+    let mut places = list.iter().enumerate().filter(|(_, uri)| uri.as_str() == song).map(|(at, _)| at).peekable();
+    let Some(&first) = places.peek() else { return ListAfterSwitch::Replaced };
+    // Repeating one song, a device may report only that song as coming up, list or no list.
+    if playback.repeat_state == "track" {
+        return ListAfterSwitch::Kept;
+    }
+    let next = &queue.queue[..queue.queue.len().min(3)];
+    let followed_as_before = |at: usize| {
+        let expected = &list[at + 1..];
+        let checked = expected.len().min(3);
+        next.len() >= checked && expected.iter().zip(next).all(|(uri, track)| *uri == track.uri)
+    };
+    let some_of_it_follows = next.iter().any(|track| track.uri != song && list.contains(&track.uri));
+    if places.any(followed_as_before) || some_of_it_follows {
+        ListAfterSwitch::Kept
+    } else {
+        ListAfterSwitch::Lost { from: first }
+    }
+}
+
+/// Makes sure a plain list of songs arrived on the device the music moved to, and sends it
+/// again if it didn't. Spotlight on this PC keeps the list by itself. Other players can take
+/// over with only the song playing: an older Spotlight on a phone or Mac does. The song then
+/// starts again there from where it is, with the songs that followed it.
+async fn keep_list_after_switch(
+    state: Arc<Mutex<AppState>>,
+    spotify_api: spotify::SpotifyApi,
+    device_id: String,
+    list: MovingList,
+    this_move: DeviceMove,
+) {
+    // Spotify can describe the move a moment late, so the list counts as lost only when two
+    // reports in a row say so.
+    let mut seemed_lost = false;
+    for wait_ms in [700, 900, 1200, 1500] {
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        if !this_move.still_stands(&state) {
+            return;
+        }
+        let Ok(token) = current_token(&state).await else { return };
+        let (Ok(Some(playback)), Ok(queue)) = tokio::join!(spotify_api.current_playback(&token), spotify_api.queue(&token)) else {
+            continue;
+        };
+        match list_after_switch(&list.uris, &playback, &queue, &device_id) {
+            ListAfterSwitch::NotYet => seemed_lost = false,
+            ListAfterSwitch::Kept => {
+                file_log("Device picked: the songs coming up came along");
+                return;
+            }
+            ListAfterSwitch::Replaced => return,
+            ListAfterSwitch::Lost { .. } if !seemed_lost => seemed_lost = true,
+            ListAfterSwitch::Lost { from } => {
+                // The reports took a moment to come. Music started in that moment stays.
+                if !this_move.still_stands(&state) {
+                    return;
+                }
+                let uris = &list.uris[from..];
+                let position = playback.progress_ms.unwrap_or(0).max(0);
+                let name = device_label(&state, &device_id);
+                file_log(&format!("Device picked: {name} took the song without the {} after it, so they're sent again", uris.len() - 1));
+                match within(REMOTE_COMMAND_LIMIT, spotify_api.play_tracks_at(&token, &device_id, uris, position)).await {
+                    Ok(()) => begin_fast_playback_refresh(&state, Duration::from_secs(4)),
+                    Err(error) => file_log(&format!("Device picked: sending them again failed ({error})")),
+                }
+                return;
+            }
+        }
+    }
 }
 
 async fn apply_volume_change(
@@ -9827,6 +10136,42 @@ fn file_log(message: &str) {
     }
 }
 
+/// Puts what the player says about music moving between devices into `spotlight.log`: the
+/// lines written for it, and the warnings and errors of its Spotify Connect side. Nothing
+/// else the player logs is kept.
+struct PlayerLog;
+
+impl PlayerLog {
+    fn keeps(target: &str, level: log::Level) -> bool {
+        target == "spotlight" || (level <= log::Level::Warn && target.starts_with("librespot_connect"))
+    }
+}
+
+impl log::Log for PlayerLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        Self::keeps(metadata.target(), metadata.level())
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // One complaint can come many times in a row. It is written once.
+        static LAST: Mutex<String> = Mutex::new(String::new());
+        let line = format!("Player: {}", record.args());
+        {
+            let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *last == line {
+                return;
+            }
+            last.clone_from(&line);
+        }
+        file_log(&line);
+    }
+
+    fn flush(&self) {}
+}
+
 fn should_show_log(level: &str, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     let is_error = lower.contains("failed") || lower.contains("error") || lower.contains("expired");
@@ -9996,6 +10341,120 @@ mod queue_edit_tests {
     }
 
     #[test]
+    fn the_songs_coming_up_are_spotify_s_unless_just_changed_here() {
+        let next_two = || Some(tracks(&["b", "c"]));
+        assert_eq!(uris(&songs_shown_coming_up(next_two(), Some(tracks(&["z"])), false)), ["b", "c"]);
+        // The queue was changed here a moment ago, and Spotify still reports it as it was.
+        assert_eq!(uris(&songs_shown_coming_up(next_two(), Some(tracks(&["c", "b"])), true)), ["c", "b"]);
+        assert_eq!(uris(&songs_shown_coming_up(next_two(), None, true)), ["b", "c"], "the queue on screen is of another song");
+        // No word from Spotify: the queue on screen, if it is of this song.
+        assert_eq!(uris(&songs_shown_coming_up(None, Some(tracks(&["b"])), false)), ["b"]);
+        assert!(songs_shown_coming_up(None, None, false).is_empty());
+        assert!(songs_shown_coming_up(Some(Vec::new()), next_two(), false).is_empty(), "Spotify says nothing follows");
+    }
+
+    #[test]
+    fn the_songs_behind_the_next_few_move_to_another_device_too() {
+        let playlist = tracks(&["a", "b", "c", "d", "e", "f"]);
+        let next_two = || tracks(&["b", "c"]);
+        // The rest of the playlist follows what Spotify reports of it.
+        assert_eq!(uris(&with_the_songs_behind("a", next_two(), &[], &playlist, false, None)), ["b", "c", "d", "e", "f"]);
+        assert_eq!(uris(&with_the_songs_behind("a", next_two(), &[], &playlist, true, None)), ["b", "c"], "not in shuffle");
+        // The playlist last started here may be other music than what plays: on another
+        // device, or brought here from one since.
+        assert_eq!(uris(&with_the_songs_behind("x", tracks(&["y", "b"]), &[], &playlist, false, None)), ["y", "b"]);
+        assert_eq!(uris(&with_the_songs_behind("a", tracks(&["b", "y"]), &[], &playlist, false, None)), ["b", "y"], "one song in common isn't enough");
+        // A song queued to play next doesn't hide that the music is from the playlist.
+        assert_eq!(uris(&with_the_songs_behind("a", tracks(&["q", "b", "c", "d", "e"]), &[], &playlist, false, None)), ["q", "b", "c", "d", "e", "f"]);
+        // The longer list held here comes first, when what is shown is the start of it.
+        let held = tracks(&["y", "b", "z"]);
+        assert_eq!(uris(&with_the_songs_behind("x", tracks(&["y", "b"]), &held, &playlist, false, None)), ["y", "b", "z"]);
+        assert_eq!(uris(&with_the_songs_behind("a", next_two(), &held, &playlist, true, None)), ["b", "c"], "a list held from other music");
+        let held = tracks(&["b", "c", "d"]);
+        assert_eq!(uris(&with_the_songs_behind("a", tracks(&["b"]), &held, &playlist, false, None)), ["b", "c", "d", "e", "f"], "and the playlist after it");
+        assert!(with_the_songs_behind("a", Vec::new(), &held, &playlist, false, None).is_empty(), "nothing follows");
+    }
+
+    #[test]
+    fn a_long_playlist_moves_whole() {
+        // A device that drops the list is sent it again, and the music must not end early.
+        let names: Vec<String> = (0..300).map(|number| format!("song{number}")).collect();
+        let playlist = tracks(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let reported = playlist[1..21].to_vec();
+        let all = with_the_songs_behind("song0", reported, &playlist[1..51], &playlist, false, None);
+        assert_eq!(all.len(), 299);
+        assert_eq!(uris(&all), uris(&playlist[1..]));
+    }
+
+    #[test]
+    fn a_queue_changed_by_hand_moves_as_it_was_left() {
+        let playlist = tracks(&["a", "b", "c", "d", "e"]);
+        // Its last song was taken off. It ended with that song before, so nothing follows.
+        let held = tracks(&["b", "c", "d"]);
+        assert_eq!(uris(&with_the_songs_behind("a", held.clone(), &held, &playlist, false, Some("e"))), ["b", "c", "d"]);
+        // Its last song was moved up, and isn't there twice.
+        let held = tracks(&["b", "e", "c", "d"]);
+        assert_eq!(uris(&with_the_songs_behind("a", tracks(&["b", "e"]), &held, &playlist, false, Some("e"))), ["b", "e", "c", "d"]);
+        // All the rows were taken off: emptying them ends the list.
+        assert!(with_the_songs_behind("a", Vec::new(), &[], &playlist, false, Some("")).is_empty());
+        // A song queued after that is all there is, even one from the playlist.
+        let held = tracks(&["c"]);
+        assert_eq!(uris(&with_the_songs_behind("b", held.clone(), &held, &playlist, false, Some(""))), ["c"]);
+
+        // Only the rows were changed. The songs the playlist has behind them still follow.
+        let names: Vec<String> = (0..300).map(|number| format!("song{number}")).collect();
+        let playlist = tracks(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut held = playlist[1..51].to_vec();
+        held.remove(49);
+        held.remove(9);
+        let all = with_the_songs_behind("song0", held[..20].to_vec(), &held, &playlist, false, Some("song50"));
+        assert_eq!(all.len(), 48 + 249);
+        assert_eq!(uris(&all[48..]), uris(&playlist[51..]));
+        assert!(!all.iter().any(|track| track.uri == "song50" || track.uri == "song10"), "the songs taken off stay off");
+        // A change to other music than what is seen coming up says nothing.
+        let seen = playlist[1..21].to_vec();
+        assert_eq!(with_the_songs_behind("song0", seen, &tracks(&["x", "y"]), &playlist, false, Some("y")).len(), 299);
+    }
+
+    #[test]
+    fn a_change_to_the_queue_is_still_known_as_its_songs_play() {
+        let rows = |uris: &[&str]| uris.iter().map(|uri| uri.to_string()).collect::<Vec<_>>();
+        let edit = QueueEdit { rows: rows(&["b", "c", "d"]), ended_with: "e".to_string() };
+        assert!(edit.left_these(&rows(&["b", "c", "d"])));
+        assert!(edit.left_these(&rows(&["c", "d"])), "a song has played since");
+        assert!(!edit.left_these(&rows(&["b", "c"])), "other rows");
+        assert!(!edit.left_these(&rows(&["x", "b", "c", "d"])));
+        assert!(!edit.left_these(&[]), "no rows say nothing");
+    }
+
+    #[test]
+    fn a_repeating_playlist_that_came_round_isn_t_sent_twice_over() {
+        let playlist = tracks(&["a", "b", "c", "d", "e"]);
+        // On its last songs with repeat on, Spotify already shows the start of it coming up.
+        assert_eq!(uris(&with_the_songs_behind("d", tracks(&["e", "a", "b"]), &[], &playlist, false, None)), ["e", "a", "b"]);
+        assert_eq!(uris(&with_the_songs_behind("b", tracks(&["c"]), &[], &playlist, false, None)), ["c", "d", "e"]);
+        // A long one: the songs seen run on into its start, and the rest would pass the song.
+        let names: Vec<String> = (0..40).map(|number| format!("song{number}")).collect();
+        let playlist = tracks(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let seen: Vec<FullTrack> = playlist[36..].iter().chain(&playlist[..10]).cloned().collect();
+        assert_eq!(with_the_songs_behind("song35", seen, &[], &playlist, false, None).len(), 14);
+        // A song that is in a playlist twice hasn't come round: the rest still follows.
+        let mut twice = playlist.clone();
+        twice[30] = playlist[5].clone();
+        let all = with_the_songs_behind("song5", twice[6..20].to_vec(), &[], &twice, false, None);
+        assert_eq!(uris(&all), uris(&twice[6..]));
+    }
+
+    #[test]
+    fn a_pick_of_a_device_no_longer_starts_music_once_pause_is_pressed() {
+        let pick = DeviceMove { switch_generation: 4, start_generation: 9, pressed_generation: 2, picked_at: Instant::now() };
+        assert!(pick.pressed_as_at(4, 9, 2));
+        assert!(!pick.pressed_as_at(4, 9, 3), "play or pause was pressed while the music was on its way");
+        assert!(!pick.pressed_as_at(4, 10, 2), "other music was started");
+        assert!(!pick.pressed_as_at(5, 9, 2), "another device was picked");
+    }
+
+    #[test]
     fn dragging_moves_a_song_both_ways() {
         let rows = painted(&["a", "b", "c", "d"]);
         let mut list = tracks(&["a", "b", "c", "d"]);
@@ -10109,7 +10568,10 @@ mod queue_edit_tests {
 
 #[cfg(test)]
 mod device_and_queue_tests {
-    use super::{pick_start_device, picker_matches, queue_tail_start, remote_start_shows, uris_from_queue_click, PlaybackState, Unanswered, UNANSWERED_DEVICE_SETTLE};
+    use super::{
+        list_after_switch, pick_start_device, picker_matches, queue_tail_start, remote_start_shows, spotify_has_the_list, uris_from_queue_click, ListAfterSwitch,
+        PlaybackState, QueueResponse, Unanswered, UNANSWERED_DEVICE_SETTLE,
+    };
     use std::time::{Duration, Instant};
 
     fn ids(values: &[&str]) -> Vec<String> {
@@ -10195,6 +10657,69 @@ mod device_and_queue_tests {
         assert_eq!(queue_tail_start(queue.into_iter(), "c"), Some(2), "skipped two");
         assert_eq!(queue_tail_start(queue.into_iter(), "d"), Some(3), "last one: nothing left");
         assert_eq!(queue_tail_start(queue.into_iter(), "z"), None, "something else started");
+    }
+
+    /// Spotify's report of the songs coming up after `song`.
+    fn coming_up(song: &str, next: &[&str]) -> QueueResponse {
+        let track = |uri: &str| serde_json::json!({ "name": uri, "uri": uri, "duration_ms": 200_000, "album": { "name": "", "images": [] }, "artists": [] });
+        serde_json::from_value(serde_json::json!({ "currently_playing": track(song), "queue": next.iter().map(|uri| track(uri)).collect::<Vec<_>>() })).unwrap()
+    }
+
+    #[test]
+    fn a_list_that_came_along_to_the_other_device_is_left_alone() {
+        let list = ids(&["a", "b", "c", "d", "e", "f"]);
+        let playing = |song: &str| report("phone", song, 61_000, true);
+        assert_eq!(list_after_switch(&list, &playing("a"), &coming_up("a", &["b", "c", "d", "e"]), "phone"), ListAfterSwitch::Kept);
+        assert_eq!(list_after_switch(&list, &playing("b"), &coming_up("b", &["c", "d", "e"]), "phone"), ListAfterSwitch::Kept, "a song ended meanwhile");
+        assert_eq!(list_after_switch(&list, &playing("e"), &coming_up("e", &["f"]), "phone"), ListAfterSwitch::Kept, "near the end");
+        assert_eq!(list_after_switch(&list, &playing("f"), &coming_up("f", &[]), "phone"), ListAfterSwitch::Kept, "the last song has nothing after it");
+        assert_eq!(list_after_switch(&list, &playing("e"), &coming_up("e", &["f", "a", "b"]), "phone"), ListAfterSwitch::Kept, "on repeat it begins again");
+        let twice = ids(&["a", "b", "a", "c"]);
+        assert_eq!(list_after_switch(&twice, &playing("a"), &coming_up("a", &["c"]), "phone"), ListAfterSwitch::Kept, "a song that is in the list twice");
+    }
+
+    #[test]
+    fn a_list_the_other_device_dropped_is_noticed() {
+        let list = ids(&["a", "b", "c", "d"]);
+        let playing = |song: &str| report("phone", song, 61_000, true);
+        assert_eq!(list_after_switch(&list, &playing("a"), &coming_up("a", &[]), "phone"), ListAfterSwitch::Lost { from: 0 }, "the song alone");
+        assert_eq!(list_after_switch(&list, &playing("a"), &coming_up("a", &["x", "y", "z"]), "phone"), ListAfterSwitch::Lost { from: 0 }, "similar songs filled in");
+        assert_eq!(list_after_switch(&list, &playing("a"), &coming_up("a", &["a", "a", "a"]), "phone"), ListAfterSwitch::Lost { from: 0 }, "the song alone, with repeat on");
+        assert_eq!(list_after_switch(&list, &playing("b"), &coming_up("b", &[]), "phone"), ListAfterSwitch::Lost { from: 1 }, "a song ended meanwhile");
+        assert_eq!(list_after_switch(&list, &playing("x"), &coming_up("x", &["y"]), "phone"), ListAfterSwitch::Replaced, "other music");
+    }
+
+    #[test]
+    fn a_list_isn_t_called_lost_before_spotify_describes_the_device() {
+        let list = ids(&["a", "b", "c"]);
+        let lost = coming_up("a", &[]);
+        assert_eq!(list_after_switch(&list, &report("desktop", "a", 61_000, true), &lost, "phone"), ListAfterSwitch::NotYet, "still shown on the device it left");
+        assert_eq!(list_after_switch(&list, &report("phone", "a", 61_000, false), &lost, "phone"), ListAfterSwitch::NotYet, "not playing there yet");
+        assert_eq!(list_after_switch(&list, &report("phone", "b", 300, true), &coming_up("a", &["b", "c"]), "phone"), ListAfterSwitch::NotYet, "the queue is from the song before");
+    }
+
+    #[test]
+    fn a_list_the_device_has_its_own_way_isn_t_sent_again() {
+        // Sending it again would start the song again and undo what was done there.
+        let list = ids(&["a", "b", "c", "d", "e"]);
+        let playing = report("phone", "a", 61_000, true);
+        assert_eq!(list_after_switch(&list, &playing, &coming_up("a", &["x", "b", "c"]), "phone"), ListAfterSwitch::Kept, "a song was queued there since");
+        assert_eq!(list_after_switch(&list, &playing, &coming_up("a", &["c", "d"]), "phone"), ListAfterSwitch::Kept, "a song was taken out there since");
+        assert_eq!(list_after_switch(&list, &playing, &coming_up("a", &["d", "b", "e"]), "phone"), ListAfterSwitch::Kept, "a shuffle dealt again");
+        let mut repeating_it = report("phone", "a", 61_000, true);
+        repeating_it.repeat_state = "track".to_string();
+        assert_eq!(list_after_switch(&list, &repeating_it, &coming_up("a", &["a", "a", "a"]), "phone"), ListAfterSwitch::Kept, "one song on repeat hides the rest");
+    }
+
+    #[test]
+    fn only_spotify_s_own_lists_are_left_to_the_device_to_fetch() {
+        for kept_by_spotify in ["spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "spotify:album:4aawyAB9vmqN3uQ7FjRGTy", "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF", "spotify:user:someone:collection"] {
+            assert!(spotify_has_the_list(Some(kept_by_spotify)), "{kept_by_spotify}");
+        }
+        for plain in ["", "-", "spotify:web-api", "spotify:search:house", "spotify:user:someone"] {
+            assert!(!spotify_has_the_list(Some(plain)), "{plain}");
+        }
+        assert!(!spotify_has_the_list(None), "songs started as a plain list have none");
     }
 
     #[test]

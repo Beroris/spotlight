@@ -457,7 +457,7 @@ impl<'ct> ConnectState {
     /// Songs that no longer fit on the list wait in their playlist again, as filling up has already
     /// gone past them and they would otherwise never play. A list running into a repeat of the
     /// playlist is left as it is, as those songs come round anyway.
-    fn return_to_context(&mut self, pushed_off: &[ProvidedTrack]) {
+    pub(super) fn return_to_context(&mut self, pushed_off: &[ProvidedTrack]) {
         let all_from_context = pushed_off
             .iter()
             .all(|track| track.is_context() && !track.uid.starts_with(IDENTIFIER_DELIMITER));
