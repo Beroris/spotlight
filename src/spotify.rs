@@ -117,7 +117,13 @@ impl SpotifyApi {
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(None);
         }
-        Ok(Some(response.json().await?))
+        let mut playback: PlaybackState = response.json().await?;
+        // Spotify can go on saying a song plays after the device playing it has gone, and
+        // then names no device. Nothing can be heard, so it counts as paused.
+        if playback.device.is_none() {
+            playback.is_playing = false;
+        }
+        Ok(Some(playback))
     }
 
     pub async fn queue(&self, token: &TokenStore) -> Result<QueueResponse> {
