@@ -347,7 +347,7 @@ impl Spirc {
 
         match initial_volume.try_into() {
             Ok(volume) => {
-                task.set_volume(volume);
+                task.take_volume(volume);
                 // we don't want to update the volume initially,
                 // we just want to set the mixer to the correct volume
                 task.update_volume = false;
@@ -2135,11 +2135,23 @@ impl SpircTask {
     }
 
     fn set_volume(&mut self, volume: u16) {
+        // Spotlight: said whether or not the music is here. An app that keeps the volume for
+        // the player's next start would otherwise never hear of one set while it's elsewhere.
+        if self.take_volume(volume) {
+            self.player.emit_volume_changed_event(volume);
+        }
+    }
+
+    /// Spotlight: sets the volume without saying so, and returns whether it changed. Alone
+    /// it is for the volume the player starts with, which the app gave and needn't hear back:
+    /// said late, it would undo a volume chosen while the player was still connecting.
+    fn take_volume(&mut self, volume: u16) -> bool {
         debug!("SpircTask::set_volume({volume})");
 
         let old_volume = self.connect_state.device_info().volume;
         let new_volume = volume as u32;
-        if old_volume != new_volume || self.mixer.volume() != volume {
+        let changed = old_volume != new_volume || self.mixer.volume() != volume;
+        if changed {
             self.update_volume = true;
 
             self.connect_state.set_volume(new_volume);
@@ -2147,10 +2159,8 @@ impl SpircTask {
             if let Some(cache) = self.session.cache() {
                 cache.save_volume(volume)
             }
-            // Said whether or not the music is here. An app that keeps the volume for the
-            // player's next start would otherwise never hear of one set while it's elsewhere.
-            self.player.emit_volume_changed_event(volume);
         }
+        changed
     }
 }
 

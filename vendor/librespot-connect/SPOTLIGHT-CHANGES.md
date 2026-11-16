@@ -122,6 +122,8 @@ as a volume Spotify passes on always was.
 `set_volume` says the new volume (`VolumeChanged`) whether or not the music is here. Before,
 one set while the music was elsewhere was only said once the music came. An app that keeps
 the volume for the player's next start missed it when the player started again first.
+The volume the player starts with is still not said (`take_volume`): the app gave it, and
+hearing it back late would undo a volume chosen while the player was still connecting.
 
 A volume Spotify passes on (`hm://connect-state/v1/connect/volume`) comes from another device
 or app. `volume_asked_through_spotify` in `src/spirc.rs` notes that, and once the volume has
