@@ -241,8 +241,8 @@ pub fn mark_for_volume(percent: u32) -> u32 {
 }
 
 /// How long after its mark a volume still counts as marked. The two come a request to
-/// Spotify apart, which is well under a second.
-const VOLUME_MARK_WINDOW: Duration = Duration::from_secs(3);
+/// Spotify apart, which is meant to be well under a second.
+pub const VOLUME_MARK_WINDOW: Duration = Duration::from_secs(3);
 
 /// Spotlight: a volume another device or app asked for.
 #[derive(Debug, PartialEq)]

@@ -8958,7 +8958,7 @@ async fn apply_volume_change(
     volume_percent: i32,
 ) -> Result<()> {
     let volume_percent = volume_percent.clamp(0, 100);
-    let (use_local, target_device_id, has_token) = {
+    let where_to = || {
         let guard = state.lock().unwrap();
         let target = guard.active_device_id.clone().or_else(|| guard.device_id.clone());
         // This PC's player is told itself, also in the moment Spotify has it as the device
@@ -8971,18 +8971,25 @@ async fn apply_volume_change(
             .is_some_and(|engine| !engine.is_finished() && target.as_deref() == Some(engine.session().device_id()));
         (guard.local_volume_is_target() || own_player, target, guard.token.is_some())
     };
-    if use_local {
+    if where_to().0 {
         return run_local_player_command(state, |engine| engine.set_volume(volume_percent as u16));
     }
     // Another device is playing: only its volume changes. This PC keeps its own, so
     // turning a speaker down never turns this PC down with it.
+    //
+    // One change at a time, its mark and its volume together. The slider and the mute
+    // button send from different tasks, and two changes mixed together mark nothing: the
+    // device would keep its volume while this window shows the new one.
+    static SENDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _sending = SENDING.lock().await;
+    // Looked at again: the change before this one may have taken seconds, and the music
+    // may have moved in them.
+    let (use_local, target_device_id, has_token) = where_to();
+    if use_local {
+        return run_local_player_command(state, |engine| engine.set_volume(volume_percent as u16));
+    }
     match target_device_id {
         Some(device_id) if has_token => {
-            // One change at a time, its mark and its volume together. The slider and the
-            // mute button send from different tasks, and two changes mixed together mark
-            // nothing: the device would keep its volume while this window shows the new one.
-            static SENDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-            let _sending = SENDING.lock().await;
             let token = current_token(&state).await?;
             send_marked_volume(&spotify_api, &token, &device_id, volume_percent).await
         }
@@ -9002,19 +9009,44 @@ async fn send_marked_volume(
     let mark = librespot_connect::mark_for_volume(volume_percent as u32) as i32;
     // A mark that couldn't be sent is no reason not to ask for the volume: a device that
     // takes any volume still gets it.
+    let mark_sent = Instant::now();
     let marked = spotify_api.volume(token, Some(device_id), mark).await;
+    let mark_took = mark_sent.elapsed();
     let asked = spotify_api.volume(token, Some(device_id), volume_percent).await;
+    // A device that takes volumes from Spotlight alone refuses one that comes too long
+    // after its mark, and nothing here shows that it did. So the log says when the two
+    // were slow: Spotify may hold a request until the device answers, and such a device
+    // never answers a mark.
+    if marked.is_ok() && mark_sent.elapsed() > Duration::from_secs(1) {
+        file_log(&format!(
+            "Sending another device a volume of {volume_percent}% and its mark took {:.1}s, the mark {:.1}s of it. Spotlight on that device takes the volume if it comes within {}s of the mark.",
+            mark_sent.elapsed().as_secs_f32(),
+            mark_took.as_secs_f32(),
+            librespot_connect::VOLUME_MARK_WINDOW.as_secs(),
+        ));
+    }
     let (Ok(()), Err(error)) = (&marked, &asked) else {
         return asked;
     };
     // The device may now be at the mark: one percent off, and for a mute still heard. The
-    // volume is asked for once more, after as long as Spotify says to wait, but soon enough
-    // for the mark still to count.
-    let wait = error
-        .downcast_ref::<spotify::RateLimitError>()
-        .map_or(Duration::from_millis(500), |limit| Duration::from_secs(limit.retry_after_secs.min(2)));
+    // volume is asked for once more, after as long as Spotify says to wait, when that is
+    // soon enough for the mark still to count. A request that failed by taking too long
+    // has used that time up, and asking again would only hold up the next change.
+    let told_to_wait = error.downcast_ref::<spotify::RateLimitError>().map(|limit| limit.retry_after_secs);
+    let Some(wait) = wait_to_ask_again(mark_sent.elapsed(), told_to_wait) else {
+        return asked;
+    };
     tokio::time::sleep(wait).await;
     spotify_api.volume(token, Some(device_id), volume_percent).await
+}
+
+/// How long to wait before asking once more for a volume that failed after its mark went:
+/// as long as Spotify said to, or half a second. `None` when the volume would then come too
+/// long after the mark to count, with half a second allowed for it to get there.
+fn wait_to_ask_again(since_mark: Duration, told_to_wait_secs: Option<u64>) -> Option<Duration> {
+    let wait = told_to_wait_secs.map_or(Duration::from_millis(500), Duration::from_secs);
+    let in_time = librespot_connect::VOLUME_MARK_WINDOW.saturating_sub(Duration::from_millis(500));
+    (since_mark + wait <= in_time).then_some(wait)
 }
 
 async fn apply_seek_change(
@@ -10860,6 +10892,20 @@ mod tests {
         // The hue stays: yellow is still more red and green than blue.
         let (r, g, b) = even_brightness(yellow, false);
         assert!(r > b * 1.5 && g > b * 1.5);
+    }
+
+    #[test]
+    fn a_volume_is_asked_for_again_only_while_its_mark_still_counts() {
+        let ms = Duration::from_millis;
+        // A quick failure: once more, half a second on or when Spotify says.
+        assert_eq!(wait_to_ask_again(ms(300), None), Some(ms(500)));
+        assert_eq!(wait_to_ask_again(ms(300), Some(2)), Some(ms(2000)));
+        assert_eq!(wait_to_ask_again(ms(2000), None), Some(ms(500)));
+        // Too late for the mark: after a slow failure, or a long wait asked for.
+        assert_eq!(wait_to_ask_again(ms(2100), None), None);
+        assert_eq!(wait_to_ask_again(ms(6000), None), None, "a request that ran out of time");
+        assert_eq!(wait_to_ask_again(ms(300), Some(3)), None);
+        assert_eq!(wait_to_ask_again(ms(300), Some(u64::MAX / 2)), None);
     }
 
     #[test]

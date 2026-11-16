@@ -175,6 +175,9 @@ asking, as between the steps of a phone's volume buttons, never comes with a mar
 Spotlight's "Volume from other devices" setting chooses between any app (as librespot was),
 Spotlight (`only_marked_volume`) and no one (`disable_volume`). The app sends a mark and its
 volume one change at a time (`send_marked_volume` in the app's `src/main.rs`), as two changes
-mixed together mark nothing, and asks once more for a volume that failed after its mark went.
+mixed together mark nothing, and asks once more for a volume that failed after its mark
+went, when that is still within the three seconds (`VOLUME_MARK_WINDOW`, which the app reads
+from here). The app's log says when a mark and its volume took over a second to send: a
+volume refused for coming late shows nowhere else on the sending side.
 
 Run its tests with `cargo test -p librespot-connect spirc::tests`.
