@@ -118,8 +118,9 @@ struct SpircTask {
     /// Spotlight: the volume waiting to be reported was asked for through Spotify, by another
     /// device or app, not by this one. Said in the app's log once it settles.
     volume_asked_through_spotify: Option<AskedThroughSpotify>,
-    /// Spotlight: how many volumes were refused since the log last said so, and when it did.
-    volumes_refused: (u32, Option<Instant>),
+    /// Spotlight: how many volumes were refused since the log last said so, when it did,
+    /// and the last of them in percent.
+    volumes_refused: (u32, Option<Instant>, u32),
 
     /// when set to true, it will update the volume after [UPDATE_STATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -378,7 +379,7 @@ impl Spirc {
             handed_over: None,
             update_volume: false,
             volume_asked_through_spotify: None,
-            volumes_refused: (0, None),
+            volumes_refused: (0, None, 0),
             update_state: false,
 
             spirc_id,
@@ -624,15 +625,16 @@ impl SpircTask {
                                 // Nothing is said back to Spotify: an asker that sends again
                                 // whenever the volume isn't the one it wants would never stop.
                                 // The log says it at most every few seconds for the same reason.
+                                let percent = (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX);
                                 self.volumes_refused.0 += 1;
+                                self.volumes_refused.2 = percent;
                                 if self.volumes_refused.1.is_none_or(|said| said.elapsed() >= REFUSED_VOLUME_LOG_GAP) {
                                     info!(
                                         target: "spotlight",
-                                        "Refused a volume of {}% another device or app asked for ({} refused since this was last said). It came with {came_with}",
-                                        (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX),
+                                        "Refused a volume of {percent}% another device or app asked for ({} refused since this was last said). It came with {came_with}",
                                         self.volumes_refused.0
                                     );
-                                    self.volumes_refused = (0, Some(Instant::now()));
+                                    self.volumes_refused = (0, Some(Instant::now()), 0);
                                 }
                             } else {
                                 // Spotlight: a volume no one chose here is otherwise a riddle.
@@ -697,6 +699,17 @@ impl SpircTask {
                     if let Err(why) = self.notify().await {
                         error!("state update: {why}")
                     }
+                },
+                // Spotlight: the volumes refused after the last line about one, said once no
+                // more have come for a while, so their count isn't left unsaid.
+                _ = async { sleep(REFUSED_VOLUME_LOG_GAP).await }, if self.volumes_refused.0 > 0 => {
+                    info!(
+                        target: "spotlight",
+                        "Refused {} more volume(s) another device or app asked for, the last of {}%",
+                        self.volumes_refused.0,
+                        self.volumes_refused.2
+                    );
+                    self.volumes_refused = (0, Some(Instant::now()), 0);
                 },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;

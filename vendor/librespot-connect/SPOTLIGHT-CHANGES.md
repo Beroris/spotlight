@@ -140,6 +140,7 @@ written as "(hidden)".
 A player made with `ConnectConfig::disable_volume` tells Spotify its volume isn't for others
 to set. librespot only said so and still took any volume that came. It now refuses one and
 says so in the app's log ("Refused a volume of N% another device or app asked for"), at most
-every five seconds, with how many were refused since. Nothing is said back to Spotify, so an
+every five seconds, with how many were refused since; the ones after that line are said once
+no more have come for five seconds. Nothing is said back to Spotify, so an
 asker that sends again whenever the volume isn't the one it wants gets no reason to. The
 app's own volume (`Spirc::set_volume`) works as before. Spotlight sets this from its "Let other devices change the volume" setting.

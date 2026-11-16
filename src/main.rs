@@ -1398,17 +1398,17 @@ fn bind_callbacks(
         let spotify_api = spotify_api.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let (audio_settings_changed, settings_before) = {
-                    let guard = state.lock().unwrap();
+                let (audio_settings_changed, settings_before, playlists, liked_count, artwork_enabled, selected_playlist_uri, settings_now) = {
+                    let mut guard = state.lock().unwrap();
+                    // Decided under the same lock the settings are written under. A player
+                    // being started checks them under it too as it is taken on, so either it
+                    // sees the new ones or this sees it and starts it again.
                     let audio_settings_changed = guard.playback_engine.is_some()
                         && (guard.config.audio_quality != ui.get_audio_quality().as_str()
                             || guard.config.normalize_volume != ui.get_normalize_volume()
                             // The player says whose its volume is to set as it connects.
                             || guard.config.volume_from_other_devices != ui.get_volume_from_other_devices());
-                    (audio_settings_changed, SettingsInEffect::of(&guard.config))
-                };
-                let (playlists, liked_count, artwork_enabled, selected_playlist_uri, settings_now) = {
-                    let mut guard = state.lock().unwrap();
+                    let settings_before = SettingsInEffect::of(&guard.config);
                     guard.config.client_id = ui.get_client_id().to_string();
                     guard.config.redirect_uri = ui.get_redirect_uri().to_string();
                     guard.config.artwork_enabled = ui.get_artwork_enabled();
@@ -1457,6 +1457,8 @@ fn bind_callbacks(
                         Vec::new()
                     };
                     (
+                        audio_settings_changed,
+                        settings_before,
                         playlists,
                         liked_count(&guard.config.library_snapshot),
                         guard.config.artwork_enabled,
@@ -8961,8 +8963,12 @@ async fn apply_volume_change(
         let target = guard.active_device_id.clone().or_else(|| guard.device_id.clone());
         // This PC's player is told itself, also in the moment Spotify has it as the device
         // playing and the player hasn't said so yet. Asked through Spotify, it would refuse
-        // the volume when other devices aren't let to change it.
-        let own_player = target.is_some() && target == guard.local_device_id && guard.playback_engine.is_some();
+        // the volume when other devices aren't let to change it. Told by the running
+        // player's own id: `local_device_id` goes by name, which another PC can share.
+        let own_player = guard
+            .playback_engine
+            .as_ref()
+            .is_some_and(|engine| !engine.is_finished() && target.as_deref() == Some(engine.session().device_id()));
         (guard.local_volume_is_target() || own_player, target, guard.token.is_some())
     };
     if use_local {
@@ -9299,14 +9305,16 @@ async fn start_local_playback(
     // to it, undoing a mute or a change made from a phone, and to full when volumes aren't
     // remembered.
     let startup_volume = state.lock().unwrap().local_volume_percent.clamp(0, 100);
-    let mut engine = loop {
-        let volume_from_other_devices = state.lock().unwrap().config.volume_from_other_devices;
-        let engine = match playback::PlaybackEngine::start(
+    let (events, finished, engine_generation) = loop {
+        // The settings a player is made with and keeps for as long as it runs.
+        let made_with = |config: &AppConfig| (config.audio_quality.clone(), config.normalize_volume, config.volume_from_other_devices);
+        let (audio_quality, normalize_volume, volume_from_other_devices) = made_with(&state.lock().unwrap().config);
+        let mut engine = match playback::PlaybackEngine::start(
             local_playback_token.access_token.clone(),
             local_client_id.clone(),
             config_snapshot.device_name.clone(),
-            config_snapshot.audio_quality.clone(),
-            config_snapshot.normalize_volume,
+            audio_quality.clone(),
+            normalize_volume,
             startup_volume as u16,
             volume_from_other_devices,
         )
@@ -9324,30 +9332,36 @@ async fn start_local_playback(
                 return Err(error);
             }
         };
-        // Whether other devices may set the volume is told to Spotify as the player connects.
-        // Changed in Settings meanwhile, it asked for no restart, as there was no player yet,
-        // so this one would carry on with the old answer. One with the new answer is started.
-        if state.lock().unwrap().config.volume_from_other_devices == volume_from_other_devices {
-            break engine;
+        let events = engine.take_player_events();
+        let finished = engine.take_finished_signal();
+        let taken_on = {
+            let mut guard = state.lock().unwrap();
+            // Signed out while the player was starting: it isn't wanted any more.
+            if let Err(error) = ensure_same_session(&guard, session) {
+                engine.shutdown();
+                return Err(error);
+            }
+            // One of them changed in Settings meanwhile asked for no restart, as there was no
+            // player yet, so this one would carry on with the old one: letting other devices
+            // set its volume, say, after that was turned off. Checked under the lock the
+            // player is taken on under: Settings writes under it too, and either this sees
+            // its change or it sees this player and starts it again.
+            if made_with(&guard.config) != (audio_quality, normalize_volume, volume_from_other_devices) {
+                Err(engine)
+            } else {
+                guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
+                let generation = guard.playback_engine_generation;
+                guard.playback_engine = Some(engine);
+                // A new player registers as a device without becoming the active one.
+                guard.local_connect_active = false;
+                Ok(generation)
+            }
+        };
+        match taken_on {
+            Ok(generation) => break (events, finished, generation),
+            // One with the new answer is started.
+            Err(engine) => engine.shutdown(),
         }
-        engine.shutdown();
-    };
-
-    let events = engine.take_player_events();
-    let finished = engine.take_finished_signal();
-    let engine_generation = {
-        let mut guard = state.lock().unwrap();
-        // Signed out while the player was starting: it isn't wanted any more.
-        if let Err(error) = ensure_same_session(&guard, session) {
-            engine.shutdown();
-            return Err(error);
-        }
-        guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);
-        let generation = guard.playback_engine_generation;
-        guard.playback_engine = Some(engine);
-        // A new player registers as a device without becoming the active one.
-        guard.local_connect_active = false;
-        generation
     };
     if let Some(events) = events {
         tokio::spawn(run_local_player_event_loop(
