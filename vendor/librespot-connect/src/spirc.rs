@@ -2222,7 +2222,23 @@ impl SpircTask {
     /// A volume still waiting to prove a mark was asked for under the rule before, which
     /// didn't take it, so it is refused.
     async fn take_volumes_from(&mut self, disable_volume: bool, only_marked_volume: bool) {
-        if let Some(refused) = self.volume_marks.forget() {
+        let waited = self.volume_marks.forget();
+        // Said in the app's log: a volume taken or refused around this moment can't be made
+        // sense of there without knowing which rule held.
+        info!(
+            target: "spotlight",
+            "From now on this player takes a volume from {}.{}",
+            match (disable_volume, only_marked_volume) {
+                (true, _) => "no other device or app",
+                (false, true) => "Spotlight on another device alone, going by its mark",
+                (false, false) => "any device or app",
+            },
+            waited.as_ref().map_or(String::new(), |ask| format!(
+                " One of {}% was waiting to see whether a marked volume followed it, and is refused with the change.",
+                ask.percent
+            ))
+        );
+        if let Some(refused) = waited {
             self.refuse_volume(refused.percent, &refused.came_with);
         }
         self.only_marked_volume = only_marked_volume;
