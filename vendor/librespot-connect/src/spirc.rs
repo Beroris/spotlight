@@ -42,7 +42,7 @@ use std::{
     future::Future,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{sync::mpsc, time::sleep};
@@ -118,6 +118,8 @@ struct SpircTask {
     /// Spotlight: the volume waiting to be reported was asked for through Spotify, by another
     /// device or app, not by this one. Said in the app's log once it settles.
     volume_asked_through_spotify: Option<AskedThroughSpotify>,
+    /// Spotlight: how many volumes were refused since the log last said so, and when it did.
+    volumes_refused: (u32, Option<Instant>),
 
     /// when set to true, it will update the volume after [UPDATE_STATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -259,6 +261,8 @@ fn all_in_list<'a>(brought: &[ContextTrack], list: impl Iterator<Item = &'a str>
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
+/// Spotlight: the least time between two log lines about refused volumes.
+const REFUSED_VOLUME_LOG_GAP: Duration = Duration::from_secs(5);
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -374,6 +378,7 @@ impl Spirc {
             handed_over: None,
             update_volume: false,
             volume_asked_through_spotify: None,
+            volumes_refused: (0, None),
             update_state: false,
 
             spirc_id,
@@ -616,18 +621,27 @@ impl SpircTask {
                                 // Spotlight: this player said its volume isn't others' to set
                                 // (`ConnectConfig::disable_volume`). Spotify's own apps then
                                 // don't ask, but nothing stops a command that comes anyway.
-                                info!(
-                                    target: "spotlight",
-                                    "Refused a volume of {}% another device or app asked for. It came with {came_with}",
-                                    (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)
-                                );
-                                // Said again, so whoever asked shows the volume it still has.
-                                self.update_volume = true;
+                                // Nothing is said back to Spotify: an asker that sends again
+                                // whenever the volume isn't the one it wants would never stop.
+                                // The log says it at most every few seconds for the same reason.
+                                self.volumes_refused.0 += 1;
+                                if self.volumes_refused.1.is_none_or(|said| said.elapsed() >= REFUSED_VOLUME_LOG_GAP) {
+                                    info!(
+                                        target: "spotlight",
+                                        "Refused a volume of {}% another device or app asked for ({} refused since this was last said). It came with {came_with}",
+                                        (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX),
+                                        self.volumes_refused.0
+                                    );
+                                    self.volumes_refused = (0, Some(Instant::now()));
+                                }
                             } else {
                                 // Spotlight: a volume no one chose here is otherwise a riddle.
                                 let before = self.connect_state.device_info().volume;
                                 self.set_volume(volume);
-                                if self.connect_state.device_info().volume != before {
+                                // Every command counts once one of them changed the volume,
+                                // also one that asks for the volume it already has.
+                                let changed = self.connect_state.device_info().volume != before;
+                                if changed || self.volume_asked_through_spotify.is_some() {
                                     let asked = self.volume_asked_through_spotify.get_or_insert_default();
                                     asked.times += 1;
                                     asked.came_with = came_with;

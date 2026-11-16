@@ -8958,11 +8958,12 @@ async fn apply_volume_change(
     let volume_percent = volume_percent.clamp(0, 100);
     let (use_local, target_device_id, has_token) = {
         let guard = state.lock().unwrap();
-        (
-            guard.local_volume_is_target(),
-            guard.active_device_id.clone().or_else(|| guard.device_id.clone()),
-            guard.token.is_some(),
-        )
+        let target = guard.active_device_id.clone().or_else(|| guard.device_id.clone());
+        // This PC's player is told itself, also in the moment Spotify has it as the device
+        // playing and the player hasn't said so yet. Asked through Spotify, it would refuse
+        // the volume when other devices aren't let to change it.
+        let own_player = target.is_some() && target == guard.local_device_id && guard.playback_engine.is_some();
+        (guard.local_volume_is_target() || own_player, target, guard.token.is_some())
     };
     if use_local {
         return run_local_player_command(state, |engine| engine.set_volume(volume_percent as u16));
@@ -9298,28 +9299,38 @@ async fn start_local_playback(
     // to it, undoing a mute or a change made from a phone, and to full when volumes aren't
     // remembered.
     let startup_volume = state.lock().unwrap().local_volume_percent.clamp(0, 100);
-    let mut engine = match playback::PlaybackEngine::start(
-        local_playback_token.access_token.clone(),
-        local_client_id,
-        config_snapshot.device_name.clone(),
-        config_snapshot.audio_quality.clone(),
-        config_snapshot.normalize_volume,
-        startup_volume as u16,
-        config_snapshot.volume_from_other_devices,
-    )
-    .await {
-        Ok(engine) => engine,
-        Err(error) => {
-            let message = error.to_string();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_connection_status("Connected".into());
-                    ui.set_player_status("Local player failed".into());
-                    append_log(&ui, &format!("Local playback failed to start: {message}"));
-                }
-            });
-            return Err(error);
+    let mut engine = loop {
+        let volume_from_other_devices = state.lock().unwrap().config.volume_from_other_devices;
+        let engine = match playback::PlaybackEngine::start(
+            local_playback_token.access_token.clone(),
+            local_client_id.clone(),
+            config_snapshot.device_name.clone(),
+            config_snapshot.audio_quality.clone(),
+            config_snapshot.normalize_volume,
+            startup_volume as u16,
+            volume_from_other_devices,
+        )
+        .await {
+            Ok(engine) => engine,
+            Err(error) => {
+                let message = error.to_string();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_connection_status("Connected".into());
+                        ui.set_player_status("Local player failed".into());
+                        append_log(&ui, &format!("Local playback failed to start: {message}"));
+                    }
+                });
+                return Err(error);
+            }
+        };
+        // Whether other devices may set the volume is told to Spotify as the player connects.
+        // Changed in Settings meanwhile, it asked for no restart, as there was no player yet,
+        // so this one would carry on with the old answer. One with the new answer is started.
+        if state.lock().unwrap().config.volume_from_other_devices == volume_from_other_devices {
+            break engine;
         }
+        engine.shutdown();
     };
 
     let events = engine.take_player_events();
