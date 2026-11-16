@@ -2319,14 +2319,12 @@ fn bind_callbacks(
 
     let ui_weak = ui.as_weak();
     ui.on_toggle_mute({
-        let runtime = Arc::clone(&runtime);
         let state = Arc::clone(&state);
-        let spotify_api = spotify_api.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let (target_volume, use_local_volume) = {
+            let target_volume = {
                 let mut guard = state.lock().unwrap();
                 guard.last_volume_change = Some(Instant::now());
                 let target = if ui.get_volume_percent() > 0 {
@@ -2338,49 +2336,21 @@ fn bind_callbacks(
                     guard.muted = false;
                     restored
                 };
-                let local = guard.local_volume_is_target();
-                if local {
+                if guard.local_volume_is_target() {
                     guard.local_volume_percent = target;
                 }
-                (target, local)
+                target
             };
-            if use_local_volume {
-                playback::set_volume_now(target_volume as u16);
-            }
             ui.set_volume_percent(target_volume);
             ui.set_muted(target_volume == 0);
             ui.set_previous_volume_percent({
                 let guard = state.lock().unwrap();
                 guard.previous_volume_percent
             });
-
-            if use_local_volume {
-                if let Err(error) = run_local_player_command(Arc::clone(&state), |engine| {
-                    engine.set_volume(target_volume as u16)
-                }) {
-                    append_log(&ui, &format!("Volume change failed: {error}"));
-                }
-                return;
-            }
-
-            let ui_weak_inner = ui_weak.clone();
-            let state_inner = Arc::clone(&state);
-            let spotify_api_inner = spotify_api.clone();
-            runtime.spawn(async move {
-                let result = apply_volume_change(
-                    Arc::clone(&state_inner),
-                    spotify_api_inner,
-                    target_volume,
-                )
-                .await;
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak_inner.upgrade() {
-                        if let Err(error) = result {
-                            append_log(&ui, &format!("Volume change failed: {error}"));
-                        }
-                    }
-                });
-            });
+            // Sent as the slider's changes are, by the one task that sends them. It takes
+            // the newest, so a drag still waiting to be sent can't undo the mute, and its
+            // changes go out in the order they were made.
+            ui.invoke_set_volume(target_volume);
         }
     });
 
@@ -8952,13 +8922,17 @@ async fn keep_list_after_switch(
     }
 }
 
+/// Sets the volume of whichever device has the music. Only the volume task calls this, one
+/// change after another: the slider and the mute button both go through it. A change sent
+/// to another device is a mark and a volume, and two changes mixed together would mark
+/// nothing: the device would keep its volume while this window showed the new one.
 async fn apply_volume_change(
     state: Arc<Mutex<AppState>>,
     spotify_api: spotify::SpotifyApi,
     volume_percent: i32,
 ) -> Result<()> {
     let volume_percent = volume_percent.clamp(0, 100);
-    let where_to = || {
+    let (use_local, target_device_id, has_token) = {
         let guard = state.lock().unwrap();
         let target = guard.active_device_id.clone().or_else(|| guard.device_id.clone());
         // This PC's player is told itself, also in the moment Spotify has it as the device
@@ -8971,23 +8945,11 @@ async fn apply_volume_change(
             .is_some_and(|engine| !engine.is_finished() && target.as_deref() == Some(engine.session().device_id()));
         (guard.local_volume_is_target() || own_player, target, guard.token.is_some())
     };
-    if where_to().0 {
+    if use_local {
         return run_local_player_command(state, |engine| engine.set_volume(volume_percent as u16));
     }
     // Another device is playing: only its volume changes. This PC keeps its own, so
     // turning a speaker down never turns this PC down with it.
-    //
-    // One change at a time, its mark and its volume together. The slider and the mute
-    // button send from different tasks, and two changes mixed together mark nothing: the
-    // device would keep its volume while this window shows the new one.
-    static SENDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _sending = SENDING.lock().await;
-    // Looked at again: the change before this one may have taken seconds, and the music
-    // may have moved in them.
-    let (use_local, target_device_id, has_token) = where_to();
-    if use_local {
-        return run_local_player_command(state, |engine| engine.set_volume(volume_percent as u16));
-    }
     match target_device_id {
         Some(device_id) if has_token => {
             let token = current_token(&state).await?;
@@ -9007,11 +8969,15 @@ async fn send_marked_volume(
     volume_percent: i32,
 ) -> Result<()> {
     let mark = librespot_connect::mark_for_volume(volume_percent as u32) as i32;
-    // A mark that couldn't be sent is no reason not to ask for the volume: a device that
-    // takes any volume still gets it.
     let mark_sent = Instant::now();
     let marked = spotify_api.volume(token, Some(device_id), mark).await;
     let mark_took = mark_sent.elapsed();
+    // A mark that couldn't be sent is no reason not to ask for the volume: a device that
+    // takes any volume still gets it. Unless Spotify said to slow down, which asking again
+    // at once would only make longer.
+    if marked.as_ref().is_err_and(|error| error.is::<spotify::RateLimitError>()) {
+        return marked;
+    }
     let asked = spotify_api.volume(token, Some(device_id), volume_percent).await;
     // A device that takes volumes from Spotlight alone refuses one that comes too long
     // after its mark, and nothing here shows that it did. So the log says when the two

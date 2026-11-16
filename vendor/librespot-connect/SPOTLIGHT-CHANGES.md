@@ -151,7 +151,8 @@ Spotify passes a volume on with nothing that says which device or app asked for 
 a player can take the volumes Spotlight asks for and no others, Spotlight marks them, and
 the mark is a volume too: an app asking for N% first asks for one percent more (one less for
 100%), `mark_for_volume`, and for N% straight after. A player that takes any volume is at
-the mark for a moment that can't be heard.
+the mark for as long as the second request takes: one percent off, which for a mute is 1%
+rather than silence, and stays so if that request fails.
 
 A player made with the new `ConnectConfig::only_marked_volume` takes a volume only when the
 ask just before it, within three seconds, was its mark (`VolumeMarks` in `src/spirc.rs`).
@@ -174,10 +175,12 @@ asking, as between the steps of a phone's volume buttons, never comes with a mar
 
 Spotlight's "Volume from other devices" setting chooses between any app (as librespot was),
 Spotlight (`only_marked_volume`) and no one (`disable_volume`). The app sends a mark and its
-volume one change at a time (`send_marked_volume` in the app's `src/main.rs`), as two changes
-mixed together mark nothing, and asks once more for a volume that failed after its mark
-went, when that is still within the three seconds (`VOLUME_MARK_WINDOW`, which the app reads
-from here). The app's log says when a mark and its volume took over a second to send: a
-volume refused for coming late shows nowhere else on the sending side.
+volume one change at a time (`send_marked_volume` in the app's `src/main.rs`, called by one
+task that the slider and the mute button both go through), as two changes mixed together
+mark nothing. It asks once more for a volume that failed after its mark went, when that is
+still within the three seconds (`VOLUME_MARK_WINDOW`, which the app reads from here) and
+after as long as Spotify said to wait; a mark Spotify answered with "slow down" is not
+followed by its volume at all. The app's log says when a mark and its volume took over a
+second to send: a volume refused for coming late shows nowhere else on the sending side.
 
 Run its tests with `cargo test -p librespot-connect spirc::tests`.
