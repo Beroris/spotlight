@@ -136,3 +136,9 @@ how many commands came before the volume settled (one is a jump, many are steps,
 buttons make), and what came with the last: its connection type, interaction and page ids,
 message id and the message's headers. A header that holds a connection id or a token is
 written as "(hidden)".
+
+A player made with `ConnectConfig::disable_volume` tells Spotify its volume isn't for others
+to set. librespot only said so and still took any volume that came. It now refuses one, says
+so in the app's log ("Refused a volume of N% another device or app asked for") and reports
+the volume it kept, so whoever asked shows it again. The app's own volume (`Spirc::set_volume`)
+works as before. Spotlight sets this from its "Let other devices change the volume" setting.

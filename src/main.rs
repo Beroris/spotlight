@@ -610,6 +610,7 @@ fn main() -> Result<()> {
         ui.set_crossfade_seconds(guard.config.crossfade_seconds.min(MAX_CROSSFADE_SECONDS) as i32);
         set_crossfade(guard.config.crossfade_seconds);
         ui.set_remember_volume(guard.config.remember_volume);
+        ui.set_volume_from_other_devices(guard.config.volume_from_other_devices);
         ui.set_global_hotkeys(guard.config.global_hotkeys);
         ui.set_media_keys_enabled(guard.config.media_keys_enabled);
         ui.set_play_pause_hotkey(guard.config.play_pause_hotkey.clone().into());
@@ -1401,7 +1402,9 @@ fn bind_callbacks(
                     let guard = state.lock().unwrap();
                     let audio_settings_changed = guard.playback_engine.is_some()
                         && (guard.config.audio_quality != ui.get_audio_quality().as_str()
-                            || guard.config.normalize_volume != ui.get_normalize_volume());
+                            || guard.config.normalize_volume != ui.get_normalize_volume()
+                            // The player says whose its volume is to set as it connects.
+                            || guard.config.volume_from_other_devices != ui.get_volume_from_other_devices());
                     (audio_settings_changed, SettingsInEffect::of(&guard.config))
                 };
                 let (playlists, liked_count, artwork_enabled, selected_playlist_uri, settings_now) = {
@@ -1424,6 +1427,7 @@ fn bind_callbacks(
                     guard.config.crossfade_seconds = ui.get_crossfade_seconds().max(0) as u32;
                     set_crossfade(guard.config.crossfade_seconds);
                     guard.config.remember_volume = ui.get_remember_volume();
+                    guard.config.volume_from_other_devices = ui.get_volume_from_other_devices();
                     guard.config.resume_on_startup = ui.get_resume_on_startup();
                     guard.config.global_hotkeys = ui.get_global_hotkeys();
                     guard.config.media_keys_enabled = ui.get_media_keys_enabled();
@@ -9301,6 +9305,7 @@ async fn start_local_playback(
         config_snapshot.audio_quality.clone(),
         config_snapshot.normalize_volume,
         startup_volume as u16,
+        config_snapshot.volume_from_other_devices,
     )
     .await {
         Ok(engine) => engine,

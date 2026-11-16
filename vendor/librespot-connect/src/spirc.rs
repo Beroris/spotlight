@@ -612,13 +612,26 @@ impl SpircTask {
                     match |volume_update| match volume_update.0.volume.try_into() {
                         Ok(volume) => {
                             let came_with = volume_update.1;
-                            // Spotlight: a volume no one chose here is otherwise a riddle.
-                            let before = self.connect_state.device_info().volume;
-                            self.set_volume(volume);
-                            if self.connect_state.device_info().volume != before {
-                                let asked = self.volume_asked_through_spotify.get_or_insert_default();
-                                asked.times += 1;
-                                asked.came_with = came_with;
+                            if self.connect_state.device_info().capabilities.disable_volume {
+                                // Spotlight: this player said its volume isn't others' to set
+                                // (`ConnectConfig::disable_volume`). Spotify's own apps then
+                                // don't ask, but nothing stops a command that comes anyway.
+                                info!(
+                                    target: "spotlight",
+                                    "Refused a volume of {}% another device or app asked for. It came with {came_with}",
+                                    (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)
+                                );
+                                // Said again, so whoever asked shows the volume it still has.
+                                self.update_volume = true;
+                            } else {
+                                // Spotlight: a volume no one chose here is otherwise a riddle.
+                                let before = self.connect_state.device_info().volume;
+                                self.set_volume(volume);
+                                if self.connect_state.device_info().volume != before {
+                                    let asked = self.volume_asked_through_spotify.get_or_insert_default();
+                                    asked.times += 1;
+                                    asked.came_with = came_with;
+                                }
                             }
                         }
                         Err(why) => error!("can't update volume, failed to parse i32 to u16: {why}")

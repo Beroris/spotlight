@@ -2624,6 +2624,7 @@ export component AppWindow inherits Window {
     // Seconds a song fades into the next as it ends. Zero is off.
     in-out property <int> crossfade_seconds: 0;
     in-out property <bool> remember_volume: true;
+    in-out property <bool> volume_from_other_devices: true;
     in-out property <bool> resume_on_startup: false;
     in-out property <bool> global_hotkeys: true;
     in-out property <bool> media_keys_enabled: true;
@@ -6137,6 +6138,7 @@ export component AppWindow inherits Window {
                                                 }
                                             }
                                             SettingToggle { label: "Remember volume"; description: "Start at the volume you last used."; checked <=> root.remember_volume; toggled => { root.save_settings(); } }
+                                            SettingToggle { label: "Let other devices change the volume"; description: "Off: only this computer sets its volume, not a phone or another Spotify app."; checked <=> root.volume_from_other_devices; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Resume when Spotlight opens"; description: "Picks up where you left off, even if another device is playing."; checked <=> root.resume_on_startup; toggled => { root.save_settings(); } }
                                         }
 

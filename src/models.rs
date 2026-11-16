@@ -46,6 +46,10 @@ pub struct AppConfig {
     pub crossfade_seconds: u32,
     #[serde(default = "default_true")]
     pub remember_volume: bool,
+    /// Whether other devices and apps on the account may set this player's volume. Off for
+    /// a volume only this computer changes.
+    #[serde(default = "default_true")]
+    pub volume_from_other_devices: bool,
     /// Resume the last session on this PC when Spotlight opens. Off by default
     /// so launching the app never takes over playback from another device.
     #[serde(default)]

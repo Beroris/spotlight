@@ -57,6 +57,7 @@ impl PlaybackEngine {
         audio_quality: String,
         normalize_volume: bool,
         initial_volume_percent: u16,
+        volume_from_other_devices: bool,
     ) -> Result<Self> {
         let credentials = Credentials::with_access_token(access_token);
         let mut session_config = SessionConfig::default();
@@ -97,6 +98,9 @@ impl PlaybackEngine {
             name: device_name.clone(),
             device_type: DeviceType::Computer,
             initial_volume: percent_to_spotify_volume(initial_volume_percent),
+            // Tells Spotify this device's volume isn't for others to set, so its apps
+            // show no slider for it. The player refuses one that comes anyway.
+            disable_volume: !volume_from_other_devices,
             ..Default::default()
         };
 
