@@ -965,9 +965,13 @@ fn main() -> Result<()> {
                     let ui_weak = ui_weak.clone();
                     move || {
                         if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_muted(value == 0);
-                            if value > 0 {
-                                ui.set_previous_volume_percent(value);
+                            // Not when the volume has been changed again since: the window
+                            // already shows that change, which is sent next.
+                            if ui.get_volume_percent() == value {
+                                ui.set_muted(value == 0);
+                                if value > 0 {
+                                    ui.set_previous_volume_percent(value);
+                                }
                             }
                             if let Err(error) = result {
                                 append_log(&ui, &format!("Volume change failed: {error}"));
@@ -8981,13 +8985,14 @@ async fn send_marked_volume(
     let asked = spotify_api.volume(token, Some(device_id), volume_percent).await;
     // A device that takes volumes from Spotlight alone refuses one that comes too long
     // after its mark, and nothing here shows that it did. So the log says when the two
-    // were slow: Spotify may hold a request until the device answers, and such a device
-    // never answers a mark.
-    if marked.is_ok() && mark_sent.elapsed() > Duration::from_secs(1) {
+    // were slow, or the mark failed: Spotify may hold a request until the device answers,
+    // and such a device never answers a mark.
+    if marked.is_err() || mark_sent.elapsed() > Duration::from_secs(1) {
         file_log(&format!(
-            "Sending another device a volume of {volume_percent}% and its mark took {:.1}s, the mark {:.1}s of it. Spotlight on that device takes the volume if it comes within {}s of the mark.",
+            "Sending another device a volume of {volume_percent}% and its mark took {:.1}s, the mark {:.1}s of it{}. Spotlight on that device takes the volume if it comes within {}s of the mark.",
             mark_sent.elapsed().as_secs_f32(),
             mark_took.as_secs_f32(),
+            marked.as_ref().err().map(|error| format!(", and the mark failed ({error})")).unwrap_or_default(),
             librespot_connect::VOLUME_MARK_WINDOW.as_secs(),
         ));
     }
@@ -9012,7 +9017,7 @@ async fn send_marked_volume(
 fn wait_to_ask_again(since_mark: Duration, told_to_wait_secs: Option<u64>) -> Option<Duration> {
     let wait = told_to_wait_secs.map_or(Duration::from_millis(500), Duration::from_secs);
     let in_time = librespot_connect::VOLUME_MARK_WINDOW.saturating_sub(Duration::from_millis(500));
-    (since_mark + wait <= in_time).then_some(wait)
+    since_mark.checked_add(wait).is_some_and(|by_then| by_then <= in_time).then_some(wait)
 }
 
 async fn apply_seek_change(
@@ -10872,6 +10877,7 @@ mod tests {
         assert_eq!(wait_to_ask_again(ms(6000), None), None, "a request that ran out of time");
         assert_eq!(wait_to_ask_again(ms(300), Some(3)), None);
         assert_eq!(wait_to_ask_again(ms(300), Some(u64::MAX / 2)), None);
+        assert_eq!(wait_to_ask_again(ms(1500), Some(u64::MAX)), None, "a wait too long to add up");
     }
 
     #[test]

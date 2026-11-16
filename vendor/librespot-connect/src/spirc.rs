@@ -234,8 +234,8 @@ fn percent_of(volume: u16) -> u32 {
 /// player that takes volumes from Spotlight's apps alone ([`ConnectConfig::only_marked_volume`])
 /// can tell it from one any other app asked for. Spotify passes on the volume and nothing
 /// that says who asked, so the mark is a volume too: the app asks for this one first and
-/// for `percent` straight after. It is one percent off, so a player that takes any volume
-/// is at it for a moment that can't be heard.
+/// for `percent` straight after. It is one percent off, and a player that takes any volume
+/// is at it for as long as the second request takes.
 pub fn mark_for_volume(percent: u32) -> u32 {
     if percent >= 100 { 99 } else { percent + 1 }
 }
