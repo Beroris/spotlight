@@ -6141,7 +6141,7 @@ export component AppWindow inherits Window {
                                             SettingToggle { label: "Remember volume"; description: "Start at the volume you last used."; checked <=> root.remember_volume; toggled => { root.save_settings(); } }
                                             SettingSegments {
                                                 label: "Volume from other devices";
-                                                description: "Who else may change this computer's volume: any app, only Spotlight on your other devices, or no one.";
+                                                description: "Spotlight: takes only what your other Spotlight apps ask for, as far as it can tell.";
                                                 options: ["Any app", "Spotlight", "No one"];
                                                 segment-width: 80px;
                                                 selected: root.volume_from == "Spotlight" ? 1 : (root.volume_from == "None" ? 2 : 0);

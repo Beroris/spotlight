@@ -221,7 +221,7 @@ struct AskedThroughSpotify {
     times: u32,
     /// What came with the last of them, from [`volume_command`].
     came_with: String,
-    /// The last of them came marked as asked for by one of Spotlight's apps.
+    /// The last of them came with the mark Spotlight's apps send.
     marked: bool,
 }
 
@@ -791,7 +791,8 @@ impl SpircTask {
                         info!(
                             target: "spotlight",
                             "{} set this player's volume to {}%. It asked {} time(s), the last with {}",
-                            if asked.marked { "A Spotlight app" } else { "Another device or app" },
+                            // By the mark alone: Spotify doesn't say who asked.
+                            if asked.marked { "Spotlight on another device, going by its mark," } else { "Another device or app" },
                             (self.connect_state.device_info().volume * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX),
                             asked.times,
                             asked.came_with
@@ -2418,6 +2419,40 @@ mod tests {
         assert_eq!(marks(&[(0, 51), (late, 50)]), (vec![], vec![51, 50]));
         // One percent the other way is no mark.
         assert_eq!(marks(&[(0, 49), (0, 50)]), (vec![], vec![49, 50]));
+        // A mark that came the whole of its time before still counts.
+        assert_eq!(marks(&[(0, 51), (VOLUME_MARK_WINDOW.as_secs(), 50)]), (vec![50], vec![]));
+    }
+
+    #[test]
+    fn only_the_one_volume_before_it_marks_a_volume() {
+        for before in 0..=100 {
+            for percent in 0..=100 {
+                let (taken, refused) = marks(&[(0, before), (0, percent)]);
+                if before == mark_for_volume(percent) {
+                    assert_eq!((taken, refused), (vec![percent], vec![]), "{before}% then {percent}%");
+                } else {
+                    assert_eq!((taken, refused), (vec![], vec![before, percent]), "{before}% then {percent}%");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_mark_and_its_volume_the_wrong_way_round_are_refused() {
+        for percent in 0..99 {
+            let (taken, refused) = marks(&[(0, percent), (0, mark_for_volume(percent))]);
+            assert_eq!((taken, refused), (vec![], vec![percent, mark_for_volume(percent)]), "{percent}%");
+        }
+        // All but the two at the top, where each is the other's mark: 100% arriving before
+        // its mark leaves the player at 99%.
+        assert_eq!(marks(&[(0, 100), (0, 99)]), (vec![99], vec![]));
+    }
+
+    #[test]
+    fn a_slider_drawn_up_to_the_top_in_another_app_gets_there() {
+        // Not wanted, but known: the last step of such a drag is 99% and then 100%, which
+        // is what Spotlight sends for 100%.
+        assert_eq!(marks(&[(0, 97), (0, 98), (0, 99), (0, 100)]), (vec![100], vec![97, 98]));
     }
 
     #[test]

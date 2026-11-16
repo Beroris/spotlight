@@ -156,12 +156,25 @@ the mark for a moment that can't be heard.
 A player made with the new `ConnectConfig::only_marked_volume` takes a volume only when the
 ask just before it, within three seconds, was its mark (`VolumeMarks` in `src/spirc.rs`).
 The mark itself is not taken. An ask that was neither marked nor followed by the volume it
-would mark is refused and said in the log like any other. A marked volume is no mark for the
-next, so a slider drawn slowly down in another app doesn't mark each step with the last;
-every other step of such a drag can still pass. The log says "A Spotlight app set this
-player's volume" for a marked one.
+would mark is refused and said in the log like any other. The log says "Spotlight on another
+device, going by its mark, set this player's volume" for a marked one.
+
+The mark shows what was sent, not who sent it, and a volume one percent under the one before
+it is what a slider drawn slowly in another app sends too:
+
+- A marked volume is no mark for the next, so such a slider doesn't mark each step with the
+  last. Every other step of it drawn down can still pass.
+- Drawn up to the top, its last step is 99% and then 100%, which passes.
+- 99% and 100% are each the other's mark. Should Spotify hand a mark and its volume over the
+  wrong way round, both are refused, except at the top, where the player ends one percent
+  from what was asked.
+
+None of these is what the setting is for: a volume that jumps to another without anyone
+asking, as between the steps of a phone's volume buttons, never comes with a mark.
 
 Spotlight's "Volume from other devices" setting chooses between any app (as librespot was),
-Spotlight (`only_marked_volume`) and no one (`disable_volume`).
+Spotlight (`only_marked_volume`) and no one (`disable_volume`). The app sends a mark and its
+volume one change at a time (`send_marked_volume` in the app's `src/main.rs`), as two changes
+mixed together mark nothing, and asks once more for a volume that failed after its mark went.
 
 Run its tests with `cargo test -p librespot-connect spirc::tests`.

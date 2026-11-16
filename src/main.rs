@@ -8978,16 +8978,43 @@ async fn apply_volume_change(
     // turning a speaker down never turns this PC down with it.
     match target_device_id {
         Some(device_id) if has_token => {
+            // One change at a time, its mark and its volume together. The slider and the
+            // mute button send from different tasks, and two changes mixed together mark
+            // nothing: the device would keep its volume while this window shows the new one.
+            static SENDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _sending = SENDING.lock().await;
             let token = current_token(&state).await?;
-            // The mark goes first: Spotlight on that device may take volumes from Spotlight
-            // alone, and knows this one by it. It is one percent off and replaced at once,
-            // so a device that takes any volume shows nothing of it.
-            let mark = librespot_connect::mark_for_volume(volume_percent as u32) as i32;
-            spotify_api.volume(&token, Some(device_id.as_str()), mark).await?;
-            spotify_api.volume(&token, Some(device_id.as_str()), volume_percent).await
+            send_marked_volume(&spotify_api, &token, &device_id, volume_percent).await
         }
         _ => Ok(()),
     }
+}
+
+/// Asks another device for a volume, with Spotlight's mark first: Spotlight on that device
+/// may take volumes from Spotlight alone, and knows this one by the mark. The mark is one
+/// percent off and replaced at once, so a device that takes any volume is at it for a moment.
+async fn send_marked_volume(
+    spotify_api: &spotify::SpotifyApi,
+    token: &TokenStore,
+    device_id: &str,
+    volume_percent: i32,
+) -> Result<()> {
+    let mark = librespot_connect::mark_for_volume(volume_percent as u32) as i32;
+    // A mark that couldn't be sent is no reason not to ask for the volume: a device that
+    // takes any volume still gets it.
+    let marked = spotify_api.volume(token, Some(device_id), mark).await;
+    let asked = spotify_api.volume(token, Some(device_id), volume_percent).await;
+    let (Ok(()), Err(error)) = (&marked, &asked) else {
+        return asked;
+    };
+    // The device may now be at the mark: one percent off, and for a mute still heard. The
+    // volume is asked for once more, after as long as Spotify says to wait, but soon enough
+    // for the mark still to count.
+    let wait = error
+        .downcast_ref::<spotify::RateLimitError>()
+        .map_or(Duration::from_millis(500), |limit| Duration::from_secs(limit.retry_after_secs.min(2)));
+    tokio::time::sleep(wait).await;
+    spotify_api.volume(token, Some(device_id), volume_percent).await
 }
 
 async fn apply_seek_change(
