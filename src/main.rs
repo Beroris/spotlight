@@ -1409,9 +1409,17 @@ fn bind_callbacks(
                     // sees the new ones or this sees it and starts it again.
                     let audio_settings_changed = guard.playback_engine.is_some()
                         && (guard.config.audio_quality != ui.get_audio_quality().as_str()
-                            || guard.config.normalize_volume != ui.get_normalize_volume()
-                            // The player says whose its volume is to set as it connects.
-                            || guard.config.volume_from != ui.get_volume_from().as_str());
+                            || guard.config.normalize_volume != ui.get_normalize_volume());
+                    // Who else may set the volume needs no new player: the running one is
+                    // told and goes by it from then on, with the music playing on. One still
+                    // being started isn't here yet, and is checked as it is taken on.
+                    if guard.config.volume_from != ui.get_volume_from().as_str() {
+                        if let Some(engine) = guard.playback_engine.as_ref() {
+                            if let Err(error) = engine.set_volume_from(ui.get_volume_from().as_str()) {
+                                file_log(&format!("Couldn't tell the player who may set its volume ({error}). The next player started goes by the setting."));
+                            }
+                        }
+                    }
                     let settings_before = SettingsInEffect::of(&guard.config);
                     guard.config.client_id = ui.get_client_id().to_string();
                     guard.config.redirect_uri = ui.get_redirect_uri().to_string();

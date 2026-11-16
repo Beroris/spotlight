@@ -151,6 +151,10 @@ enum SpircCommand {
     Disconnect { pause: bool },
     SetPosition(u32),
     SetVolume(u16),
+    SetVolumeFrom {
+        disable_volume: bool,
+        only_marked_volume: bool,
+    },
     Activate,
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
@@ -287,6 +291,11 @@ impl VolumeMarks {
         self.unproven
             .as_ref()
             .map_or(Duration::ZERO, |ask| VOLUME_MARK_WINDOW.saturating_sub(now.duration_since(ask.at)))
+    }
+
+    /// The ask that waited, whatever time it had left: nothing after it can make it a mark.
+    fn forget(&mut self) -> Option<VolumeAsk> {
+        self.unproven.take()
     }
 
     /// The ask that waited, once its time is up: it was no mark.
@@ -574,6 +583,17 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn set_volume(&self, volume: u16) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::SetVolume(volume))?)
+    }
+
+    /// Spotlight: changes whose volumes the player takes while it runs, as
+    /// [`ConnectConfig::disable_volume`] and [`ConnectConfig::only_marked_volume`] set it
+    /// when the player is made. Takes effect with the music here or not, and leaves the
+    /// music alone.
+    pub fn set_volume_from(&self, disable_volume: bool, only_marked_volume: bool) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::SetVolumeFrom {
+            disable_volume,
+            only_marked_volume,
+        })?)
     }
 
     /// Updates the position to the given value.
@@ -960,6 +980,14 @@ impl SpircTask {
             // elsewhere or nowhere was dropped, and the old one came back with the music.
             SpircCommand::SetVolume(volume) if !self.connect_state.is_active() => {
                 self.set_volume_chosen_here(volume);
+                return Ok(());
+            }
+            // Spotlight: whose volumes are taken is the device's own business as well.
+            SpircCommand::SetVolumeFrom {
+                disable_volume,
+                only_marked_volume,
+            } => {
+                self.take_volumes_from(disable_volume, only_marked_volume).await;
                 return Ok(());
             }
             _ if !self.connect_state.is_active() => {
@@ -2190,6 +2218,24 @@ impl SpircTask {
         }
     }
 
+    /// Spotlight: changes whose volumes are taken from now on ([`Spirc::set_volume_from`]).
+    /// A volume still waiting to prove a mark was asked for under the rule before, which
+    /// didn't take it, so it is refused.
+    async fn take_volumes_from(&mut self, disable_volume: bool, only_marked_volume: bool) {
+        if let Some(refused) = self.volume_marks.forget() {
+            self.refuse_volume(refused.percent, &refused.came_with);
+        }
+        self.only_marked_volume = only_marked_volume;
+        if !self.connect_state.set_disable_volume(disable_volume) {
+            return;
+        }
+        // Spotify is told, so that its apps show or hide this device's volume. The player
+        // goes by its own word either way, so failing to tell changes nothing here.
+        if let Err(why) = self.notify().await {
+            warn!("couldn't tell Spotify whether this device's volume is for others to set: {why}");
+        }
+    }
+
     /// Spotlight: a volume this app asked for. It is the latest word, so one Spotify passed
     /// on just before is no longer what the log should speak of.
     fn set_volume_chosen_here(&mut self, volume: u16) {
@@ -2466,6 +2512,19 @@ mod tests {
         // Two drags from one of Spotlight's apps, each with its own mark.
         let (taken, refused) = marks(&[(0, 31), (0, 30), (1, 41), (1, 40)]);
         assert_eq!((taken, refused), (vec![30, 40], vec![]));
+    }
+
+    #[test]
+    fn an_ask_forgotten_marks_nothing_after_it() {
+        // Whose volumes are taken changed while a volume waited: it is handed back to be
+        // refused, and the volume it would have marked comes unmarked.
+        let start = Instant::now();
+        let mut marks = VolumeMarks::default();
+        assert_eq!(marks.ask(51, "how".into(), start), (false, None));
+        assert_eq!(marks.forget().map(|ask| ask.percent), Some(51));
+        assert!(!marks.waits());
+        assert_eq!(marks.forget(), None);
+        assert_eq!(marks.ask(50, String::new(), start).0, false);
     }
 
     #[test]

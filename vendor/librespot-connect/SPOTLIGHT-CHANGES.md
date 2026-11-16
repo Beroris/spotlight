@@ -183,4 +183,12 @@ after as long as Spotify said to wait; a mark Spotify answered with "slow down" 
 followed by its volume at all. The app's log says when a mark and its volume took over a
 second to send: a volume refused for coming late shows nowhere else on the sending side.
 
+The choice can be changed on a running player, with the music playing on:
+`Spirc::set_volume_from` (`SpircCommand::SetVolumeFrom`, `take_volumes_from`) sets both
+rules at once, with the music here or elsewhere. A volume still waiting to prove a mark is
+refused, as the rule it came under didn't take it. When whether the volume is for others to
+set changed (`ConnectState::set_disable_volume` in `src/state.rs`), Spotify is told with
+the player's state; whether its apps then show or hide the device's volume straight away
+hasn't been seen. The player goes by its own word either way.
+
 Run its tests with `cargo test -p librespot-connect spirc::tests`.
