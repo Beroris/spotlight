@@ -130,3 +130,9 @@ or app. `volume_asked_through_spotify` in `src/spirc.rs` notes that, and once th
 settled the app's log says "Another device or app set this player's volume to N%", unless
 one was chosen here in between. Spotify doesn't say which device asked, and a volume this
 app sends to its own player through Spotify's API counts as from elsewhere too.
+
+The line goes on with what there is to tell one asker from another by (`volume_command`):
+how many commands came before the volume settled (one is a jump, many are steps, as volume
+buttons make), and what came with the last: its connection type, interaction and page ids,
+message id and the message's headers. A header that holds a connection id or a token is
+written as "(hidden)".

@@ -85,7 +85,7 @@ struct SpircTask {
 
     connection_id_update: BoxedStreamResult<String>,
     connect_state_update: BoxedStreamResult<ClusterUpdate>,
-    connect_state_volume_update: BoxedStreamResult<SetVolumeCommand>,
+    connect_state_volume_update: BoxedStreamResult<(SetVolumeCommand, String)>,
     connect_state_logout_request: BoxedStreamResult<LogoutCommand>,
     playlist_update: BoxedStreamResult<PlaylistModificationInfo>,
     session_update: BoxedStreamResult<FallbackWrapper<SessionUpdate>>,
@@ -117,7 +117,7 @@ struct SpircTask {
     update_volume: bool,
     /// Spotlight: the volume waiting to be reported was asked for through Spotify, by another
     /// device or app, not by this one. Said in the app's log once it settles.
-    volume_asked_through_spotify: bool,
+    volume_asked_through_spotify: Option<AskedThroughSpotify>,
 
     /// when set to true, it will update the volume after [UPDATE_STATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -207,6 +207,45 @@ fn named_or_brought(
     }
 }
 
+/// Spotlight: the volumes asked for through Spotify since the last one was said in the log.
+#[derive(Default)]
+struct AskedThroughSpotify {
+    /// How many came. One is a jump; many in a row are steps, as volume buttons make.
+    times: u32,
+    /// What came with the last of them, from [`volume_command`].
+    came_with: String,
+}
+
+/// Spotlight: a volume command Spotify passed on, and a line on what came with it. Spotify
+/// doesn't say which device or app asked, so this is all there is to tell one asker from
+/// another by.
+fn volume_command(message: Message) -> Result<(SetVolumeCommand, String), Error> {
+    let mut headers: Vec<String> = message
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            // The id of this player's connection stays out of the log.
+            let lower = name.to_lowercase();
+            let secret = ["connection", "token", "authorization"]
+                .iter()
+                .any(|part| lower.contains(part));
+            format!("{name}: {}", if secret { "(hidden)" } else { value.as_str() })
+        })
+        .collect();
+    headers.sort();
+
+    let command: SetVolumeCommand = Message::from_raw(message)?;
+    let came_with = format!(
+        "connection type {:?}, interaction ids {:?}, page ids {:?}, message id {}, headers {:?}",
+        command.connection_type,
+        command.logging_params.interaction_ids,
+        command.logging_params.page_instance_ids,
+        command.command_options.message_id,
+        headers
+    );
+    Ok((command, came_with))
+}
+
 /// Spotlight: whether every song a play command brought is in `list`, the songs this player
 /// has. Only then does a command naming that list mean "play from it".
 fn all_in_list<'a>(brought: &[ContextTrack], list: impl Iterator<Item = &'a str>) -> bool {
@@ -263,7 +302,7 @@ impl Spirc {
 
         let connect_state_volume_update = session
             .dealer()
-            .listen_for("hm://connect-state/v1/connect/volume", Message::from_raw)?;
+            .listen_for("hm://connect-state/v1/connect/volume", volume_command)?;
 
         let connect_state_logout_request = session
             .dealer()
@@ -334,7 +373,7 @@ impl Spirc {
             playing_elsewhere: None,
             handed_over: None,
             update_volume: false,
-            volume_asked_through_spotify: false,
+            volume_asked_through_spotify: None,
             update_state: false,
 
             spirc_id,
@@ -570,13 +609,16 @@ impl SpircTask {
                 // volume request handling is send separately (it's more like a fire forget)
                 volume_update = self.connect_state_volume_update.next() => unwrap! {
                     volume_update,
-                    match |volume_update| match volume_update.volume.try_into() {
+                    match |volume_update| match volume_update.0.volume.try_into() {
                         Ok(volume) => {
+                            let came_with = volume_update.1;
                             // Spotlight: a volume no one chose here is otherwise a riddle.
                             let before = self.connect_state.device_info().volume;
                             self.set_volume(volume);
                             if self.connect_state.device_info().volume != before {
-                                self.volume_asked_through_spotify = true;
+                                let asked = self.volume_asked_through_spotify.get_or_insert_default();
+                                asked.times += 1;
+                                asked.came_with = came_with;
                             }
                         }
                         Err(why) => error!("can't update volume, failed to parse i32 to u16: {why}")
@@ -631,11 +673,13 @@ impl SpircTask {
                 },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;
-                    if std::mem::take(&mut self.volume_asked_through_spotify) {
+                    if let Some(asked) = self.volume_asked_through_spotify.take() {
                         info!(
                             target: "spotlight",
-                            "Another device or app set this player's volume to {}%",
-                            (self.connect_state.device_info().volume * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)
+                            "Another device or app set this player's volume to {}%. It asked {} time(s), the last with {}",
+                            (self.connect_state.device_info().volume * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX),
+                            asked.times,
+                            asked.came_with
                         );
                     }
 
@@ -2000,7 +2044,7 @@ impl SpircTask {
     /// Spotlight: a volume this app asked for. It is the latest word, so one Spotify passed
     /// on just before is no longer what the log should speak of.
     fn set_volume_chosen_here(&mut self, volume: u16) {
-        self.volume_asked_through_spotify = false;
+        self.volume_asked_through_spotify = None;
         self.set_volume(volume);
     }
 
@@ -2185,6 +2229,41 @@ mod tests {
 
     fn uris(tracks: &[ContextTrack]) -> Vec<String> {
         tracks.iter().flat_map(|track| track.uri.clone()).collect()
+    }
+
+    #[test]
+    fn a_volume_command_keeps_what_came_with_it_but_not_the_connection_id() {
+        use crate::core::dealer::protocol::PayloadValue;
+        use crate::protocol::connect::ConnectLoggingParams;
+        use protobuf::Message as _;
+
+        let sent = SetVolumeCommand {
+            volume: 16384,
+            connection_type: "wlan".to_string(),
+            logging_params: MessageField::some(ConnectLoggingParams {
+                interaction_ids: vec!["tap-1".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let message = Message {
+            headers: [
+                ("Content-Type".to_string(), "application/x-protobuf".to_string()),
+                ("Spotify-Connection-Id".to_string(), "private-id".to_string()),
+            ]
+            .into(),
+            payload: PayloadValue::Raw(sent.write_to_bytes().unwrap()),
+            uri: "hm://connect-state/v1/connect/volume".to_string(),
+        };
+
+        let (command, came_with) = volume_command(message).unwrap();
+        assert_eq!(command.volume, 16384);
+        assert!(came_with.contains(r#"connection type "wlan""#), "{came_with}");
+        assert!(came_with.contains(r#"interaction ids ["tap-1"]"#), "{came_with}");
+        assert!(came_with.contains("page ids []"), "{came_with}");
+        assert!(came_with.contains("Content-Type: application/x-protobuf"), "{came_with}");
+        assert!(came_with.contains("Spotify-Connection-Id: (hidden)"), "{came_with}");
+        assert!(!came_with.contains("private-id"), "{came_with}");
     }
 
     #[test]
