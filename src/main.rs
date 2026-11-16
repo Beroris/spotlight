@@ -610,7 +610,7 @@ fn main() -> Result<()> {
         ui.set_crossfade_seconds(guard.config.crossfade_seconds.min(MAX_CROSSFADE_SECONDS) as i32);
         set_crossfade(guard.config.crossfade_seconds);
         ui.set_remember_volume(guard.config.remember_volume);
-        ui.set_volume_from_other_devices(guard.config.volume_from_other_devices);
+        ui.set_volume_from(guard.config.volume_from.clone().into());
         ui.set_global_hotkeys(guard.config.global_hotkeys);
         ui.set_media_keys_enabled(guard.config.media_keys_enabled);
         ui.set_play_pause_hotkey(guard.config.play_pause_hotkey.clone().into());
@@ -1407,7 +1407,7 @@ fn bind_callbacks(
                         && (guard.config.audio_quality != ui.get_audio_quality().as_str()
                             || guard.config.normalize_volume != ui.get_normalize_volume()
                             // The player says whose its volume is to set as it connects.
-                            || guard.config.volume_from_other_devices != ui.get_volume_from_other_devices());
+                            || guard.config.volume_from != ui.get_volume_from().as_str());
                     let settings_before = SettingsInEffect::of(&guard.config);
                     guard.config.client_id = ui.get_client_id().to_string();
                     guard.config.redirect_uri = ui.get_redirect_uri().to_string();
@@ -1427,7 +1427,7 @@ fn bind_callbacks(
                     guard.config.crossfade_seconds = ui.get_crossfade_seconds().max(0) as u32;
                     set_crossfade(guard.config.crossfade_seconds);
                     guard.config.remember_volume = ui.get_remember_volume();
-                    guard.config.volume_from_other_devices = ui.get_volume_from_other_devices();
+                    guard.config.volume_from = ui.get_volume_from().to_string();
                     guard.config.resume_on_startup = ui.get_resume_on_startup();
                     guard.config.global_hotkeys = ui.get_global_hotkeys();
                     guard.config.media_keys_enabled = ui.get_media_keys_enabled();
@@ -8979,6 +8979,11 @@ async fn apply_volume_change(
     match target_device_id {
         Some(device_id) if has_token => {
             let token = current_token(&state).await?;
+            // The mark goes first: Spotlight on that device may take volumes from Spotlight
+            // alone, and knows this one by it. It is one percent off and replaced at once,
+            // so a device that takes any volume shows nothing of it.
+            let mark = librespot_connect::mark_for_volume(volume_percent as u32) as i32;
+            spotify_api.volume(&token, Some(device_id.as_str()), mark).await?;
             spotify_api.volume(&token, Some(device_id.as_str()), volume_percent).await
         }
         _ => Ok(()),
@@ -9307,8 +9312,8 @@ async fn start_local_playback(
     let startup_volume = state.lock().unwrap().local_volume_percent.clamp(0, 100);
     let (events, finished, engine_generation) = loop {
         // The settings a player is made with and keeps for as long as it runs.
-        let made_with = |config: &AppConfig| (config.audio_quality.clone(), config.normalize_volume, config.volume_from_other_devices);
-        let (audio_quality, normalize_volume, volume_from_other_devices) = made_with(&state.lock().unwrap().config);
+        let made_with = |config: &AppConfig| (config.audio_quality.clone(), config.normalize_volume, config.volume_from.clone());
+        let (audio_quality, normalize_volume, volume_from) = made_with(&state.lock().unwrap().config);
         let mut engine = match playback::PlaybackEngine::start(
             local_playback_token.access_token.clone(),
             local_client_id.clone(),
@@ -9316,7 +9321,7 @@ async fn start_local_playback(
             audio_quality.clone(),
             normalize_volume,
             startup_volume as u16,
-            volume_from_other_devices,
+            &volume_from,
         )
         .await {
             Ok(engine) => engine,
@@ -9346,7 +9351,7 @@ async fn start_local_playback(
             // set its volume, say, after that was turned off. Checked under the lock the
             // player is taken on under: Settings writes under it too, and either this sees
             // its change or it sees this player and starts it again.
-            if made_with(&guard.config) != (audio_quality, normalize_volume, volume_from_other_devices) {
+            if made_with(&guard.config) != (audio_quality, normalize_volume, volume_from) {
                 Err(engine)
             } else {
                 guard.playback_engine_generation = guard.playback_engine_generation.wrapping_add(1);

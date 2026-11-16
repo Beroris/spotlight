@@ -92,6 +92,9 @@ pub struct ConnectConfig {
     pub disable_volume: bool,
     /// Number of incremental steps (default: 64)
     pub volume_steps: u16,
+    /// Spotlight: takes a volume from another device or app only when it comes marked as
+    /// asked for by one of Spotlight's apps, see `mark_for_volume` (default: false)
+    pub only_marked_volume: bool,
 }
 
 impl Default for ConnectConfig {
@@ -103,6 +106,7 @@ impl Default for ConnectConfig {
             initial_volume: u16::MAX / 2,
             disable_volume: false,
             volume_steps: 64,
+            only_marked_volume: false,
         }
     }
 }

@@ -143,4 +143,25 @@ says so in the app's log ("Refused a volume of N% another device or app asked fo
 every five seconds, with how many were refused since; the ones after that line are said once
 no more have come for five seconds. Nothing is said back to Spotify, so an
 asker that sends again whenever the volume isn't the one it wants gets no reason to. The
-app's own volume (`Spirc::set_volume`) works as before. Spotlight sets this from its "Let other devices change the volume" setting.
+app's own volume (`Spirc::set_volume`) works as before.
+
+## Taking a volume only from Spotlight on another device
+
+Spotify passes a volume on with nothing that says which device or app asked for it. So that
+a player can take the volumes Spotlight asks for and no others, Spotlight marks them, and
+the mark is a volume too: an app asking for N% first asks for one percent more (one less for
+100%), `mark_for_volume`, and for N% straight after. A player that takes any volume is at
+the mark for a moment that can't be heard.
+
+A player made with the new `ConnectConfig::only_marked_volume` takes a volume only when the
+ask just before it, within three seconds, was its mark (`VolumeMarks` in `src/spirc.rs`).
+The mark itself is not taken. An ask that was neither marked nor followed by the volume it
+would mark is refused and said in the log like any other. A marked volume is no mark for the
+next, so a slider drawn slowly down in another app doesn't mark each step with the last;
+every other step of such a drag can still pass. The log says "A Spotlight app set this
+player's volume" for a marked one.
+
+Spotlight's "Volume from other devices" setting chooses between any app (as librespot was),
+Spotlight (`only_marked_volume`) and no one (`disable_volume`).
+
+Run its tests with `cargo test -p librespot-connect spirc::tests`.

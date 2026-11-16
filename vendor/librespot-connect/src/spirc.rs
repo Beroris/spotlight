@@ -121,6 +121,10 @@ struct SpircTask {
     /// Spotlight: how many volumes were refused since the log last said so, when it did,
     /// and the last of them in percent.
     volumes_refused: (u32, Option<Instant>, u32),
+    /// Spotlight: a volume from elsewhere is only taken when one of Spotlight's apps asked
+    /// for it ([`ConnectConfig::only_marked_volume`]).
+    only_marked_volume: bool,
+    volume_marks: VolumeMarks,
 
     /// when set to true, it will update the volume after [UPDATE_STATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -217,6 +221,78 @@ struct AskedThroughSpotify {
     times: u32,
     /// What came with the last of them, from [`volume_command`].
     came_with: String,
+    /// The last of them came marked as asked for by one of Spotlight's apps.
+    marked: bool,
+}
+
+/// Spotlight: a volume as Spotify sends it, in percent.
+fn percent_of(volume: u16) -> u32 {
+    (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)
+}
+
+/// Spotlight: how one of Spotlight's apps marks a volume it asks another device for, so a
+/// player that takes volumes from Spotlight's apps alone ([`ConnectConfig::only_marked_volume`])
+/// can tell it from one any other app asked for. Spotify passes on the volume and nothing
+/// that says who asked, so the mark is a volume too: the app asks for this one first and
+/// for `percent` straight after. It is one percent off, so a player that takes any volume
+/// is at it for a moment that can't be heard.
+pub fn mark_for_volume(percent: u32) -> u32 {
+    if percent >= 100 { 99 } else { percent + 1 }
+}
+
+/// How long after its mark a volume still counts as marked. The two come a request to
+/// Spotify apart, which is well under a second.
+const VOLUME_MARK_WINDOW: Duration = Duration::from_secs(3);
+
+/// Spotlight: a volume another device or app asked for.
+#[derive(Debug, PartialEq)]
+struct VolumeAsk {
+    percent: u32,
+    came_with: String,
+    at: Instant,
+}
+
+/// Spotlight: tells the volumes Spotlight's apps ask for from all others, by their mark
+/// ([`mark_for_volume`]).
+#[derive(Default)]
+struct VolumeMarks {
+    /// The last ask, not taken: it wasn't marked, and may be the mark of the next.
+    unproven: Option<VolumeAsk>,
+}
+
+impl VolumeMarks {
+    /// Whether a volume asked for at `now` is marked, and the ask before it if that has now
+    /// proved to be no mark, so a volume from elsewhere that was refused.
+    fn ask(&mut self, percent: u32, came_with: String, now: Instant) -> (bool, Option<VolumeAsk>) {
+        let before = self.unproven.take();
+        let marked = before.as_ref().is_some_and(|mark| {
+            mark.percent == mark_for_volume(percent) && now.duration_since(mark.at) <= VOLUME_MARK_WINDOW
+        });
+        if marked {
+            // The mark is used up, and a marked volume is no mark for the next: a slider
+            // drawn slowly down in another app would otherwise mark each step with the last.
+            return (true, None);
+        }
+        self.unproven = Some(VolumeAsk { percent, came_with, at: now });
+        (false, before)
+    }
+
+    /// Whether an ask is still waiting to prove a mark.
+    fn waits(&self) -> bool {
+        self.unproven.is_some()
+    }
+
+    /// How long the ask that waits still has.
+    fn time_left(&self, now: Instant) -> Duration {
+        self.unproven
+            .as_ref()
+            .map_or(Duration::ZERO, |ask| VOLUME_MARK_WINDOW.saturating_sub(now.duration_since(ask.at)))
+    }
+
+    /// The ask that waited, once its time is up: it was no mark.
+    fn give_up(&mut self, now: Instant) -> Option<VolumeAsk> {
+        self.unproven.take_if(|ask| now.duration_since(ask.at) >= VOLUME_MARK_WINDOW)
+    }
 }
 
 /// Spotlight: a volume command Spotify passed on, and a line on what came with it. Spotify
@@ -295,6 +371,7 @@ impl Spirc {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{spirc_id}]");
 
+        let only_marked_volume = config.only_marked_volume;
         let connect_state = ConnectState::new(config, &session);
 
         let connection_id_update = session
@@ -380,6 +457,8 @@ impl Spirc {
             update_volume: false,
             volume_asked_through_spotify: None,
             volumes_refused: (0, None, 0),
+            only_marked_volume,
+            volume_marks: VolumeMarks::default(),
             update_state: false,
 
             spirc_id,
@@ -618,36 +697,24 @@ impl SpircTask {
                     match |volume_update| match volume_update.0.volume.try_into() {
                         Ok(volume) => {
                             let came_with = volume_update.1;
+                            let percent = percent_of(volume);
                             if self.connect_state.device_info().capabilities.disable_volume {
                                 // Spotlight: this player said its volume isn't others' to set
                                 // (`ConnectConfig::disable_volume`). Spotify's own apps then
                                 // don't ask, but nothing stops a command that comes anyway.
-                                // Nothing is said back to Spotify: an asker that sends again
-                                // whenever the volume isn't the one it wants would never stop.
-                                // The log says it at most every few seconds for the same reason.
-                                let percent = (u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX);
-                                self.volumes_refused.0 += 1;
-                                self.volumes_refused.2 = percent;
-                                if self.volumes_refused.1.is_none_or(|said| said.elapsed() >= REFUSED_VOLUME_LOG_GAP) {
-                                    info!(
-                                        target: "spotlight",
-                                        "Refused a volume of {percent}% another device or app asked for ({} refused since this was last said). It came with {came_with}",
-                                        self.volumes_refused.0
-                                    );
-                                    self.volumes_refused = (0, Some(Instant::now()), 0);
+                                self.refuse_volume(percent, &came_with);
+                            } else if self.only_marked_volume {
+                                // Spotlight: only a volume one of Spotlight's apps asked for is
+                                // taken. An ask that isn't marked may be the mark of the next.
+                                let (marked, not_a_mark) = self.volume_marks.ask(percent, came_with.clone(), Instant::now());
+                                if let Some(refused) = not_a_mark {
+                                    self.refuse_volume(refused.percent, &refused.came_with);
+                                }
+                                if marked {
+                                    self.take_volume_from_elsewhere(volume, came_with, true);
                                 }
                             } else {
-                                // Spotlight: a volume no one chose here is otherwise a riddle.
-                                let before = self.connect_state.device_info().volume;
-                                self.set_volume(volume);
-                                // Every command counts once one of them changed the volume,
-                                // also one that asks for the volume it already has.
-                                let changed = self.connect_state.device_info().volume != before;
-                                if changed || self.volume_asked_through_spotify.is_some() {
-                                    let asked = self.volume_asked_through_spotify.get_or_insert_default();
-                                    asked.times += 1;
-                                    asked.came_with = came_with;
-                                }
+                                self.take_volume_from_elsewhere(volume, came_with, false);
                             }
                         }
                         Err(why) => error!("can't update volume, failed to parse i32 to u16: {why}")
@@ -700,6 +767,13 @@ impl SpircTask {
                         error!("state update: {why}")
                     }
                 },
+                // Spotlight: an ask that could have been the mark of the next one, and no next
+                // one came in time. It was a volume from elsewhere, and is said as refused.
+                _ = async { sleep(self.volume_marks.time_left(Instant::now())).await }, if self.volume_marks.waits() => {
+                    if let Some(refused) = self.volume_marks.give_up(Instant::now()) {
+                        self.refuse_volume(refused.percent, &refused.came_with);
+                    }
+                },
                 // Spotlight: the volumes refused after the last line about one, said once no
                 // more have come for a while, so their count isn't left unsaid.
                 _ = async { sleep(REFUSED_VOLUME_LOG_GAP).await }, if self.volumes_refused.0 > 0 => {
@@ -716,7 +790,8 @@ impl SpircTask {
                     if let Some(asked) = self.volume_asked_through_spotify.take() {
                         info!(
                             target: "spotlight",
-                            "Another device or app set this player's volume to {}%. It asked {} time(s), the last with {}",
+                            "{} set this player's volume to {}%. It asked {} time(s), the last with {}",
+                            if asked.marked { "A Spotlight app" } else { "Another device or app" },
                             (self.connect_state.device_info().volume * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX),
                             asked.times,
                             asked.came_with
@@ -2081,6 +2156,39 @@ impl SpircTask {
         self.set_volume_chosen_here(volume);
     }
 
+    /// Spotlight: takes a volume Spotify passed on, from another device or app, and notes it
+    /// for the log: a volume no one chose here is otherwise a riddle. `marked` is whether it
+    /// came marked as asked for by one of Spotlight's apps.
+    fn take_volume_from_elsewhere(&mut self, volume: u16, came_with: String, marked: bool) {
+        let before = self.connect_state.device_info().volume;
+        self.set_volume(volume);
+        // Every command counts once one of them changed the volume, also one that asks for
+        // the volume it already has.
+        let changed = self.connect_state.device_info().volume != before;
+        if changed || self.volume_asked_through_spotify.is_some() {
+            let asked = self.volume_asked_through_spotify.get_or_insert_default();
+            asked.times += 1;
+            asked.came_with = came_with;
+            asked.marked = marked;
+        }
+    }
+
+    /// Spotlight: notes a volume from elsewhere that wasn't taken. Nothing is said back to
+    /// Spotify: an asker that sends again whenever the volume isn't the one it wants would
+    /// never stop. The log says it at most every few seconds for the same reason.
+    fn refuse_volume(&mut self, percent: u32, came_with: &str) {
+        self.volumes_refused.0 += 1;
+        self.volumes_refused.2 = percent;
+        if self.volumes_refused.1.is_none_or(|said| said.elapsed() >= REFUSED_VOLUME_LOG_GAP) {
+            info!(
+                target: "spotlight",
+                "Refused a volume of {percent}% another device or app asked for ({} refused since this was last said). It came with {came_with}",
+                self.volumes_refused.0
+            );
+            self.volumes_refused = (0, Some(Instant::now()), 0);
+        }
+    }
+
     /// Spotlight: a volume this app asked for. It is the latest word, so one Spotify passed
     /// on just before is no longer what the log should speak of.
     fn set_volume_chosen_here(&mut self, volume: u16) {
@@ -2269,6 +2377,74 @@ mod tests {
 
     fn uris(tracks: &[ContextTrack]) -> Vec<String> {
         tracks.iter().flat_map(|track| track.uri.clone()).collect()
+    }
+
+    /// What `VolumeMarks` makes of volumes asked for at these seconds: which were taken, and
+    /// which proved to be from elsewhere and were refused.
+    fn marks(asks: &[(u64, u32)]) -> (Vec<u32>, Vec<u32>) {
+        let start = Instant::now();
+        let mut marks = VolumeMarks::default();
+        let (mut taken, mut refused) = (Vec::new(), Vec::new());
+        for &(second, percent) in asks {
+            let (marked, not_a_mark) = marks.ask(percent, String::new(), start + Duration::from_secs(second));
+            refused.extend(not_a_mark.map(|ask| ask.percent));
+            if marked {
+                taken.push(percent);
+            }
+        }
+        let end = start + Duration::from_secs(asks.last().map_or(0, |ask| ask.0)) + VOLUME_MARK_WINDOW;
+        refused.extend(marks.give_up(end).map(|ask| ask.percent));
+        assert!(!marks.waits());
+        (taken, refused)
+    }
+
+    #[test]
+    fn a_volume_is_taken_when_its_mark_came_just_before_it() {
+        for percent in 0..=100 {
+            let (taken, refused) = marks(&[(0, mark_for_volume(percent)), (0, percent)]);
+            assert_eq!((taken, refused), (vec![percent], vec![]), "{percent}%");
+            assert_eq!(mark_for_volume(percent).abs_diff(percent), 1, "a mark is one percent off");
+        }
+    }
+
+    #[test]
+    fn a_volume_without_its_mark_is_refused() {
+        // What the log showed: jumps between an iPhone's volume steps, one command each.
+        let (taken, refused) = marks(&[(0, 25), (1, 100), (2, 25), (40, 6), (41, 25)]);
+        assert_eq!((taken, refused), (vec![], vec![25, 100, 25, 6, 25]));
+        // The same volume twice, and a mark that came too long before.
+        assert_eq!(marks(&[(0, 50), (1, 50)]), (vec![], vec![50, 50]));
+        let late = VOLUME_MARK_WINDOW.as_secs() + 1;
+        assert_eq!(marks(&[(0, 51), (late, 50)]), (vec![], vec![51, 50]));
+        // One percent the other way is no mark.
+        assert_eq!(marks(&[(0, 49), (0, 50)]), (vec![], vec![49, 50]));
+    }
+
+    #[test]
+    fn a_marked_volume_is_no_mark_for_the_next() {
+        // A slider drawn slowly down in another app: 52, 51, 50, 49. The first pair looks
+        // marked; the steps after it don't ride on it.
+        let (taken, refused) = marks(&[(0, 52), (0, 51), (0, 50), (0, 49)]);
+        assert_eq!((taken, refused), (vec![51, 49], vec![]));
+        let (taken, refused) = marks(&[(0, 52), (0, 51), (0, 50)]);
+        assert_eq!((taken, refused), (vec![51], vec![50]));
+        // Two drags from one of Spotlight's apps, each with its own mark.
+        let (taken, refused) = marks(&[(0, 31), (0, 30), (1, 41), (1, 40)]);
+        assert_eq!((taken, refused), (vec![30, 40], vec![]));
+    }
+
+    #[test]
+    fn an_ask_waits_for_its_time_to_prove_a_mark() {
+        let start = Instant::now();
+        let mut marks = VolumeMarks::default();
+        assert_eq!(marks.ask(25, "how".into(), start), (false, None));
+        assert!(marks.waits());
+        assert_eq!(marks.time_left(start + Duration::from_secs(1)), VOLUME_MARK_WINDOW - Duration::from_secs(1));
+        assert_eq!(marks.give_up(start + Duration::from_secs(1)), None, "not yet");
+        assert_eq!(marks.time_left(start + VOLUME_MARK_WINDOW * 2), Duration::ZERO);
+        let refused = marks.give_up(start + VOLUME_MARK_WINDOW).unwrap();
+        assert_eq!((refused.percent, refused.came_with.as_str()), (25, "how"));
+        assert!(!marks.waits());
     }
 
     #[test]
