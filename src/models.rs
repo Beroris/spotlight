@@ -46,6 +46,10 @@ pub struct AppConfig {
     pub crossfade_seconds: u32,
     #[serde(default = "default_true")]
     pub remember_volume: bool,
+    /// Who else on the account may set this player's volume: "Any" device or app, only
+    /// "Spotlight" on another device, or "None". Anything else is read as "Any".
+    #[serde(default = "default_volume_from")]
+    pub volume_from: String,
     /// Resume the last session on this PC when Spotlight opens. Off by default
     /// so launching the app never takes over playback from another device.
     #[serde(default)]
@@ -191,6 +195,10 @@ fn default_theme_mode() -> String {
 
 fn default_accent_color() -> String {
     "Green".to_string()
+}
+
+fn default_volume_from() -> String {
+    "Any".to_string()
 }
 
 fn default_audio_quality() -> String {

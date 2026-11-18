@@ -6,6 +6,8 @@ pub(super) mod provider;
 mod restrictions;
 mod tracks;
 mod transfer;
+// Spotlight: reads the list another device hands over. See SPOTLIGHT-CHANGES.md.
+pub(super) mod handed_over;
 
 use crate::{
     core::{
@@ -90,6 +92,9 @@ pub struct ConnectConfig {
     pub disable_volume: bool,
     /// Number of incremental steps (default: 64)
     pub volume_steps: u16,
+    /// Spotlight: takes a volume from another device or app only when it comes marked as
+    /// asked for by one of Spotlight's apps, see `mark_for_volume` (default: false)
+    pub only_marked_volume: bool,
 }
 
 impl Default for ConnectConfig {
@@ -101,6 +106,7 @@ impl Default for ConnectConfig {
             initial_volume: u16::MAX / 2,
             disable_volume: false,
             volume_steps: 64,
+            only_marked_volume: false,
         }
     }
 }
@@ -273,6 +279,21 @@ impl ConnectState {
     pub fn is_pause(&self) -> bool {
         let player = self.player();
         player.is_playing && player.is_paused && player.is_buffering
+    }
+
+    /// Spotlight: says whether this device's volume is for others to set
+    /// ([`ConnectConfig::disable_volume`]), and returns whether that changed.
+    pub fn set_disable_volume(&mut self, disable_volume: bool) -> bool {
+        let capabilities = self
+            .device_mut()
+            .device_info
+            .as_mut()
+            .expect("the device_info has to be always given")
+            .capabilities
+            .mut_or_insert_default();
+        let changed = capabilities.disable_volume != disable_volume;
+        capabilities.disable_volume = disable_volume;
+        changed
     }
 
     pub fn set_volume(&mut self, volume: u32) {

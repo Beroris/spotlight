@@ -206,6 +206,20 @@ impl ContextResolver {
         self.find_next().is_some()
     }
 
+    /// Spotlight: whether the next one to be had is a list itself, not more pages of one or
+    /// the similar songs that follow it.
+    pub fn next_is_the_list_itself(&self) -> bool {
+        self.find_next().is_some_and(|(next, _, _)| {
+            next.update == ContextType::Default && next.action == ContextAction::Replace
+        })
+    }
+
+    /// Spotlight: whether `resolve` failed before and so isn't asked for again: `add` leaves
+    /// it out without a word.
+    pub fn gave_up_on(&self, resolve: &ResolveContext) -> bool {
+        self.unavailable_contexts.contains_key(resolve)
+    }
+
     pub async fn get_next_context(
         &self,
         recent_track_uri: impl Fn() -> Vec<String>,
@@ -342,5 +356,71 @@ impl ContextResolver {
         state.update_queue_revision();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SessionConfig;
+
+    /// Spotlight: what `SpircTask::handle_transfer` goes by when it uses the songs a handover
+    /// brought instead of waiting on a playlist.
+    #[test]
+    fn a_list_that_failed_is_known_not_to_be_asked_for_again() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _in_runtime = runtime.enter();
+        let mut resolver = ContextResolver::new(Session::new(SessionConfig::default(), None));
+        let playlist = ResolveContext::from_uri(
+            "spotify:playlist:37i9dQZF1E38hYajo1J1J7",
+            "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+            ContextType::Default,
+            ContextAction::Replace,
+        );
+        assert!(!resolver.gave_up_on(&playlist));
+        resolver.add(playlist.clone());
+        assert!(resolver.next_is_the_list_itself());
+
+        // Spotify couldn't give it.
+        resolver.mark_next_unavailable();
+        resolver.remove_used_and_invalid();
+        assert!(resolver.gave_up_on(&playlist));
+        resolver.add(playlist.clone());
+        assert!(!resolver.has_next(), "nothing would ever come back for a handover waiting on it");
+
+        let more_of_it = ResolveContext::append_context("spotify:playlist:37i9dQZF1E38hYajo1J1J7");
+        resolver.add(more_of_it);
+        assert!(resolver.has_next() && !resolver.next_is_the_list_itself(), "more pages of a list aren't the list");
+    }
+
+    /// Spotlight: what `SpircTask::handle_next_context` goes by when the last page of a
+    /// handover's playlist fails: nothing is left that would finish the handover.
+    #[test]
+    fn a_last_page_that_fails_leaves_nothing_to_wait_for() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _in_runtime = runtime.enter();
+        let mut resolver = ContextResolver::new(Session::new(SessionConfig::default(), None));
+        resolver.add(ResolveContext::from_uri(
+            "spotify:playlist:37i9dQZF1E38hYajo1J1J7",
+            "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        // Its first page came, and said there are two more.
+        resolver.add_list(vec![
+            ResolveContext::append_context("hm://playlist/37i9dQZF1E38hYajo1J1J7?page=1"),
+            ResolveContext::append_context("hm://playlist/37i9dQZF1E38hYajo1J1J7?page=2"),
+        ]);
+        resolver.remove_used_and_invalid();
+        assert!(resolver.has_next() && !resolver.next_is_the_list_itself());
+
+        // The first of them fails. The other is still to come, and finishes the handover.
+        resolver.mark_next_unavailable();
+        resolver.remove_used_and_invalid();
+        assert!(resolver.has_next());
+        // That one fails too.
+        resolver.mark_next_unavailable();
+        resolver.remove_used_and_invalid();
+        assert!(!resolver.has_next());
     }
 }

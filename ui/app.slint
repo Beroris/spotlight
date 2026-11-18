@@ -2624,6 +2624,8 @@ export component AppWindow inherits Window {
     // Seconds a song fades into the next as it ends. Zero is off.
     in-out property <int> crossfade_seconds: 0;
     in-out property <bool> remember_volume: true;
+    // Who else may set this computer's volume: "Any", "Spotlight" or "None".
+    in-out property <string> volume_from: "Any";
     in-out property <bool> resume_on_startup: false;
     in-out property <bool> global_hotkeys: true;
     in-out property <bool> media_keys_enabled: true;
@@ -6137,6 +6139,17 @@ export component AppWindow inherits Window {
                                                 }
                                             }
                                             SettingToggle { label: "Remember volume"; description: "Start at the volume you last used."; checked <=> root.remember_volume; toggled => { root.save_settings(); } }
+                                            SettingSegments {
+                                                label: "Volume from other devices";
+                                                description: "Spotlight: takes only what your other Spotlight apps ask for, as far as it can tell.";
+                                                options: ["Any app", "Spotlight", "No one"];
+                                                segment-width: 80px;
+                                                selected: root.volume_from == "Spotlight" ? 1 : (root.volume_from == "None" ? 2 : 0);
+                                                chosen(index) => {
+                                                    root.volume_from = ["Any", "Spotlight", "None"][index];
+                                                    root.save_settings();
+                                                }
+                                            }
                                             SettingToggle { label: "Resume when Spotlight opens"; description: "Picks up where you left off, even if another device is playing."; checked <=> root.resume_on_startup; toggled => { root.save_settings(); } }
                                         }
 

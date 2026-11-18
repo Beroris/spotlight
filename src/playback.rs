@@ -57,6 +57,7 @@ impl PlaybackEngine {
         audio_quality: String,
         normalize_volume: bool,
         initial_volume_percent: u16,
+        volume_from: &str,
     ) -> Result<Self> {
         let credentials = Credentials::with_access_token(access_token);
         let mut session_config = SessionConfig::default();
@@ -93,10 +94,13 @@ impl PlaybackEngine {
         );
         let player_events = player.get_player_event_channel();
 
+        let (disable_volume, only_marked_volume) = volume_rules(volume_from);
         let connect_config = ConnectConfig {
             name: device_name.clone(),
             device_type: DeviceType::Computer,
             initial_volume: percent_to_spotify_volume(initial_volume_percent),
+            disable_volume,
+            only_marked_volume,
             ..Default::default()
         };
 
@@ -144,14 +148,15 @@ impl PlaybackEngine {
         self.finished.take()
     }
 
-    pub fn play_pause(&self) -> Result<()> {
-        self._spirc.play_pause()?;
-        Ok(())
-    }
-
     /// Resumes if paused. Does nothing if already playing.
     pub fn play(&self) -> Result<()> {
         self._spirc.play()?;
+        Ok(())
+    }
+
+    /// Pauses if playing. Does nothing if already paused.
+    pub fn pause(&self) -> Result<()> {
+        self._spirc.pause()?;
         Ok(())
     }
 
@@ -170,6 +175,13 @@ impl PlaybackEngine {
 
     pub fn set_volume(&self, volume_percent: u16) -> Result<()> {
         self._spirc.set_volume(percent_to_spotify_volume(volume_percent))?;
+        Ok(())
+    }
+
+    /// Changes who else may set this player's volume while it runs, music and all.
+    pub fn set_volume_from(&self, volume_from: &str) -> Result<()> {
+        let (disable_volume, only_marked_volume) = volume_rules(volume_from);
+        self._spirc.set_volume_from(disable_volume, only_marked_volume)?;
         Ok(())
     }
 
@@ -213,6 +225,17 @@ impl PlaybackEngine {
         }
         Ok(())
     }
+}
+
+/// What the "Volume from other devices" setting means to the player: whether its volume is
+/// closed to others, and whether it takes only volumes that come with Spotlight's mark.
+/// - "None" tells Spotify this device's volume isn't for others to set, so its apps show no
+///   slider for it, and the player refuses one that comes anyway.
+/// - "Spotlight" leaves the volume open to Spotify, as Spotlight on another device asks
+///   through it too, and the player takes only what comes with the mark.
+/// - Anything else is "Any": every volume is taken.
+fn volume_rules(volume_from: &str) -> (bool, bool) {
+    (volume_from == "None", volume_from == "Spotlight")
 }
 
 pub fn spotify_volume_to_percent(volume: u16) -> i32 {

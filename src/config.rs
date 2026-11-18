@@ -104,6 +104,7 @@ pub fn new_config() -> AppConfig {
         normalize_volume: true,
         autoplay_similar: true,
         remember_volume: true,
+        volume_from: "Any".into(),
         last_volume_percent: 100,
         global_hotkeys: true,
         media_keys_enabled: true,
