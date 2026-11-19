@@ -170,13 +170,11 @@ component BarSurface inherits Rectangle {
     Rectangle {
         border-radius: root.border-radius;
         clip: true;
-        border-width: 1px;
-        // Glass catches the light along its rim, strongest at two opposite corners.
-        border-color: !root.glass ? root.ink.with-alpha(0.08) : AppTheme.is-light
-            ? @linear-gradient(115deg, #ffffffff 0%, #ffffff66 30%, #00000014 70%, #0000002e 100%)
-            : @linear-gradient(115deg, #ffffff70 0%, #ffffff1c 30%, #ffffff12 70%, #ffffff48 100%);
+        // Glass has no outline: its edge is where the blur stops.
+        border-width: root.glass ? 0px : 1px;
+        border-color: root.ink.with-alpha(0.08);
         background: root.glass
-            ? (AppTheme.flat ? root.pane : AppTheme.ambient.mix(root.pane, 0.25)).with-alpha(root.blurred ? (AppTheme.is-light ? 0.42 : 0.34) : (root.island ? 0.93 : (AppTheme.is-light ? 0.74 : 0.72)))
+            ? (AppTheme.flat ? root.pane : AppTheme.ambient.mix(root.pane, 0.25)).with-alpha(root.blurred ? (AppTheme.is-light ? 0.3 : 0.22) : (root.island ? 0.93 : (AppTheme.is-light ? 0.74 : 0.72)))
             : (root.plain ? AppTheme.card-bg.with-alpha(0.97) : AppTheme.ambient.mix(AppTheme.window-bg, AppTheme.is-light ? 0.8 : 0.6));
         animate background { duration: AppTheme.motion-slow; easing: ease-in-out; }
 
