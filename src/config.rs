@@ -122,7 +122,7 @@ pub fn new_config() -> AppConfig {
         disable_background_effects: true,
         album_colors: true,
         bar_shape: "Bar".into(),
-        bar_look: "Frosted".into(),
+        bar_look: "Glass".into(),
         log_level: "Info".into(),
         check_for_updates: true,
         library_snapshot: Default::default(),
@@ -146,8 +146,9 @@ fn tidy_config(cfg: &mut AppConfig) {
     if !matches!(cfg.bar_shape.as_str(), "Bar" | "Islands") {
         cfg.bar_shape = "Bar".into();
     }
-    if !matches!(cfg.bar_look.as_str(), "Tinted" | "Frosted" | "Smoked") {
-        cfg.bar_look = "Frosted".into();
+    // "Tinted" was an earlier look that the glass one replaced.
+    if !matches!(cfg.bar_look.as_str(), "Glass" | "Frosted" | "Smoked") {
+        cfg.bar_look = "Glass".into();
     }
     if !matches!(cfg.accent_color.as_str(), "Green" | "Blue" | "Purple" | "White") {
         cfg.accent_color = "Green".into();

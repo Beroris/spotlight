@@ -91,7 +91,7 @@ pub struct AppConfig {
     /// The player bar's shape: "Bar" for one rounded bar, "Islands" for three.
     #[serde(default = "default_bar_shape")]
     pub bar_shape: String,
-    /// What the player bar is made of: "Tinted", "Frosted" or "Smoked".
+    /// What the player bar is made of: "Glass", "Frosted" or "Smoked".
     #[serde(default = "default_bar_look")]
     pub bar_look: String,
     #[serde(default = "default_log_level")]
@@ -200,7 +200,7 @@ fn default_bar_shape() -> String {
 }
 
 fn default_bar_look() -> String {
-    "Frosted".to_string()
+    "Glass".to_string()
 }
 
 fn default_theme_mode() -> String {
