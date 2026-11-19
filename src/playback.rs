@@ -201,6 +201,40 @@ impl PlaybackEngine {
         Ok(())
     }
 
+    /// The id Spotify knows this player by, also in its list of devices.
+    pub fn device_id(&self) -> String {
+        self.session.device_id().to_string()
+    }
+
+    /// Plays these songs here, from `position_ms` into the first, or loads them paused there.
+    /// This PC becomes the device playing. Nothing goes through Spotify's servers first, so
+    /// the song begins loading at once, and it works before Spotify lists this PC.
+    pub fn start_songs(&self, uris: Vec<String>, position_ms: u32, playing: bool) -> Result<()> {
+        use librespot_connect::{LoadRequest, LoadRequestOptions, PlayingTrack};
+        let options = LoadRequestOptions {
+            start_playing: playing,
+            seek_to: position_ms,
+            context_options: None,
+            playing_track: Some(PlayingTrack::Index(0)),
+        };
+        self._spirc.load(LoadRequest::from_tracks(uris, options))?;
+        Ok(())
+    }
+
+    /// Plays a playlist or album Spotify has here: from its start, or shuffled, from a song
+    /// the player picks.
+    pub fn start_list(&self, uri: String, shuffled: bool) -> Result<()> {
+        use librespot_connect::{LoadContextOptions, LoadRequest, LoadRequestOptions, Options};
+        let options = LoadRequestOptions {
+            start_playing: true,
+            seek_to: 0,
+            context_options: shuffled.then(|| LoadContextOptions::Options(Options { shuffle: true, repeat: false, repeat_track: false })),
+            playing_track: None,
+        };
+        self._spirc.load(LoadRequest::from_context_uri(uri, options))?;
+        Ok(())
+    }
+
     /// Plays a list here, from a point in its first song, as it was left: the songs after it
     /// in the order given, also in shuffle, and repeat as it was. This PC becomes the device
     /// playing, so it's only for when nothing else is.

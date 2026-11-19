@@ -96,6 +96,36 @@ fn paged(url: &str, limit: usize, offset: usize) -> String {
     format!("{url}{joiner}limit={limit}&offset={offset}")
 }
 
+/// Where the pages after the first start, for a part of about `count` entries from `from` on
+/// in a list `total` long, when the first page held `first_read` entries and there is more.
+fn later_pages(from: usize, first_read: usize, count: usize, total: usize, more: bool) -> Vec<usize> {
+    if !more || first_read == 0 {
+        return Vec::new();
+    }
+    // A list Spotify gave no length for is read as far as was asked.
+    let end = if total == 0 { from + count } else { (from + count).min(total) };
+    (from + first_read..end).step_by(first_read).collect()
+}
+
+/// Runs `tasks` together and gives their results in the order the tasks came in.
+async fn join_in_order<F: std::future::Future>(tasks: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut tasks: Vec<_> = tasks.into_iter().map(|task| (Box::pin(task), None)).collect();
+    std::future::poll_fn(|context| {
+        let mut waiting = false;
+        for (task, result) in tasks.iter_mut() {
+            if result.is_none() {
+                match task.as_mut().poll(context) {
+                    std::task::Poll::Ready(value) => *result = Some(value),
+                    std::task::Poll::Pending => waiting = true,
+                }
+            }
+        }
+        if waiting { std::task::Poll::Pending } else { std::task::Poll::Ready(()) }
+    })
+    .await;
+    tasks.into_iter().filter_map(|(_, result)| result).collect()
+}
+
 #[derive(Clone)]
 pub struct SpotifyApi {
     http: Client,
@@ -141,46 +171,54 @@ impl SpotifyApi {
         Ok(response.json::<DevicesResponse>().await?.devices)
     }
 
-    /// About `count` entries of a list from `from` on, a page at a time. `first` is the first
-    /// page's address.
-    async fn part<P: Page + serde::de::DeserializeOwned>(&self, token: &TokenStore, first: String, from: usize, count: usize) -> Result<Part<P::Item>> {
-        let mut url = first;
-        let mut items = Vec::new();
-        let mut read = 0;
-        loop {
-            let page: P = self.request(token, Method::GET, &url, None).await?.json().await?;
-            let (page_items, page_read, next, total) = page.open();
+    /// About `count` entries of the list at `list` from `from` on, in pages of `page_size`.
+    ///
+    /// The first page says how long the list is, and the pages after it are then asked for
+    /// together. One after another, with a pause between, 500 songs took around two seconds
+    /// to come and 500 liked songs nearer four.
+    async fn part<P: Page + serde::de::DeserializeOwned>(&self, token: &TokenStore, list: &str, page_size: usize, from: usize, count: usize) -> Result<Part<P::Item>> {
+        let page: P = self.request(token, Method::GET, &paged(list, page_size, from), None).await?.json().await?;
+        let (mut items, first_read, mut next, total) = page.open();
+        let mut read = first_read;
+        let mut last_read = first_read;
+        // Spotify may give fewer to a page than asked for. The next page starts where this
+        // one ended either way.
+        let starts = later_pages(from, first_read, count, total, next.is_some());
+        let pages = starts.iter().map(|start| async move {
+            let page: P = self.request(token, Method::GET, &paged(list, first_read, *start), None).await?.json().await?;
+            Ok::<_, anyhow::Error>(page.open())
+        });
+        for page in join_in_order(pages).await {
+            let (page_items, page_read, page_next, _) = page?;
             items.extend(page_items);
             read += page_read;
-            match next {
-                Some(next) if read < count && page_read > 0 => {
-                    url = next;
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-                next => {
-                    let more_from = next.filter(|_| page_read > 0).map(|_| from + read);
-                    return Ok(Part { items, total: total.max(from + read), more_from });
-                }
+            last_read = page_read;
+            next = page_next;
+            // A page that came short ends the part there, so no songs are skipped over.
+            if page_read < first_read {
+                break;
             }
         }
+        let more_from = next.filter(|_| last_read > 0).map(|_| from + read);
+        Ok(Part { items, total: total.max(from + read), more_from })
     }
 
     /// The playlists in the library, `count` of them from `from` on.
     pub async fn playlists(&self, token: &TokenStore, from: usize, count: usize) -> Result<Part<PlaylistItem>> {
-        self.part::<PlaylistPage>(token, paged("https://api.spotify.com/v1/me/playlists", 50, from), from, count).await
+        self.part::<PlaylistPage>(token, "https://api.spotify.com/v1/me/playlists", 50, from, count).await
     }
 
     pub async fn liked_songs(&self, token: &TokenStore, from: usize, count: usize) -> Result<Part<FullTrack>> {
-        self.part::<SavedTracksPage>(token, paged("https://api.spotify.com/v1/me/tracks", 50, from), from, count).await
+        self.part::<SavedTracksPage>(token, "https://api.spotify.com/v1/me/tracks", 50, from, count).await
     }
 
     pub async fn playlist_tracks(&self, token: &TokenStore, playlist_id: &str, from: usize, count: usize) -> Result<Part<FullTrack>> {
         let url = format!("https://api.spotify.com/v1/playlists/{}/items", urlencoding::encode(playlist_id));
-        self.part::<PlaylistTracksPage>(token, paged(&url, 100, from), from, count).await
+        self.part::<PlaylistTracksPage>(token, &url, 100, from, count).await
     }
 
     pub async fn playlist_tracks_by_href(&self, token: &TokenStore, href: &str, from: usize, count: usize) -> Result<Part<FullTrack>> {
-        self.part::<PlaylistTracksPage>(token, paged(href, 100, from), from, count).await
+        self.part::<PlaylistTracksPage>(token, href, 100, from, count).await
     }
 
     pub async fn playlist_image_url(&self, token: &TokenStore, playlist_id: &str) -> Result<Option<String>> {
@@ -455,28 +493,30 @@ impl SpotifyApi {
     /// one and caps search pages at 10, so this walks a few pages of search.
     pub async fn artist_tracks(&self, token: &TokenStore, artist: &str) -> Result<Vec<FullTrack>> {
         let query = format!("artist:\"{artist}\"");
-        let mut all: Vec<FullTrack> = Vec::new();
-        for page in 0..10 {
-            let response = self
-                .request(
-                    token,
-                    Method::GET,
-                    &format!(
-                        "https://api.spotify.com/v1/search?q={}&type=track&limit=10&offset={}",
-                        urlencoding::encode(&query),
-                        page * 10
-                    ),
-                    None,
-                )
-                .await?;
-            let items = response.json::<SearchTracksResponse>().await?.tracks.items;
-            // Pages can come back short with more after them, so only an empty one ends it.
-            if items.is_empty() {
-                break;
+        let query = urlencoding::encode(&query);
+        let page = |page: usize| {
+            let query = &query;
+            async move {
+                let url = format!("https://api.spotify.com/v1/search?q={query}&type=track&limit=10&offset={}", page * 10);
+                let response = self.request(token, Method::GET, &url, None).await?;
+                Ok::<_, anyhow::Error>(response.json::<SearchTracksResponse>().await?.tracks.items)
             }
-            all.extend(items.into_iter().filter(|track| {
-                track.artists.iter().any(|candidate| candidate.name.eq_ignore_ascii_case(artist))
-            }));
+        };
+        // Asked for together: one after another, ten pages took about three seconds, which
+        // was most of the wait for an artist's page. The first few go first, as an artist
+        // with few songs has no more, and the rest only if those were all there.
+        let mut all: Vec<FullTrack> = Vec::new();
+        'pages: for wave in [0..3, 3..10] {
+            for items in join_in_order(wave.map(page)).await {
+                let items = items?;
+                // Pages can come back short with more after them, so only an empty one ends it.
+                if items.is_empty() {
+                    break 'pages;
+                }
+                all.extend(items.into_iter().filter(|track| {
+                    track.artists.iter().any(|candidate| candidate.name.eq_ignore_ascii_case(artist))
+                }));
+            }
         }
         Ok(all)
     }
@@ -641,5 +681,49 @@ fn endpoint_with_device(base: &str, device_id: Option<&str>) -> String {
     match device_id {
         Some(device_id) => format!("{base}?device_id={}", urlencoding::encode(device_id)),
         None => base.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_in_order, later_pages};
+
+    #[test]
+    fn the_pages_after_the_first_cover_the_part_asked_for_and_no_more() {
+        // 500 songs of a long playlist, 100 to a page.
+        assert_eq!(later_pages(0, 100, 500, 1_240, true), [100, 200, 300, 400]);
+        // The next part carries on where that one ended.
+        assert_eq!(later_pages(500, 100, 500, 1_240, true), [600, 700, 800, 900]);
+        // A list shorter than what was asked for ends where it ends.
+        assert_eq!(later_pages(0, 50, 500, 120, true), [50, 100]);
+        // Spotify gave fewer to a page than asked for: the pages follow what it gave.
+        assert_eq!(later_pages(0, 50, 200, 1_000, true), [50, 100, 150]);
+    }
+
+    #[test]
+    fn a_list_that_fits_one_page_asks_for_no_more() {
+        assert!(later_pages(0, 37, 500, 37, false).is_empty());
+        assert!(later_pages(0, 100, 100, 1_000, true).is_empty());
+        // An empty page says nothing about how far apart pages are.
+        assert!(later_pages(0, 0, 500, 1_000, true).is_empty());
+    }
+
+    #[test]
+    fn a_list_of_unknown_length_is_read_as_far_as_asked() {
+        assert_eq!(later_pages(0, 50, 150, 0, true), [50, 100]);
+    }
+
+    #[tokio::test]
+    async fn pages_asked_for_together_come_back_in_the_order_asked() {
+        // The first takes longest, the last comes at once.
+        let pages = [30u64, 10, 0].map(|wait| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            wait
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(join_in_order(pages).await, [30, 10, 0]);
+        // Together, not one after another: all three in about the time of the longest.
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(join_in_order(Vec::<std::future::Ready<u8>>::new()).await.is_empty());
     }
 }
