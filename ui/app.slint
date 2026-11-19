@@ -5406,12 +5406,32 @@ export component AppWindow inherits Window {
                     alignment: center;
                     spacing: 0px;
 
-                    Text {
-                        text: root.track_title;
-                        color: AppTheme.text;
-                        font-size: 14px;
-                        font-weight: 600;
-                        overflow: elide;
+                    // The name opens the song's album.
+                    Rectangle {
+                        preferred-width: bar-title.preferred-width;
+                        min-width: 0px;
+                        height: bar-title.preferred-height;
+                        bar-title := Text {
+                            width: parent.width;
+                            text: root.track_title;
+                            color: AppTheme.text;
+                            font-size: 14px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        // An underline that draws in on hover, as on the artists.
+                        Rectangle {
+                            y: parent.height - 1px;
+                            x: 0px;
+                            width: title-touch.has-hover && root.track_album != "" ? min(bar-title.preferred-width, parent.width) : 0px;
+                            height: 1px;
+                            background: AppTheme.text.with-alpha(0.7);
+                            animate width { duration: AppTheme.motion-spring; easing: ease-out; }
+                        }
+                        title-touch := TouchArea {
+                            mouse-cursor: root.track_album != "" ? pointer : default;
+                            clicked => { if (root.track_album != "") { root.show-album(); } }
+                        }
                     }
                     ArtistLinks { names: root.track_artists; size: 12px; fades: false; clicked(name) => { root.show-artist(name); } }
                 }
@@ -5582,9 +5602,11 @@ export component AppWindow inherits Window {
 
                     vol-slider := SlimSlider {
                         x: 8px;
+                        // Shown from the first moment, growing out of the button as the
+                        // others make room, rather than appearing once they have.
                         width: max(0px, vol-group.slot - 14px);
-                        visible: vol-group.slot > 30px;
-                        opacity: vol-group.slot / 84px;
+                        visible: vol-group.slot > 1px;
+                        opacity: min(1, vol-group.slot / 28px);
                         rest-height: 4px;
                         knob: true;
                         value: root.volume_percent;
