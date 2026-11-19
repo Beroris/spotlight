@@ -121,6 +121,9 @@ pub fn new_config() -> AppConfig {
         reduce_animations: false,
         disable_background_effects: true,
         album_colors: true,
+        bar_shape: "Bar".into(),
+        bar_look: "Glass".into(),
+        bar_blur: true,
         log_level: "Info".into(),
         check_for_updates: true,
         library_snapshot: Default::default(),
@@ -140,6 +143,13 @@ fn tidy_config(cfg: &mut AppConfig) {
     }
     if !matches!(cfg.theme_mode.as_str(), "Dark" | "Light" | "System") {
         cfg.theme_mode = "Dark".into();
+    }
+    if !matches!(cfg.bar_shape.as_str(), "Bar" | "Islands") {
+        cfg.bar_shape = "Bar".into();
+    }
+    // "Tinted" was an earlier look that the glass one replaced.
+    if !matches!(cfg.bar_look.as_str(), "Glass" | "Frosted" | "Smoked") {
+        cfg.bar_look = "Glass".into();
     }
     if !matches!(cfg.accent_color.as_str(), "Green" | "Blue" | "Purple" | "White") {
         cfg.accent_color = "Green".into();

@@ -766,8 +766,10 @@ impl SpircTask {
                     match |session_update| self.handle_session_update(session_update)
                 },
                 cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => match cmd {
+                    // Spotlight: said in the app's log. The app sends commands without waiting
+                    // for an answer, so a failure showed nowhere.
                     Some(cmd) => if let Err(e) = self.handle_command(cmd).await {
-                        debug!("could not dispatch command: {e}");
+                        warn!(target: "spotlight", "A command to this player failed: {e}");
                     },
                     // Spotlight: no one can command this any more. Shutting down beats coming
                     // straight back here forever, and a device no one controls playing on.
@@ -989,6 +991,13 @@ impl SpircTask {
             } => {
                 self.take_volumes_from(disable_volume, only_marked_volume).await;
                 return Ok(());
+            }
+            // Spotlight: music started on this device makes it the active one, as a play
+            // command Spotify passes on does. Before, the app had to send `Activate` first,
+            // and the song only began loading once Spotify had been told of that.
+            SpircCommand::Load(command) if !self.connect_state.is_active() => {
+                self.handle_activate();
+                self.handle_load(command, None, None, Vec::new()).await?
             }
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
@@ -2595,7 +2604,8 @@ mod tests {
     #[test]
     fn a_play_command_that_names_no_real_list_plays_the_songs_it_brought() {
         let brought = songs(&["spotify:track:a", "spotify:track:b"]);
-        for made_up in ["-", "", "spotify:web-api", "spotify:unknown"] {
+        // The last two are what Spotify's own API calls a list of songs it was sent.
+        for made_up in ["-", "", "spotify:web-api", "spotify:unknown", "spotify:webapi", "spotify:webapi:3W3wJolupcEgGSI9xrX1fC"] {
             let plays = named_or_brought(Some(made_up.to_string()), &brought, None);
             assert!(
                 matches!(plays, Some(PlayContext::Tracks(ref tracks)) if *tracks == uris(&brought)),

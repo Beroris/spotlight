@@ -80,7 +80,11 @@ impl HandedOver {
     /// Whether `uri` is a playlist, album or other list Spotify can be asked for.
     pub fn can_be_asked_for(uri: &str) -> bool {
         const MADE_UP: [&str; 4] = ["", "-", "spotify:web-api", "spotify:unknown"];
-        !MADE_UP.contains(&uri) && !uri.starts_with("spotify:search")
+        // Spotify's own API names a plain list of songs "spotify:webapi", or that with an id
+        // after it ("spotify:webapi:3W3w..."). Asking for either is answered with "400 Bad
+        // Request", seen in the app's log at every start of such a list.
+        let from_the_api = uri == "spotify:webapi" || uri.starts_with("spotify:webapi:");
+        !MADE_UP.contains(&uri) && !from_the_api && !uri.starts_with("spotify:search")
     }
 
     /// The songs coming up in the order they play: the list's, with the queued ones where
@@ -866,7 +870,15 @@ mod tests {
     fn only_real_lists_are_asked_for() {
         assert!(HandedOver::can_be_asked_for("spotify:playlist:37i9dQZF1E38hYajo1J1J7"));
         assert!(HandedOver::can_be_asked_for("spotify:album:5LFzwirfFwBKXJQGfwmiMY"));
-        for made_up in ["", "-", "spotify:web-api", "spotify:unknown", "spotify:search:some+words"] {
+        for made_up in [
+            "",
+            "-",
+            "spotify:web-api",
+            "spotify:webapi",
+            "spotify:webapi:3W3wJolupcEgGSI9xrX1fC",
+            "spotify:unknown",
+            "spotify:search:some+words",
+        ] {
             assert!(!HandedOver::can_be_asked_for(made_up), "{made_up}");
         }
     }

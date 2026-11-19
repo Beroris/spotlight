@@ -192,3 +192,24 @@ the player's state; whether its apps then show or hide the device's volume strai
 hasn't been seen. The player goes by its own word either way.
 
 Run its tests with `cargo test -p librespot-connect spirc::tests`.
+
+## Music started on this device without going through Spotify
+
+Spotlight used to start every song on its own PC by asking Spotify to tell this player to
+play, which took a request there and back before the song began to load, and couldn't be
+done until Spotify listed the device, some seconds after the app opens. The app now hands
+the music straight to the player (`Spirc::load`). In `src/spirc.rs`:
+
+- A `SpircCommand::Load` that arrives while this isn't the active device makes it the
+  active one first (`handle_activate`) and is then loaded. librespot dropped it with
+  "not the active device". Nothing else activates on its own: play, pause, next and the
+  rest are still refused while the music is elsewhere.
+- A command that fails is said in the app's log ("A command to this player failed"), not
+  only in debug output. The app sends commands without getting an answer, so a failure
+  showed nowhere.
+
+In `src/state/handed_over.rs`, `spotify:webapi` and `spotify:webapi:<id>` joined the names
+that are no real list (`can_be_asked_for`). Spotify gives them to plain lists of songs
+started through its public API, by Spotlight on another device or by any other app, and
+asking for the list by that name failed with a 400 on every such start before the songs
+that came with the command were played.
