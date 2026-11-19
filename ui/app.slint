@@ -127,6 +127,9 @@ component BarSurface inherits Rectangle {
     in property <length> slice-x: 0px;
     in property <length> full-width: self.width;
     in property <length> radius: 24px;
+    // Blur the page behind the glass. Done by Spotlight's own change to Slint's renderer.
+    in property <bool> blur: false;
+    property <bool> blurred: root.glass && root.blur;
 
     property <color> ink: AppTheme.is-light ? #000000 : #ffffff;
     property <bool> glass: root.look == "Glass";
@@ -156,6 +159,14 @@ component BarSurface inherits Rectangle {
     drop-shadow-offset-y: 5px;
     drop-shadow-color: AppTheme.is-light ? #00000024 : #00000052;
 
+    // A shadow in this color is the renderer's cue to blur what is behind, not a shadow.
+    // It has to be drawn straight to the window, so it stays outside the clipped pane.
+    if root.blurred : Rectangle {
+        border-radius: root.border-radius;
+        drop-shadow-color: #5b10b501;
+        drop-shadow-blur: 20px;
+    }
+
     Rectangle {
         border-radius: root.border-radius;
         clip: true;
@@ -165,7 +176,7 @@ component BarSurface inherits Rectangle {
             ? @linear-gradient(115deg, #ffffffff 0%, #ffffff66 30%, #00000014 70%, #0000002e 100%)
             : @linear-gradient(115deg, #ffffff70 0%, #ffffff1c 30%, #ffffff12 70%, #ffffff48 100%);
         background: root.glass
-            ? (AppTheme.flat ? root.pane : AppTheme.ambient.mix(root.pane, 0.25)).with-alpha(root.island ? 0.93 : (AppTheme.is-light ? 0.74 : 0.72))
+            ? (AppTheme.flat ? root.pane : AppTheme.ambient.mix(root.pane, 0.25)).with-alpha(root.blurred ? (AppTheme.is-light ? 0.42 : 0.34) : (root.island ? 0.93 : (AppTheme.is-light ? 0.74 : 0.72)))
             : (root.plain ? AppTheme.card-bg.with-alpha(0.97) : AppTheme.ambient.mix(AppTheme.window-bg, AppTheme.is-light ? 0.8 : 0.6));
         animate background { duration: AppTheme.motion-slow; easing: ease-in-out; }
 
@@ -2760,6 +2771,7 @@ export component AppWindow inherits Window {
     in-out property <bool> album_colors: true;
     in-out property <string> bar_shape: "Bar";
     in-out property <string> bar_look: "Glass";
+    in-out property <bool> bar_blur: true;
     // The cover blurred along the bar, for the frosted look. Empty with nothing playing.
     in-out property <image> bar_backdrop;
     in-out property <string> log_level: "Info";
@@ -5293,9 +5305,10 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Content fades out as it passes under the floating bar. Islands leave the page alone.
+        // Content fades out as it passes under the floating bar. Islands, and glass that
+        // blurs what is behind it, leave the page alone.
         Rectangle {
-            visible: root.bar_shape != "Islands";
+            visible: root.bar_shape != "Islands" && !(root.bar_look == "Glass" && root.bar_blur);
             y: parent.height - 120px;
             width: parent.width;
             height: 120px;
@@ -5329,12 +5342,14 @@ export component AppWindow inherits Window {
 
             if !player-bar.islands : BarSurface {
                 look: root.bar_look;
+                blur: root.bar_blur;
                 backdrop: root.bar_backdrop;
             }
             if player-bar.islands : BarSurface {
                 x: 0px;
                 width: player-bar.left-w;
                 look: root.bar_look;
+                blur: root.bar_blur;
                 backdrop: root.bar_backdrop;
                 full-width: player-bar.width;
             }
@@ -5342,6 +5357,7 @@ export component AppWindow inherits Window {
                 x: player-bar.mid-x;
                 width: player-bar.mid-w;
                 look: root.bar_look;
+                blur: root.bar_blur;
                 backdrop: root.bar_backdrop;
                 slice-x: player-bar.mid-x;
                 full-width: player-bar.width;
@@ -5350,6 +5366,7 @@ export component AppWindow inherits Window {
                 x: player-bar.width - player-bar.right-w;
                 width: player-bar.right-w;
                 look: root.bar_look;
+                blur: root.bar_blur;
                 backdrop: root.bar_backdrop;
                 slice-x: player-bar.width - player-bar.right-w;
                 full-width: player-bar.width;
@@ -6419,7 +6436,7 @@ export component AppWindow inherits Window {
                                             }
                                             SettingSegments {
                                                 label: "Player bar look";
-                                                description: "Glass is a dark pane with a touch of the cover's color. Frosted shows the cover, blurred. Smoked stays plain.";
+                                                description: "Glass shows the page behind it. Frosted shows the cover, blurred. Smoked stays plain.";
                                                 options: ["Glass", "Frosted", "Smoked"];
                                                 segment-width: 72px;
                                                 selected: root.bar_look == "Frosted" ? 1 : (root.bar_look == "Smoked" ? 2 : 0);
@@ -6428,6 +6445,7 @@ export component AppWindow inherits Window {
                                                     root.save_settings();
                                                 }
                                             }
+                                            SettingToggle { label: "Blur behind the player bar"; description: "The glass look blurs the page under it. Off saves a little work on every frame."; checked <=> root.bar_blur; toggled => { root.save_settings(); } }
                                             SettingToggle { label: "Reduce motion"; description: "Fewer animations and no smooth scrolling."; checked <=> root.reduce_animations; toggled => { root.save_settings(); } }
                                         }
 

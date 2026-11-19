@@ -94,6 +94,9 @@ pub struct AppConfig {
     /// What the player bar is made of: "Glass", "Frosted" or "Smoked".
     #[serde(default = "default_bar_look")]
     pub bar_look: String,
+    /// Blur the page behind the glass player bar.
+    #[serde(default = "default_true")]
+    pub bar_blur: bool,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]

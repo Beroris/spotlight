@@ -637,6 +637,7 @@ fn main() -> Result<()> {
         ui.set_album_colors(guard.config.album_colors);
         ui.set_bar_shape(guard.config.bar_shape.clone().into());
         ui.set_bar_look(guard.config.bar_look.clone().into());
+        ui.set_bar_blur(guard.config.bar_blur);
         ui.set_log_level(guard.config.log_level.clone().into());
         ui.set_developer_mode(guard.config.developer_mode);
         ui.set_check_for_updates(guard.config.check_for_updates);
@@ -1473,6 +1474,7 @@ fn bind_callbacks(
                     guard.config.album_colors = ui.get_album_colors();
                     guard.config.bar_shape = ui.get_bar_shape().to_string();
                     guard.config.bar_look = ui.get_bar_look().to_string();
+                    guard.config.bar_blur = ui.get_bar_blur();
                     guard.config.log_level = ui.get_log_level().to_string();
                     guard.config.developer_mode = ui.get_developer_mode();
                     guard.config.check_for_updates = ui.get_check_for_updates();

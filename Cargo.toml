@@ -129,12 +129,14 @@ librespot-playback = { path = "vendor/librespot-playback" }
 # Stops a second, identical frame after every change, and frame requests while in the tray.
 # See its SPOTLIGHT-CHANGES.md.
 i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
+# Adds a blur of what is behind an element, for the glass player bar. See its SPOTLIGHT-CHANGES.md.
+i-slint-renderer-femtovg = { path = "vendor/i-slint-renderer-femtovg" }
 
 [workspace]
 members = ["vendor/librespot-connect"]
 # Kept out of the workspace so Cargo.lock lists only what Spotlight builds. A member's
 # optional backends (wgpu, Vulkan, other audio outputs) would all be locked, though never built.
-exclude = ["vendor/i-slint-backend-winit", "vendor/librespot-playback"]
+exclude = ["vendor/i-slint-backend-winit", "vendor/i-slint-renderer-femtovg", "vendor/librespot-playback"]
 
 [profile.dev.package.realfft]
 opt-level = 3

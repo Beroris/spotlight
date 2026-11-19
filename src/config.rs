@@ -123,6 +123,7 @@ pub fn new_config() -> AppConfig {
         album_colors: true,
         bar_shape: "Bar".into(),
         bar_look: "Glass".into(),
+        bar_blur: true,
         log_level: "Info".into(),
         check_for_updates: true,
         library_snapshot: Default::default(),
