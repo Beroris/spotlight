@@ -130,7 +130,9 @@ component BarSurface inherits Rectangle {
 
     property <color> ink: AppTheme.is-light ? #000000 : #ffffff;
     property <bool> glass: root.look == "Glass";
-    property <color> pane: AppTheme.is-light ? #fcfcfd : #27272c;
+    // An island sits straight on the page, with no fade under it, so it has to hide more of it.
+    property <bool> island: root.full-width > self.width + 1px;
+    property <color> pane: AppTheme.is-light ? #ffffff : #3a3a42;
     // With album colors off, the glass loses its tint and the frosted one is plain.
     property <bool> plain: root.look == "Smoked" || (AppTheme.flat && !root.glass);
     property <bool> showing-b: false;
@@ -158,9 +160,12 @@ component BarSurface inherits Rectangle {
         border-radius: root.border-radius;
         clip: true;
         border-width: 1px;
-        border-color: root.ink.with-alpha(root.glass ? 0.12 : 0.08);
+        // Glass catches the light along its rim, strongest at two opposite corners.
+        border-color: !root.glass ? root.ink.with-alpha(0.08) : AppTheme.is-light
+            ? @linear-gradient(115deg, #ffffffff 0%, #ffffff66 30%, #00000014 70%, #0000002e 100%)
+            : @linear-gradient(115deg, #ffffff70 0%, #ffffff1c 30%, #ffffff12 70%, #ffffff48 100%);
         background: root.glass
-            ? (AppTheme.flat ? root.pane : AppTheme.ambient.mix(root.pane, 0.35)).with-alpha(AppTheme.is-light ? 0.9 : 0.86)
+            ? (AppTheme.flat ? root.pane : AppTheme.ambient.mix(root.pane, 0.25)).with-alpha(root.island ? 0.93 : (AppTheme.is-light ? 0.74 : 0.72))
             : (root.plain ? AppTheme.card-bg.with-alpha(0.97) : AppTheme.ambient.mix(AppTheme.window-bg, AppTheme.is-light ? 0.8 : 0.6));
         animate background { duration: AppTheme.motion-slow; easing: ease-in-out; }
 
@@ -3970,10 +3975,13 @@ export component AppWindow inherits Window {
                                     animate x { duration: AppTheme.motion-slow; easing: ease-in-out; }
                                     width: 18px;
                                     height: 18px;
-                                    commands: "M2 8.2 L9 2 L16 8.2 L16 16 L11 16 L11 11 L7 11 L7 16 L2 16 Z";
-                                    viewbox-width: 18;
-                                    viewbox-height: 18;
-                                    fill: root.show_home ? AppTheme.text : AppTheme.secondary-text;
+                                    commands: "M4 11 L12 4.5 L20 11 L20 19 A1.5 1.5 0 0 1 18.5 20.5 L5.5 20.5 A1.5 1.5 0 0 1 4 19 Z";
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
+                                    property <color> ink: root.show_home ? AppTheme.text : AppTheme.secondary-text;
+                                    fill: self.ink.with-alpha(root.show_home ? 0.32 : 0.2);
+                                    stroke: self.ink;
+                                    stroke-width: 1.5px;
                                 }
                                 Text {
                                     x: 46px + self.nudge;
@@ -4012,12 +4020,25 @@ export component AppWindow inherits Window {
                                     animate x { duration: AppTheme.motion-slow; easing: ease-in-out; }
                                     width: 18px;
                                     height: 18px;
-                                    commands: "M9 2.25 A6.75 6.75 0 1 1 8.99 2.25 Z M9 5.5 L9 9 L11.6 10.6";
-                                    viewbox-width: 18;
-                                    viewbox-height: 18;
+                                    commands: "M3.4 12 A8.6 8.6 0 1 0 20.6 12 A8.6 8.6 0 1 0 3.4 12 Z";
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
+                                    property <color> ink: parent.open ? AppTheme.text : AppTheme.secondary-text;
+                                    fill: self.ink.with-alpha(parent.open ? 0.32 : 0.2);
+                                    stroke: self.ink;
+                                    stroke-width: 1.5px;
+                                }
+                                Path {
+                                    x: root.compact_sidebars ? 21px : 16px;
+                                    animate x { duration: AppTheme.motion-slow; easing: ease-in-out; }
+                                    width: 18px;
+                                    height: 18px;
+                                    commands: "M12 7.4 L12 12 L15 13.9";
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
                                     fill: transparent;
                                     stroke: parent.open ? AppTheme.text : AppTheme.secondary-text;
-                                    stroke-width: 1.6px;
+                                    stroke-width: 1.5px;
                                 }
                                 Text {
                                     x: 46px + self.nudge;
@@ -5272,8 +5293,9 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Content fades out as it passes under the floating bar.
+        // Content fades out as it passes under the floating bar. Islands leave the page alone.
         Rectangle {
+            visible: root.bar_shape != "Islands";
             y: parent.height - 120px;
             width: parent.width;
             height: 120px;
