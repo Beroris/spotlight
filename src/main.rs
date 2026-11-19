@@ -635,6 +635,8 @@ fn main() -> Result<()> {
         ui.set_reduce_animations(guard.config.reduce_animations);
         ui.set_disable_background_effects(guard.config.disable_background_effects);
         ui.set_album_colors(guard.config.album_colors);
+        ui.set_bar_shape(guard.config.bar_shape.clone().into());
+        ui.set_bar_look(guard.config.bar_look.clone().into());
         ui.set_log_level(guard.config.log_level.clone().into());
         ui.set_developer_mode(guard.config.developer_mode);
         ui.set_check_for_updates(guard.config.check_for_updates);
@@ -1335,6 +1337,11 @@ fn apply_theme_to_ui(ui: &AppWindow) {
         .flatten()
         .unwrap_or_else(|| theme.get_window_bg());
     theme.set_ambient(ambient);
+    let backdrop = (!ui.get_current_track_uri().is_empty())
+        .then(|| bar_backdrop_from_image(&ui.get_album_art(), light))
+        .flatten()
+        .unwrap_or_default();
+    ui.set_bar_backdrop(backdrop);
     theme.set_accent(accent);
     theme.set_accent_soft(Color::from_argb_u8(40, accent.red(), accent.green(), accent.blue()));
     theme.set_accent_border(Color::from_argb_u8(110, accent.red(), accent.green(), accent.blue()));
@@ -1464,6 +1471,8 @@ fn bind_callbacks(
                     guard.config.reduce_animations = ui.get_reduce_animations();
                     guard.config.disable_background_effects = ui.get_disable_background_effects();
                     guard.config.album_colors = ui.get_album_colors();
+                    guard.config.bar_shape = ui.get_bar_shape().to_string();
+                    guard.config.bar_look = ui.get_bar_look().to_string();
                     guard.config.log_level = ui.get_log_level().to_string();
                     guard.config.developer_mode = ui.get_developer_mode();
                     guard.config.check_for_updates = ui.get_check_for_updates();
@@ -4854,6 +4863,97 @@ fn ambient_color_from_image(image: &slint::Image, light: bool) -> Option<Color> 
     Some(Color::from_rgb_u8((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8))
 }
 
+/// The cover as the player bar's frosted backing: its colours from left to right, blurred
+/// until no shape is left, then darkened (or paled, in the light theme) so the bar's text
+/// and buttons read on any cover. Slint can't blur, so the blur is made here, once a song.
+fn bar_backdrop_from_image(image: &slint::Image, light: bool) -> Option<slint::Image> {
+    const COLUMNS: usize = 96;
+    const ROWS: usize = 2;
+    let buffer = image.to_rgba8()?;
+    let (width, height) = (buffer.width() as usize, buffer.height() as usize);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixels = buffer.as_slice();
+    // One colour for each strip of the cover, favouring its colourful pixels as the window's tint does.
+    let (step_x, step_y) = ((width / 256).max(1), (height / 48).max(1));
+    let mut strips = [[0f32; 3]; COLUMNS];
+    for (column, strip) in strips.iter_mut().enumerate() {
+        let from = column * width / COLUMNS;
+        let to = ((column + 1) * width / COLUMNS).max(from + 1).min(width);
+        let (mut sum, mut n) = ([0f32; 3], 0f32);
+        for y in (0..height).step_by(step_y) {
+            for x in (from..to).step_by(step_x) {
+                let pixel = pixels[y * width + x];
+                let (max, min) = (pixel.r.max(pixel.g).max(pixel.b) as f32, pixel.r.min(pixel.g).min(pixel.b) as f32);
+                let weight = 1.0 + (max - min) * (max - min) / 64.0;
+                sum[0] += srgb_to_linear(pixel.r as f32 / 255.0) * weight;
+                sum[1] += srgb_to_linear(pixel.g as f32 / 255.0) * weight;
+                sum[2] += srgb_to_linear(pixel.b as f32 / 255.0) * weight;
+                n += weight;
+            }
+        }
+        if n > 0.0 {
+            *strip = [sum[0] / n, sum[1] / n, sum[2] / n];
+        }
+    }
+    // A wide blur along the bar. The ends repeat, so the edges keep their own colour.
+    const REACH: isize = 22;
+    const SIGMA: f32 = 9.0;
+    let mut row = Vec::with_capacity(COLUMNS * 4);
+    for column in 0..COLUMNS as isize {
+        let (mut sum, mut total) = ([0f32; 3], 0f32);
+        for offset in -REACH..=REACH {
+            let weight = (-((offset * offset) as f32) / (2.0 * SIGMA * SIGMA)).exp();
+            let strip = strips[(column + offset).clamp(0, COLUMNS as isize - 1) as usize];
+            sum[0] += strip[0] * weight;
+            sum[1] += strip[1] * weight;
+            sum[2] += strip[2] * weight;
+            total += weight;
+        }
+        let (r, g, b) = (linear_to_srgb(sum[0] / total), linear_to_srgb(sum[1] / total), linear_to_srgb(sum[2] / total));
+        // Smoked over: mostly the theme's own surface, with the cover showing through it.
+        let (base, keep) = if light { ([0.965f32, 0.965, 0.975], 0.30) } else { ([0.051f32, 0.047, 0.067], 0.30) };
+        let mixed = (base[0] + (r - base[0]) * keep, base[1] + (g - base[1]) * keep, base[2] + (b - base[2]) * keep);
+        let (r, g, b) = bar_brightness(mixed, light);
+        row.extend_from_slice(&[(r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8, 255]);
+    }
+    let out = row.repeat(ROWS);
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&out, COLUMNS as u32, ROWS as u32);
+    Some(slint::Image::from_rgba8(buffer))
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// Keeps the bar's backing dark enough for white text in the dark theme, and pale enough for
+/// black text in the light one, whatever the cover.
+fn bar_brightness((r, g, b): (f32, f32, f32), light: bool) -> (f32, f32, f32) {
+    let (lr, lg, lb) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+    let luminance = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+    let (lr, lg, lb) = if light {
+        const LEAST: f32 = 0.66;
+        if luminance >= LEAST {
+            return (r, g, b);
+        }
+        let toward_white = (LEAST - luminance) / (1.0 - luminance);
+        (lr + (1.0 - lr) * toward_white, lg + (1.0 - lg) * toward_white, lb + (1.0 - lb) * toward_white)
+    } else {
+        const MOST: f32 = 0.038;
+        if luminance <= MOST {
+            return (r, g, b);
+        }
+        let scale = MOST / luminance;
+        (lr * scale, lg * scale, lb * scale)
+    };
+    (linear_to_srgb(lr).clamp(0.0, 1.0), linear_to_srgb(lg).clamp(0.0, 1.0), linear_to_srgb(lb).clamp(0.0, 1.0))
+}
+
 /// HSL lightness makes a yellow or green tint several times brighter than a blue one, enough
 /// that faint text on it gets hard to read. This brings the tint to an even brightness: no
 /// brighter than a blue one in the dark theme, and no darker than a pale one in the light.
@@ -5569,6 +5669,7 @@ fn reset_album_art_to_logo(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
         guard.last_album_art_ui_path = None;
     }
     ui.set_album_art(slint::Image::default());
+    ui.set_bar_backdrop(slint::Image::default());
 }
 
 fn build_track_queue_from_playlist(
@@ -7351,6 +7452,11 @@ fn set_album_art_if_changed(
             .and_then(|_| ambient_color_from_image(&image, theme.get_is_light()))
             .unwrap_or_else(|| theme.get_window_bg());
         theme.set_ambient(ambient);
+        let backdrop = album_art_path
+            .as_ref()
+            .and_then(|_| bar_backdrop_from_image(&image, theme.get_is_light()))
+            .unwrap_or_default();
+        ui.set_bar_backdrop(backdrop);
         ui.set_album_art(image);
     }
 }

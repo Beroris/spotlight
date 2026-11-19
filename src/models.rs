@@ -88,6 +88,12 @@ pub struct AppConfig {
     /// Tint the header and Now Playing panel with the current album's color.
     #[serde(default = "default_true")]
     pub album_colors: bool,
+    /// The player bar's shape: "Bar" for one rounded bar, "Islands" for three.
+    #[serde(default = "default_bar_shape")]
+    pub bar_shape: String,
+    /// What the player bar is made of: "Tinted", "Frosted" or "Smoked".
+    #[serde(default = "default_bar_look")]
+    pub bar_look: String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]
@@ -187,6 +193,14 @@ pub struct QueueResponse {
     pub currently_playing: Option<FullTrack>,
     #[serde(default)]
     pub queue: Vec<FullTrack>,
+}
+
+fn default_bar_shape() -> String {
+    "Bar".to_string()
+}
+
+fn default_bar_look() -> String {
+    "Frosted".to_string()
 }
 
 fn default_theme_mode() -> String {
