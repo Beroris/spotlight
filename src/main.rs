@@ -10565,7 +10565,8 @@ fn apply_runtime_window_icon() {
             Foundation::HWND,
             System::LibraryLoader::GetModuleHandleW,
             UI::WindowsAndMessaging::{
-                FindWindowW, LoadIconW, SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON,
+                FindWindowW, GetSystemMetrics, LoadIconW, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+                SM_CXSMICON, WM_SETICON,
             },
         };
 
@@ -10579,8 +10580,13 @@ fn apply_runtime_window_icon() {
             let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
             let hicon = unsafe { LoadIconW(hinstance, 1 as _) };
             if !hicon.is_null() {
+                // The title bar's icon is loaded at its own size, so Windows picks the icon's
+                // small drawing instead of shrinking the large one.
+                let small_size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+                let small = unsafe { LoadImageW(hinstance, 1 as _, IMAGE_ICON, small_size, small_size, 0) };
+                let small = if small.is_null() { hicon as _ } else { small };
                 unsafe {
-                    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, hicon as isize);
+                    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
                     SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, hicon as isize);
                 }
                 break;
