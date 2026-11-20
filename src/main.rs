@@ -87,6 +87,12 @@ struct AppState {
     local_device_id: Option<String>,
     /// Device Spotify currently reports as active (may be another app).
     active_device_id: Option<String>,
+    /// Whether the device Spotify reports as active was playing, by its last report.
+    active_device_playing: bool,
+    /// Another device that was last seen playing, or was picked from the list, and when. For a
+    /// few minutes after, it goes on getting new music while paused; after that, nothing is
+    /// playing anywhere and music starts on this PC.
+    used_elsewhere: Option<(String, Instant)>,
     preferred_device_id: Option<String>,
     /// Devices that didn't answer when music was sent to them, and when. Spotify can go on
     /// listing, even as active, a device that has closed or gone to sleep. New music skips
@@ -258,9 +264,29 @@ impl AppState {
     }
 
     /// The device new music goes to, leaving out one that didn't answer a moment ago.
+    /// `None` means this PC.
     fn start_device(&self) -> Option<String> {
-        pick_start_device(self.active_device_id.as_ref(), self.preferred_device_id.as_ref(), &self.available_device_ids)
-            .filter(|id| !self.unanswered_devices.get(id).is_some_and(Unanswered::still_left_out))
+        pick_start_device(
+            self.active_device_id.as_ref(),
+            self.active_device_playing,
+            self.recently_used_elsewhere(),
+            &self.available_device_ids,
+        )
+        .filter(|id| !self.unanswered_devices.get(id).is_some_and(Unanswered::still_left_out))
+    }
+
+    /// Another device that was playing, or was picked, within the last few minutes.
+    fn recently_used_elsewhere(&self) -> Option<&String> {
+        self.used_elsewhere.as_ref().filter(|(_, at)| at.elapsed() < USED_ELSEWHERE_HOLD).map(|(id, _)| id)
+    }
+
+    /// Notes that this PC's own player has the music: nothing elsewhere is in use any more.
+    fn note_playing_here(&mut self, own: String) {
+        self.local_device_id = Some(own.clone());
+        self.active_device_id = Some(own.clone());
+        self.preferred_device_id = Some(own.clone());
+        self.device_id = Some(own);
+        self.used_elsewhere = None;
     }
 
     /// `device_id` didn't take the music sent to it, so the next music plays on this PC.
@@ -309,6 +335,9 @@ impl Unanswered {
 /// How long new music leaves out a device that didn't answer. Picking it from the list again
 /// sends music to it at once.
 const UNANSWERED_DEVICE_SKIP: Duration = Duration::from_secs(10 * 60);
+/// How long a device elsewhere goes on getting new music after it was last seen playing, or
+/// was picked. Paused for longer, nothing counts as playing and music starts on this PC.
+const USED_ELSEWHERE_HOLD: Duration = Duration::from_secs(5 * 60);
 /// How long after a device was left out Spotify may still report it as it was before.
 const UNANSWERED_DEVICE_SETTLE: Duration = Duration::from_secs(15);
 
@@ -509,6 +538,8 @@ fn main() -> Result<()> {
         device_id: None,
         local_device_id: None,
         active_device_id: None,
+        active_device_playing: false,
+        used_elsewhere: None,
         preferred_device_id: None,
         unanswered_devices: HashMap::new(),
         available_device_ids: Vec::new(),
@@ -1746,6 +1777,8 @@ fn bind_callbacks(
                 {
                     let mut guard = state.lock().unwrap();
                     guard.active_device_id = None;
+                    guard.active_device_playing = false;
+                    guard.used_elsewhere = None;
                     guard.device_id = None;
                     guard.preferred_device_id = None;
                 }
@@ -2318,6 +2351,7 @@ fn bind_callbacks(
                         match &result {
                             Ok(actual_device_id) => {
                                 guard.unanswered_devices.remove(actual_device_id);
+                                guard.used_elsewhere = (!is_local_device).then(|| (actual_device_id.clone(), Instant::now()));
                                 guard.preferred_device_id = Some(actual_device_id.clone());
                                 guard.device_id = Some(actual_device_id.clone());
                             }
@@ -5069,6 +5103,8 @@ fn apply_device_rows(
     ui: &AppWindow,
     devices: &[crate::models::Device],
     device_name: &str,
+    // The device music plays on or would start on, which the list marks.
+    current: Option<&str>,
 ) {
     let titles = devices
         .iter()
@@ -5084,7 +5120,7 @@ fn apply_device_rows(
             } else {
                 d.device_type.as_str()
             };
-            let state = if d.is_active { "Active" } else { "" };
+            let state = if d.id.is_some() && d.id.as_deref() == current { "Active" } else { "" };
             let volume = d.volume_percent.map(|v| format!("{}%", v)).unwrap_or_default();
             let parts = [kind, state, volume.as_str()]
                 .into_iter()
@@ -5101,7 +5137,7 @@ fn apply_device_rows(
         .iter()
         .map(|d| load_icon(device_type_icon(&d.device_type)))
         .collect::<Vec<_>>();
-    let active = devices.iter().map(|d| d.is_active).collect::<Vec<_>>();
+    let active = devices.iter().map(|d| d.id.is_some() && d.id.as_deref() == current).collect::<Vec<_>>();
     let local = devices.iter().map(|d| d.name == device_name).collect::<Vec<_>>();
 
     ui.set_device_titles(ModelRc::from(Rc::new(VecModel::from(titles))));
@@ -6934,6 +6970,20 @@ async fn play_current_here(
     Ok(())
 }
 
+/// Starts the player bar's song on this PC from where it is, with what comes after it.
+async fn continue_bar_song_here(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState>>, paused_at: Option<i32>) -> Result<()> {
+    let (track, position) = {
+        let guard = state.lock().unwrap();
+        (guard.current_track_uri.clone(), paused_at.unwrap_or_else(|| guard.playback_clock.displayed_progress_ms()))
+    };
+    let Some(track) = track else {
+        return Err(anyhow!("nothing is in the player bar to play"));
+    };
+    let mut uris = vec![track];
+    uris.extend(current_queue_tracks(&state).into_iter().map(|track| track.uri));
+    start_here(ui_weak, state, &Start::Songs { uris, position_ms: position }).await
+}
+
 /// False for the failures that playing somewhere else wouldn't get past: Spotify asking to
 /// slow down, a missing permission or Premium.
 fn device_may_be_gone(error: &anyhow::Error) -> bool {
@@ -6946,10 +6996,18 @@ fn device_may_be_gone(error: &anyhow::Error) -> bool {
 
 /// The device new music goes to: whatever is current, else the last one in use.
 /// `None` means there has never been one, so this PC is the only choice.
-fn pick_start_device(active: Option<&String>, last_used: Option<&String>, available: &[String]) -> Option<String> {
-    active
-        .or_else(|| last_used.filter(|id| available.contains(id)))
-        .cloned()
+fn pick_start_device(
+    active: Option<&String>,
+    active_playing: bool,
+    recently_used: Option<&String>,
+    available: &[String],
+) -> Option<String> {
+    if active_playing {
+        return active.cloned();
+    }
+    // Nothing is playing. A device in use a few minutes ago keeps the music, as this one may
+    // be a remote for it; otherwise it starts on the device in hand.
+    recently_used.filter(|id| Some(*id) == active || available.contains(id)).cloned()
 }
 
 /// Songs to send when a queue row is clicked: that row, the rows after it, then
@@ -6976,7 +7034,7 @@ const PLAYBACK_REPORT_FRESH: Duration = Duration::from_secs(5);
 /// The other device new music goes to, or `None` when it plays on this PC. Only clicking a
 /// device changes where music plays: every way of starting a song goes to the current device.
 async fn other_device_to_start_on(state: &Arc<Mutex<AppState>>, spotify_api: &spotify::SpotifyApi) -> Option<String> {
-    let (mut target, local, own, just_asked) = {
+    let (mut target, local, own, just_asked, recent) = {
         let guard = state.lock().unwrap();
         // This PC's own player has the music, by its own word, which is newer than anything
         // Spotify has said: for a moment after music starts here Spotify can still report
@@ -6985,7 +7043,7 @@ async fn other_device_to_start_on(state: &Arc<Mutex<AppState>>, spotify_api: &sp
             return None;
         }
         let just_asked = guard.playback_reported_at.is_some_and(|at| at.elapsed() < PLAYBACK_REPORT_FRESH);
-        (guard.start_device(), guard.local_device_id.clone(), guard.own_device_id(), just_asked)
+        (guard.start_device(), guard.local_device_id.clone(), guard.own_device_id(), just_asked, guard.recently_used_elsewhere().cloned())
     };
     // No device is known to have the music, and none was last in use. Spotify is asked rather
     // than music taken from a phone that began playing a moment ago, unless it was just asked:
@@ -6994,10 +7052,12 @@ async fn other_device_to_start_on(state: &Arc<Mutex<AppState>>, spotify_api: &sp
         if let Ok(token) = current_token(state).await {
             if let Ok(Ok(Some(playback))) = tokio::time::timeout(Duration::from_secs(3), spotify_api.current_playback(&token)).await {
                 let unanswered = state.lock().unwrap().unanswered_devices.clone();
+                let is_playing = playback.is_playing;
                 target = playback
                     .device
                     .filter(|device| device.is_active)
                     .and_then(|device| device.id)
+                    .filter(|id| is_playing || Some(id) == recent.as_ref())
                     .filter(|id| !unanswered.get(id).is_some_and(Unanswered::still_left_out));
             }
         }
@@ -7372,8 +7432,13 @@ fn apply_playback_to_ui(
     ui.set_current_track_uri(track.uri.clone().into());
     {
         // Show where audio is coming out when it isn't this PC.
-        let local_name = state.lock().unwrap().config.device_name.clone();
-        let active_name = playback.device.as_ref().map(|device| device.name.clone()).unwrap_or_default();
+        let (local_name, recent) = {
+            let guard = state.lock().unwrap();
+            (guard.config.device_name.clone(), guard.recently_used_elsewhere().cloned())
+        };
+        // A device paused for longer than a few minutes isn't where play would go: this PC is.
+        let in_use = |device: &&crate::models::Device| playback.is_playing || (device.id.is_some() && device.id == recent);
+        let active_name = playback.device.as_ref().filter(in_use).map(|device| device.name.clone()).unwrap_or_else(|| local_name.clone());
         let remote_name = if active_name == local_name { String::new() } else { active_name.clone() };
         if !remote_name.is_empty() {
             // Another device's stream isn't ours to report on.
@@ -7543,7 +7608,12 @@ async fn refresh_playback_only(
             }
         }
         guard.active_device_id = reported_active.clone();
+        guard.active_device_playing = is_playing;
         if let Some(active) = reported_active {
+            let elsewhere = Some(&active) != own_id.as_ref() && Some(&active) != guard.local_device_id.as_ref();
+            if is_playing && elsewhere {
+                guard.used_elsewhere = Some((active.clone(), Instant::now()));
+            }
             guard.preferred_device_id = Some(active.clone());
             guard.device_id = Some(active);
         }
@@ -7767,23 +7837,18 @@ async fn refresh_everything(
         }
     };
     let device_name = state.lock().unwrap().config.device_name.clone();
-    let preferred_device_id = state.lock().unwrap().preferred_device_id.clone();
+    let (active_playing, recent) = {
+        let guard = state.lock().unwrap();
+        (guard.active_device_playing, guard.recently_used_elsewhere().cloned())
+    };
     let own_device_id = state.lock().unwrap().own_device_id();
     let local_device_id = local_device_in(&devices, own_device_id.as_deref(), &device_name);
     let devices = without_this_pcs_old_players(devices, local_device_id.as_deref(), own_device_id.as_deref(), &device_name);
     let active_device_id = devices.iter().find(|d| d.is_active).and_then(|d| d.id.clone());
-    // Control whatever is actually playing. Only when nothing is active do we
-    // fall back to the user's pick, then this PC.
-    let selected_device_id = active_device_id
-        .clone()
-        .or_else(|| {
-            preferred_device_id.and_then(|preferred| {
-                devices
-                    .iter()
-                    .find(|d| d.id.as_deref() == Some(preferred.as_str()))
-                    .and_then(|d| d.id.clone())
-            })
-        })
+    // Control whatever is playing, or was in use a few minutes ago. With nothing playing
+    // anywhere, this PC.
+    let listed = devices.iter().filter_map(|d| d.id.clone()).collect::<Vec<_>>();
+    let selected_device_id = pick_start_device(active_device_id.as_ref(), active_playing, recent.as_ref(), &listed)
         .or_else(|| local_device_id.clone());
     let mut ordered_devices = devices;
     if let Some(selected_id) = selected_device_id.as_deref() {
@@ -7816,7 +7881,9 @@ async fn refresh_everything(
                 .volume_percent
                 .map(|value| format!(" - {}%", value))
                 .unwrap_or_default();
-            format!("{marker} {}{}", d.name, volume)
+            // The row marked as current changes with it, so it's part of what's compared.
+            let current = if d.id.is_some() && d.id == selected_device_id { " (current)" } else { "" };
+            format!("{marker} {}{}{current}", d.name, volume)
         })
         .collect::<Vec<_>>();
     let device_ids = ordered_devices
@@ -7832,7 +7899,7 @@ async fn refresh_everything(
         }
         guard.local_device_id = local_device_id.clone();
         guard.active_device_id = active_device_id;
-        guard.device_id = selected_device_id;
+        guard.device_id = selected_device_id.clone();
         guard.available_device_ids = device_ids.clone();
         guard.available_device_names = device_names;
     }
@@ -8227,7 +8294,7 @@ async fn refresh_everything(
                 }
             };
             if should_update_devices {
-                apply_device_rows(&ui, &ordered_devices, &device_name);
+                apply_device_rows(&ui, &ordered_devices, &device_name, selected_device_id.as_deref());
             }
             let device_ready = state.lock().unwrap().local_device_id.is_some();
             ui.set_player_status(if device_ready { "Local player ready".into() } else { "Waiting for local player".into() });
@@ -8628,6 +8695,13 @@ async fn set_playing(
     }
     if is_playing {
         return Ok(());
+    }
+    // Another device has it, paused for longer than a few minutes: nothing is in use, so the
+    // song goes on on the device in hand.
+    let holder_in_use = holder.as_ref().is_some_and(|id| state.lock().unwrap().recently_used_elsewhere() == Some(id));
+    if let Some(stale) = holder.as_ref().filter(|_| !held_here && !holder_in_use && has_bar_song) {
+        file_log(&format!("Play: {} has been paused a while, so the song goes on here", device_label(&state, stale)));
+        return continue_bar_song_here(ui_weak, state, paused_at).await;
     }
     if let Some(holder) = holder.filter(|_| !held_here) {
         // Another device has it, paused. One that was closed or has gone to sleep stays in
@@ -9680,10 +9754,7 @@ async fn run_local_player_event_loop(
                     // librespot only loads tracks while it is the active device. Its own id
                     // says which that is, also in the seconds before Spotify lists it.
                     if let Some(own) = guard.own_device_id() {
-                        guard.local_device_id = Some(own.clone());
-                        guard.active_device_id = Some(own.clone());
-                        guard.preferred_device_id = Some(own.clone());
-                        guard.device_id = Some(own);
+                        guard.note_playing_here(own);
                     }
                     guard.latest_local_track_uri = Some(track_uri.clone());
                     guard.play_watch.song_changed(track.clone());
@@ -9904,10 +9975,7 @@ fn apply_local_player_position_event(
         crash_restart::note_playing_here(is_playing);
         if is_playing {
             if let Some(own) = guard.own_device_id() {
-                guard.local_device_id = Some(own.clone());
-                guard.active_device_id = Some(own.clone());
-                guard.preferred_device_id = Some(own.clone());
-                guard.device_id = Some(own);
+                guard.note_playing_here(own);
             }
         }
         let duration = guard.playback_clock.duration_ms;
@@ -10926,13 +10994,14 @@ mod device_and_queue_tests {
 
     #[test]
     fn music_stays_on_the_current_device() {
-        let (desktop, local, phone) = ("desktop".to_string(), "local".to_string(), "phone".to_string());
+        let (desktop, phone) = ("desktop".to_string(), "phone".to_string());
         let available = ids(&["desktop", "local", "phone"]);
-        assert_eq!(pick_start_device(Some(&desktop), Some(&phone), &available), Some(desktop.clone()), "what is playing wins");
-        assert_eq!(pick_start_device(None, Some(&phone), &available), Some(phone.clone()), "paused long enough for the session to lapse");
-        assert_eq!(pick_start_device(None, Some(&local), &available), Some(local));
-        assert_eq!(pick_start_device(None, Some(&phone), &ids(&["desktop"])), None, "last device has gone");
-        assert_eq!(pick_start_device(None, None, &available), None);
+        assert_eq!(pick_start_device(Some(&desktop), true, Some(&phone), &available), Some(desktop.clone()), "what is playing wins");
+        assert_eq!(pick_start_device(Some(&desktop), false, Some(&desktop), &available), Some(desktop.clone()), "paused a moment ago, it keeps the music");
+        assert_eq!(pick_start_device(Some(&desktop), false, None, &available), None, "paused a while, music starts here");
+        assert_eq!(pick_start_device(None, false, Some(&phone), &available), Some(phone.clone()), "in use a moment ago, before Spotify lists it as active");
+        assert_eq!(pick_start_device(None, false, Some(&phone), &ids(&["desktop"])), None, "last device has gone");
+        assert_eq!(pick_start_device(None, false, None, &available), None, "nothing playing anywhere: here");
     }
 
     #[test]

@@ -3214,8 +3214,8 @@ export component AppWindow inherits Window {
     property <bool> search-page: root.in-search && root.track_view_kicker == "Search results";
     // A list page opened from Home goes back there.
     property <bool> back-to-home: false;
-    property <string> output-label: root.active_device_name == "" ? "No active device"
-        : (root.active_device_name == root.local_device_name ? (root.is_mac ? "This Mac" : root.is_linux ? "This computer" : "This PC") : root.active_device_name);
+    // With nothing playing anywhere, music starts on this device.
+    property <string> output-label: root.active_device_name == "" || root.active_device_name == root.local_device_name ? (root.is_mac ? "This Mac" : root.is_linux ? "This computer" : "This PC") : root.active_device_name;
     property <length> row-height: 48px;
     property <bool> reset-armed: false;
     property <int> suggestion-count: root.search_suggestions.length + 1;
@@ -5169,7 +5169,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     Text {
-                                        text: root.active_device_name == "" ? "Not playing" : root.output-label;
+                                        text: root.output-label;
                                         color: AppTheme.text;
                                         font-size: 12px;
                                         font-weight: 600;
